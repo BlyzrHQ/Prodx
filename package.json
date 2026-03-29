@@ -1,0 +1,26 @@
+{
+  "name": "shopify-catalog-toolkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first Shopify catalog toolkit built from the PRD in this workspace.",
+  "bin": {
+    "catalog": "./bin/catalog.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --disable-warning=ExperimentalWarning --experimental-strip-types ./tests/run-tests.ts",
+    "catalog": "npm run build && node ./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
