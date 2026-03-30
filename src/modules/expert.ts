@@ -1,9 +1,13 @@
 import { createBaseResult } from "./shared.js";
+import { applyCatalogGuideCompatibility } from "../lib/catalog-guide.js";
+import { buildCatalogGuidePromptPayload, buildSystemPrompt, getCatalogGuidePromptSpec } from "../lib/prompt-specs.js";
 import { buildStarterPolicy, initialLearningMarkdown, renderPolicyMarkdown } from "../lib/policy-template.js";
 import { getCatalogPaths } from "../lib/paths.js";
-import { writeJson, writeText } from "../lib/fs.js";
+import { exists, readText, writeJson, writeText } from "../lib/fs.js";
 import { resolveProvider } from "../lib/providers.js";
 import { createOpenAIJsonResponse } from "../connectors/openai.js";
+import { createGeminiJsonResponse } from "../connectors/gemini.js";
+import { createAnthropicJsonResponse } from "../connectors/anthropic.js";
 import { searchSerperWeb } from "../connectors/serper.js";
 import { fetchShopifyPolicyContext } from "../connectors/shopify.js";
 import type { LooseRecord, PolicyDocument, ProductMetafieldValue, ResolvedProvider } from "../types.js";
@@ -25,6 +29,10 @@ function stringArraySchema() {
   return { type: "array", items: { type: "string" } };
 }
 
+function flexibleArraySchema() {
+  return { type: "array", items: {} };
+}
+
 function metafieldDefinitionSchema() {
   return strictObject(
     {
@@ -34,15 +42,35 @@ function metafieldDefinitionSchema() {
       value: { type: "string" },
       description: { type: "string" },
       required: { type: "boolean" },
-      source_field: { type: "string" }
+      source_field: { type: "string" },
+      source: { type: "string" },
+      validation_rules: stringArraySchema(),
+      example_values: stringArraySchema(),
+      usage: stringArraySchema(),
+      automation_mode: { type: "string" },
+      inferred: { type: "boolean" }
     },
-    ["namespace", "key", "type", "value", "description", "required", "source_field"]
+    [
+      "namespace",
+      "key",
+      "type",
+      "value",
+      "description",
+      "required",
+      "source_field",
+      "source",
+      "validation_rules",
+      "example_values",
+      "usage",
+      "automation_mode",
+      "inferred"
+    ]
   );
 }
 
 function buildPolicySchema() {
   return {
-    name: "catalog_policy",
+    name: "catalog_guide",
     schema: strictObject(
       {
         industry_business_context: strictObject(
@@ -61,29 +89,48 @@ function buildPolicySchema() {
           },
           ["accept", "reject"]
         ),
-        product_title_structure: strictObject(
+        taxonomy_design: strictObject(
           {
-            pattern: { type: "string" },
-            examples: stringArraySchema()
+            hierarchy: stringArraySchema(),
+            category_tree: flexibleArraySchema(),
+            collection_logic: stringArraySchema(),
+            tagging_system: stringArraySchema(),
+            product_type_rules: stringArraySchema(),
+            handle_structure_rules: stringArraySchema()
           },
-          ["pattern", "examples"]
+          ["hierarchy", "category_tree", "collection_logic", "tagging_system", "product_type_rules", "handle_structure_rules"]
         ),
-        description_structure: strictObject(
+        product_title_system: strictObject(
           {
-            tone: { type: "string" },
-            word_count: { type: "string" },
-            guidance: { type: "string" },
-            required_sections: stringArraySchema()
+            formula: { type: "string" },
+            examples: stringArraySchema(),
+            disallowed_patterns: stringArraySchema(),
+            seo_rules: stringArraySchema(),
+            edge_case_rules: stringArraySchema()
           },
-          ["tone", "word_count", "guidance", "required_sections"]
+          ["formula", "examples", "disallowed_patterns", "seo_rules", "edge_case_rules"]
         ),
-        categorization_taxonomy: strictObject(
+        product_description_system: strictObject(
           {
-            type: { type: "string" },
-            tree: stringArraySchema(),
-            guidance: { type: "string" }
+            structure_template: stringArraySchema(),
+            tone_rules: stringArraySchema(),
+            length_rules: stringArraySchema(),
+            formatting_rules: stringArraySchema(),
+            auto_generatable: stringArraySchema(),
+            manual_required: stringArraySchema(),
+            guidance: stringArraySchema()
           },
-          ["type", "tree", "guidance"]
+          ["structure_template", "tone_rules", "length_rules", "formatting_rules", "auto_generatable", "manual_required", "guidance"]
+        ),
+        variant_architecture: strictObject(
+          {
+            allowed_dimensions: stringArraySchema(),
+            split_vs_variant_rules: stringArraySchema(),
+            max_variant_logic: stringArraySchema(),
+            naming_conventions: stringArraySchema(),
+            duplicate_rules: stringArraySchema()
+          },
+          ["allowed_dimensions", "split_vs_variant_rules", "max_variant_logic", "naming_conventions", "duplicate_rules"]
         ),
         attributes_metafields_schema: strictObject(
           {
@@ -96,157 +143,131 @@ function buildPolicySchema() {
           },
           ["required_fields", "optional_fields", "standard_shopify_fields", "metafields", "fill_rules", "guidance"]
         ),
-        product_listing_checklist: strictObject(
+        image_media_standards: strictObject(
           {
-            required: stringArraySchema(),
-            optional: stringArraySchema()
-          },
-          ["required", "optional"]
-        ),
-        qa_scoring_criteria: strictObject(
-          {
-            passing_score: { type: "number" },
-            success_definition: { type: "string" },
-            weights: strictObject(
-              {
-                title: { type: "number" },
-                description: { type: "number" },
-                classification: { type: "number" },
-                images: { type: "number" },
-                required_fields: { type: "number" },
-                attributes: { type: "number" },
-                additional_information: { type: "number" }
-              },
-              ["title", "description", "classification", "images", "required_fields", "attributes", "additional_information"]
-            )
-          },
-          ["passing_score", "success_definition", "weights"]
-        ),
-        image_requirements: strictObject(
-          {
-            primary_image: { type: "string" },
-            background: { type: "string" },
-            preferred_styles: stringArraySchema(),
+            image_types: stringArraySchema(),
+            background_rules: stringArraySchema(),
+            aspect_ratios: stringArraySchema(),
+            naming_conventions: stringArraySchema(),
+            alt_text_rules: stringArraySchema(),
+            automation_tagging_rules: stringArraySchema(),
             avoid: stringArraySchema()
           },
-          ["primary_image", "background", "preferred_styles", "avoid"]
+          ["image_types", "background_rules", "aspect_ratios", "naming_conventions", "alt_text_rules", "automation_tagging_rules", "avoid"]
         ),
-        seo_handle_rules: strictObject(
+        merchandising_rules: strictObject(
           {
-            handle_format: { type: "string" },
-            seo_description_pattern: { type: "string" },
-            title_guidance: { type: "string" }
+            collection_sorting_logic: stringArraySchema(),
+            cross_sell_rules: stringArraySchema(),
+            upsell_rules: stringArraySchema(),
+            product_grouping_logic: stringArraySchema(),
+            seasonal_overrides: stringArraySchema(),
+            featured_product_logic: stringArraySchema()
           },
-          ["handle_format", "seo_description_pattern", "title_guidance"]
+          ["collection_sorting_logic", "cross_sell_rules", "upsell_rules", "product_grouping_logic", "seasonal_overrides", "featured_product_logic"]
         ),
-        variant_structure: strictObject(
+        seo_discovery_rules: strictObject(
           {
-            primary_dimensions: stringArraySchema(),
-            guidance: { type: "string" },
-            duplicate_rules: stringArraySchema()
+            meta_title_format: stringArraySchema(),
+            meta_description_rules: stringArraySchema(),
+            url_handle_rules: stringArraySchema(),
+            internal_linking_logic: stringArraySchema(),
+            keyword_usage_patterns: stringArraySchema()
           },
-          ["primary_dimensions", "guidance", "duplicate_rules"]
+          ["meta_title_format", "meta_description_rules", "url_handle_rules", "internal_linking_logic", "keyword_usage_patterns"]
         ),
-        pricing_discount_display_rules: strictObject(
+        automation_playbook: strictObject(
           {
-            compare_at_price: { type: "string" },
-            pricing_copy: { type: "string" },
-            bundles: { type: "string" },
-            unit_pricing: { type: "string" }
+            fully_automated: stringArraySchema(),
+            validation_checkpoints: stringArraySchema(),
+            human_approval_required: stringArraySchema(),
+            transformation_logic: stringArraySchema(),
+            fallback_rules: stringArraySchema(),
+            error_handling_rules: stringArraySchema()
           },
-          ["compare_at_price", "pricing_copy", "bundles", "unit_pricing"]
+          ["fully_automated", "validation_checkpoints", "human_approval_required", "transformation_logic", "fallback_rules", "error_handling_rules"]
         ),
-        collections_merchandising_rules: strictObject(
+        qa_validation_system: strictObject(
           {
-            status: { type: "string" },
-            guidance: { type: "string" },
-            default_collection_types: stringArraySchema()
+            title_validation: stringArraySchema(),
+            variant_validation: stringArraySchema(),
+            metafield_completeness: stringArraySchema(),
+            image_checks: stringArraySchema(),
+            seo_checks: stringArraySchema(),
+            pass_fail_conditions: stringArraySchema(),
+            auto_fix_rules: stringArraySchema(),
+            passing_score: { type: "number" }
           },
-          ["status", "guidance", "default_collection_types"]
+          ["title_validation", "variant_validation", "metafield_completeness", "image_checks", "seo_checks", "pass_fail_conditions", "auto_fix_rules", "passing_score"]
         )
       },
       [
         "industry_business_context",
         "eligibility_rules",
-        "product_title_structure",
-        "description_structure",
-        "categorization_taxonomy",
+        "taxonomy_design",
+        "product_title_system",
+        "product_description_system",
+        "variant_architecture",
         "attributes_metafields_schema",
-        "product_listing_checklist",
-        "qa_scoring_criteria",
-        "image_requirements",
-        "seo_handle_rules",
-        "variant_structure",
-        "pricing_discount_display_rules",
-        "collections_merchandising_rules"
+        "image_media_standards",
+        "merchandising_rules",
+        "seo_discovery_rules",
+        "automation_playbook",
+        "qa_validation_system"
       ]
     )
   };
 }
 
 function normalizeGeneratedPolicy(base: PolicyDocument, generated: LooseRecord, input: LooseRecord, generationMethod: string): PolicyDocument {
-  const taxonomy = generated.categorization_taxonomy as LooseRecord | undefined;
-  const baseTaxonomy = (base.categorization_taxonomy as LooseRecord | undefined) ?? {};
-  const baseQa = (base.qa_scoring_criteria as LooseRecord | undefined) ?? {};
-  const generatedQa = (generated.qa_scoring_criteria as LooseRecord | undefined) ?? {};
-  const computedWeights: LooseRecord = (generatedQa.weights as LooseRecord | undefined) ?? ((baseQa.weights as LooseRecord | undefined) ?? {});
-  const baseAttributeSchema = (base.attributes_metafields_schema as LooseRecord | undefined) ?? {};
-  const generatedAttributeSchema = (generated.attributes_metafields_schema as LooseRecord | undefined) ?? {};
-  return {
+  const combined: PolicyDocument = {
     ...base,
     ...generated,
-    categorization_taxonomy: {
-      ...baseTaxonomy,
-      ...(taxonomy ?? {}),
-      tree: Array.isArray(taxonomy?.tree) ? taxonomy.tree : baseTaxonomy.tree
-    },
-    qa_scoring_criteria: {
-      ...baseQa,
-      ...generatedQa,
-      weights: computedWeights
-    },
     attributes_metafields_schema: {
-      ...baseAttributeSchema,
-      ...generatedAttributeSchema,
-      metafields: Array.isArray(generatedAttributeSchema.metafields)
-        ? generatedAttributeSchema.metafields
-        : Array.isArray(baseAttributeSchema.metafields)
-          ? baseAttributeSchema.metafields
-          : []
+      ...base.attributes_metafields_schema,
+      ...((generated.attributes_metafields_schema as LooseRecord | undefined) ?? {}),
+      metafields: Array.isArray((generated.attributes_metafields_schema as LooseRecord | undefined)?.metafields)
+        ? ((generated.attributes_metafields_schema as LooseRecord).metafields as ProductMetafieldValue[])
+        : base.attributes_metafields_schema?.metafields ?? []
     },
     meta: {
       ...(base.meta ?? {}),
       business_name: String(input.businessName ?? base.meta?.business_name ?? "Demo Store"),
       business_description: String(input.businessDescription ?? base.meta?.business_description ?? ""),
       industry: String(input.industry ?? base.meta?.industry ?? "generic"),
-      target_market: String(input.targetMarket ?? base.meta?.target_market ?? "General ecommerce shoppers"),
+      target_market: String(input.targetMarket ?? base.meta?.target_market ?? ""),
       operating_mode: String(input.operatingMode ?? base.meta?.operating_mode ?? "local_files"),
       store_url: String(input.storeUrl ?? base.meta?.store_url ?? ""),
       generated_at: new Date().toISOString(),
       generation_method: generationMethod
     }
   };
+
+  return applyCatalogGuideCompatibility(combined);
 }
 
 function normalizeShopifyMetafields(input: unknown): ProductMetafieldValue[] {
   if (!Array.isArray(input)) return [];
-
   return input.flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const record = item as LooseRecord;
     const namespace = typeof record.namespace === "string" ? record.namespace : "";
     const key = typeof record.key === "string" ? record.key : "";
-    const type = typeof record.type === "string" ? record.type : "single_line_text_field";
     if (!namespace || !key) return [];
-
     return [{
       namespace,
       key,
-      type,
-      value: typeof record.value === "string" ? record.value : "",
+      type: typeof record.type === "string" ? record.type : "single_line_text_field",
+      value: typeof record.value === "string" ? record.value : "requires_review",
       description: typeof record.description === "string" ? record.description : "",
       required: Boolean(record.required),
-      source_field: typeof record.source_field === "string" ? record.source_field : ""
+      source_field: typeof record.source_field === "string" ? record.source_field : "shopify_context",
+      source: typeof record.source === "string" ? record.source : "shopify",
+      validation_rules: Array.isArray(record.validation_rules) ? record.validation_rules.map(String) : [],
+      example_values: Array.isArray(record.example_values) ? record.example_values.map(String) : [],
+      usage: Array.isArray(record.usage) ? record.usage.map(String) : ["internal logic"],
+      automation_mode: typeof record.automation_mode === "string" ? record.automation_mode : "review_required",
+      inferred: Boolean(record.inferred)
     }];
   });
 }
@@ -260,34 +281,42 @@ function applyShopifyContextToStarterPolicy(starterPolicy: PolicyDocument, shopi
   const optionValues = [...new Set(sampleProducts.flatMap((item) => Array.isArray(item.options) ? item.options.map(String) : []))];
   const tagsSeen = [...new Set(sampleProducts.flatMap((item) => Array.isArray(item.tags) ? item.tags.map(String) : []))];
 
-  return {
+  const mergedMetafields = [...starterPolicy.attributes_metafields_schema?.metafields ?? []];
+  const seenMetafields = new Set(mergedMetafields.map((field) => `${field.namespace}.${field.key}`));
+  for (const definition of sampleDefinitions) {
+    const identifier = `${definition.namespace}.${definition.key}`;
+    if (seenMetafields.has(identifier)) continue;
+    seenMetafields.add(identifier);
+    mergedMetafields.push(definition);
+  }
+
+  const updated: PolicyDocument = {
     ...starterPolicy,
+    taxonomy_design: {
+      ...starterPolicy.taxonomy_design,
+      product_type_rules: [
+        ...(starterPolicy.taxonomy_design?.product_type_rules ?? []),
+        ...(productTypeValues.length > 0 ? [`Observed Shopify product types: ${productTypeValues.join(", ")}`] : [])
+      ]
+    },
     attributes_metafields_schema: {
-      ...(starterPolicy.attributes_metafields_schema ?? {}),
+      ...starterPolicy.attributes_metafields_schema,
       standard_shopify_fields: [
         ...new Set([
-          ...((starterPolicy.attributes_metafields_schema?.standard_shopify_fields ?? []) as string[]),
-          "title",
-          "handle",
-          "body_html",
-          "vendor",
-          "product_type",
-          "tags",
+          ...(starterPolicy.attributes_metafields_schema?.standard_shopify_fields ?? []),
           ...(optionValues.length > 0 ? optionValues.map((option) => `option:${option}`) : [])
         ])
       ],
-      metafields: sampleDefinitions.length > 0
-        ? sampleDefinitions
-        : starterPolicy.attributes_metafields_schema?.metafields ?? [],
+      metafields: mergedMetafields,
       fill_rules: [
-        ...new Set([
-          ...((starterPolicy.attributes_metafields_schema?.fill_rules ?? []) as string[]),
-          ...(productTypeValues.length > 0 ? [`Observed Shopify product types: ${productTypeValues.join(", ")}`] : []),
-          ...(tagsSeen.length > 0 ? [`Observed Shopify tags for reference: ${tagsSeen.slice(0, 20).join(", ")}`] : [])
-        ])
+        ...(starterPolicy.attributes_metafields_schema?.fill_rules ?? []),
+        ...(sampleDefinitions.length > 0 ? ["Shopify metafield definitions were pulled from the connected store and should be treated as the source of truth for type and requiredness."] : []),
+        ...(tagsSeen.length > 0 ? [`Observed Shopify tags for reference: ${tagsSeen.slice(0, 20).join(", ")}`] : [])
       ]
     }
   };
+
+  return applyCatalogGuideCompatibility(updated);
 }
 
 async function getShopifyContext(root: string): Promise<LooseRecord | null> {
@@ -314,55 +343,83 @@ async function getResearchNotes(root: string, input: LooseRecord): Promise<Array
     return [];
   }
 
-  const query = `${String(input.industry ?? "ecommerce")} Shopify catalog policy best practices`;
-  const results = await searchSerperWeb({
+  const query = `${String(input.industry ?? "ecommerce")} Shopify catalog guide best practices`;
+  return searchSerperWeb({
     apiKey: researchProvider.credential.value,
     query,
     num: 3
   });
-  return results;
 }
 
-async function generateWithOpenAI(provider: ResolvedProvider, input: LooseRecord, starterPolicy: PolicyDocument, shopifyContext: LooseRecord | null, researchNotes: Array<{ title: string; link: string; snippet?: string }>): Promise<PolicyDocument> {
-  const adaptationNotes = [
-    "Adapt the policy deeply to the specific business, not just the broad industry.",
-    "Replace generic grocery assumptions with halal, cultural, imported, and hard-to-find product considerations when appropriate.",
-    "Use the connected Shopify sample context to infer taxonomy, title conventions, variant dimensions, and metafield opportunities.",
-    "Document the Shopify product structure and custom metafields clearly in the Attributes & Metafields Schema section, including type, requiredness, and fill rules.",
-    "Only include metafields that exist in the connected store or are explicitly justified by the business context.",
-    "Examples, taxonomy, checklist details, and merchandising guidance should feel specific to this store."
-  ].join(" ");
-  const response = await createOpenAIJsonResponse<LooseRecord>({
-    apiKey: provider.credential.value,
-    model: provider.provider.model ?? "gpt-5",
-    instructions: [
-      "You are creating a Shopify catalog policy.",
-      "Keep the exact policy structure you are asked to fill.",
-      "Return JSON only.",
-      "Use the store context and sample Shopify structure if provided.",
-      "Do not invent sections outside the required structure.",
-      adaptationNotes
-    ].join(" "),
-    input: JSON.stringify({
-      requested_policy_template: starterPolicy,
-      business_context: {
-        business_name: input.businessName ?? "Demo Store",
-        business_description: input.businessDescription ?? "",
-        industry: input.industry ?? "generic",
-        target_market: input.targetMarket ?? "General ecommerce shoppers",
-        operating_mode: input.operatingMode ?? "both",
-        store_url: input.storeUrl ?? "",
-        notes: input.notes ?? ""
-      },
-      shopify_context: shopifyContext,
-      optional_research_notes: researchNotes
-    }, null, 2),
-    schema: buildPolicySchema(),
-    maxOutputTokens: 5000,
-    reasoningEffort: "low"
-  });
+async function generateWithProvider(
+  provider: ResolvedProvider,
+  input: LooseRecord,
+  starterPolicy: PolicyDocument,
+  shopifyContext: LooseRecord | null,
+  researchNotes: Array<{ title: string; link: string; snippet?: string }>,
+  learningText: string
+): Promise<PolicyDocument> {
+  const spec = getCatalogGuidePromptSpec();
+  const systemPrompt = buildSystemPrompt(spec);
+  const requestBody = buildCatalogGuidePromptPayload(
+    starterPolicy,
+    {
+      business_name: input.businessName ?? "Demo Store",
+      business_description: input.businessDescription ?? "",
+      industry: input.industry ?? "generic",
+      target_market: input.targetMarket ?? "",
+      operating_mode: input.operatingMode ?? "both",
+      store_url: input.storeUrl ?? "",
+      notes: input.notes ?? ""
+    },
+    shopifyContext,
+    researchNotes,
+    learningText
+  );
+  const schema = buildPolicySchema();
+  let generated: LooseRecord;
 
-  return normalizeGeneratedPolicy(starterPolicy, response.json, input, shopifyContext ? "gpt-5-with-shopify-context" : "gpt-5");
+  if (provider.provider.type === "openai") {
+    const response = await createOpenAIJsonResponse<LooseRecord>({
+      apiKey: provider.credential.value,
+      model: provider.provider.model ?? "gpt-5",
+      instructions: systemPrompt,
+      input: requestBody,
+      schema,
+      maxOutputTokens: 5200,
+      reasoningEffort: "low"
+    });
+    generated = response.json;
+  } else if (provider.provider.type === "gemini") {
+    const response = await createGeminiJsonResponse<LooseRecord>({
+      apiKey: provider.credential.source === "oauth" ? undefined : provider.credential.value,
+      accessToken: provider.credential.source === "oauth" ? provider.credential.value : undefined,
+      googleProjectId: provider.credential.source === "oauth" ? String(provider.credential.metadata?.project_id ?? "") : undefined,
+      model: provider.provider.model ?? "gemini-2.5-flash",
+      systemInstruction: systemPrompt,
+      textPrompt: requestBody,
+      schema
+    });
+    generated = response.json;
+  } else if (provider.provider.type === "anthropic") {
+    const response = await createAnthropicJsonResponse<LooseRecord>({
+      apiKey: provider.credential.value,
+      model: provider.provider.model ?? "claude-sonnet-4-20250514",
+      systemInstruction: systemPrompt,
+      textPrompt: `${requestBody}\n\nReturn valid JSON matching this schema exactly: ${JSON.stringify((schema as { schema: unknown }).schema)}`,
+      maxTokens: 5200
+    });
+    generated = response.json;
+  } else {
+    throw new Error(`Unsupported guide provider type: ${provider.provider.type}`);
+  }
+
+  return normalizeGeneratedPolicy(
+    starterPolicy,
+    generated,
+    input,
+    shopifyContext ? `${provider.provider.type}-with-shopify-context` : provider.provider.type
+  );
 }
 
 export async function runExpertGenerate({ root, jobId, input }: { root: string; jobId: string; input: LooseRecord }) {
@@ -375,37 +432,45 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
   let policy: PolicyDocument = starterPolicy;
   const shouldResearch = Boolean(input.research);
   let researchNotes: Array<{ title: string; link: string; snippet?: string }> = [];
+  const existingLearningText = await readText(paths.learningMarkdown, "");
 
   if (shopifyContext) {
-    reasoning.push("Fetched sample Shopify product structure to adapt the policy to the connected store.");
+    reasoning.push("Fetched Shopify sample structure and metafield definitions to adapt the Catalog Guide.");
   }
 
   if (shouldResearch) {
     try {
       researchNotes = await getResearchNotes(root, input);
       if (researchNotes.length > 0) {
-        reasoning.push(`Collected ${researchNotes.length} optional research note(s) for policy generation.`);
+        reasoning.push(`Collected ${researchNotes.length} optional research note(s) for guide generation.`);
       }
     } catch (error) {
       warnings.push(`Optional research failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  if (providerReady(llmProvider) && llmProvider.provider.type === "openai") {
+  if (providerReady(llmProvider) && ["openai", "gemini", "anthropic"].includes(llmProvider.provider.type)) {
     try {
-      policy = await generateWithOpenAI(llmProvider, input, starterPolicy, shopifyContext, researchNotes);
-      reasoning.push(`Generated the policy pack with ${llmProvider.providerAlias}.`);
+      policy = await generateWithProvider(llmProvider, input, starterPolicy, shopifyContext, researchNotes, existingLearningText);
+      reasoning.push(`Generated the Catalog Guide with ${llmProvider.providerAlias}.`);
     } catch (error) {
-      warnings.push(`GPT-5 policy generation failed: ${error instanceof Error ? error.message : String(error)}`);
-      reasoning.push("Fell back to the starter policy template because GPT-5 policy generation was unavailable.");
+      warnings.push(`Catalog Guide generation failed: ${error instanceof Error ? error.message : String(error)}`);
+      reasoning.push("Fell back to the starter Catalog Guide template because provider-based generation was unavailable.");
     }
   } else {
-    reasoning.push("No ready OpenAI provider was configured for catalogue-expert; generated a starter template policy.");
+    reasoning.push("No ready LLM provider was configured for catalogue-expert; generated a starter Catalog Guide template.");
   }
 
   await writeJson(paths.policyJson, policy);
   await writeText(paths.policyMarkdown, renderPolicyMarkdown(policy));
-  await writeText(paths.learningMarkdown, initialLearningMarkdown(policy));
+  if (!(await exists(paths.learningMarkdown))) {
+    await writeText(paths.learningMarkdown, initialLearningMarkdown(policy));
+  } else {
+    const currentLearning = await readText(paths.learningMarkdown, "");
+    if (!currentLearning.trim() || /No lessons recorded yet\./i.test(currentLearning)) {
+      await writeText(paths.learningMarkdown, initialLearningMarkdown(policy));
+    }
+  }
 
   return createBaseResult({
     jobId,
@@ -422,6 +487,7 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
     warnings,
     reasoning: [
       ...reasoning,
+      "Rendered the Markdown Catalog Guide directly from the JSON source of truth.",
       "Initialized the learning file for future review outcomes."
     ],
     artifacts: {
@@ -430,8 +496,8 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
       research_used: shouldResearch && researchNotes.length > 0
     },
     nextActions: [
-      "Review the generated policy files before running enrichment and QA workflows.",
-      "Use `catalog expert generate --research true` only when you explicitly want web research folded into the policy."
+      "Review the generated Catalog Guide files before running enrichment and QA workflows.",
+      "Use `catalog guide show` to inspect the current guide summary."
     ]
   });
 }

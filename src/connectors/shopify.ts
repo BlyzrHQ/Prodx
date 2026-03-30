@@ -1,3 +1,6 @@
+import crypto from "node:crypto";
+import http from "node:http";
+import { spawn } from "node:child_process";
 import type { ProductRecord, ProductVariant, ShopifyPayload } from "../types.js";
 
 interface CreateMediaInput {
@@ -13,12 +16,25 @@ interface MetafieldInput {
   value: string;
 }
 
+type ShopifyMetafieldDefinitionMap = Map<string, { type: string }>;
+
 interface ShopifyGraphqlRequest {
   store: string;
   apiVersion?: string;
   accessToken: string;
   query: string;
   variables?: Record<string, unknown>;
+}
+
+interface ShopifyOAuthResponse {
+  access_token: string;
+  scope?: string;
+  scopes?: string[];
+  expires_in?: number;
+  associated_user_scope?: string;
+  refresh_token?: string;
+  refresh_token_expires_in?: number;
+  token_type?: string;
 }
 
 interface ShopifyGraphqlResponse<T> {
@@ -28,6 +44,10 @@ interface ShopifyGraphqlResponse<T> {
 
 function buildGraphqlUrl(store: string, apiVersion = "2025-04"): string {
   return `https://${store}/admin/api/${apiVersion}/graphql.json`;
+}
+
+function isShopifyProductGid(value: unknown): value is string {
+  return typeof value === "string" && /^gid:\/\/shopify\/Product\/.+$/i.test(value.trim());
 }
 
 async function shopifyGraphql<T>({
@@ -81,19 +101,160 @@ export function buildShopifyPayload(product: ProductRecord): ShopifyPayload {
     ...(Array.isArray(product.images) ? product.images.filter((item) => typeof item === "string") : [])
   ].filter((value, index, items): value is string => Boolean(value) && items.indexOf(value) === index);
 
+  const firstVariant = Array.isArray(product.variants) && product.variants.length > 0
+    ? product.variants[0] as ProductVariant
+    : null;
+
   return {
     id: product.id ?? null,
     title: product.title,
     handle: product.handle,
     descriptionHtml: product.description_html ?? product.description ?? "",
-    vendor: product.brand ?? product.vendor ?? "",
+    vendor: product.vendor ?? product.brand ?? "",
     productType: product.product_type ?? "",
     tags: product.tags ?? [],
     variants: product.variants ?? [],
+    price: typeof firstVariant?.price === "string" ? firstVariant.price : product.price,
+    compareAtPrice: typeof firstVariant?.compare_at_price === "string" ? firstVariant.compare_at_price : product.compare_at_price,
     featuredImage: imageCandidates[0] ?? "",
     images: imageCandidates,
     imageAltText: typeof product.image_alt_text === "string" ? product.image_alt_text : product.title ?? "",
     metafields: Array.isArray(product.metafields) ? product.metafields : []
+  };
+}
+
+function normalizeShopDomain(store: string): string {
+  const trimmed = store.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  return trimmed.endsWith(".myshopify.com") ? trimmed : `${trimmed}.myshopify.com`;
+}
+
+function buildOauthHmac(params: URLSearchParams, clientSecret: string): string {
+  const message = [...params.entries()]
+    .filter(([key]) => key !== "hmac" && key !== "signature")
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("&");
+
+  return crypto.createHmac("sha256", clientSecret).update(message).digest("hex");
+}
+
+function openBrowser(url: string): void {
+  const platform = process.platform;
+  if (platform === "win32") {
+    spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
+  if (platform === "darwin") {
+    spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
+  spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+}
+
+export async function authenticateShopifyViaOAuth({
+  store,
+  clientId,
+  clientSecret,
+  scopes = ["write_products", "read_products", "read_metafields", "write_metafields"],
+  openBrowserWindow = true
+}: {
+  store: string;
+  clientId: string;
+  clientSecret: string;
+  scopes?: string[];
+  openBrowserWindow?: boolean;
+}): Promise<ShopifyOAuthResponse & { store: string; method: "oauth"; obtained_at: string }> {
+  const normalizedStore = normalizeShopDomain(store);
+  const state = crypto.randomBytes(16).toString("hex");
+  const callbackServer = await new Promise<{ redirectUri: string; codePromise: Promise<string> }>((resolve, reject) => {
+    const server = http.createServer((request, response) => {
+      const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (requestUrl.pathname !== "/oauth/callback") {
+        response.statusCode = 404;
+        response.end("Not found");
+        return;
+      }
+
+      try {
+        const code = requestUrl.searchParams.get("code") ?? "";
+        const callbackState = requestUrl.searchParams.get("state") ?? "";
+        const callbackShop = normalizeShopDomain(requestUrl.searchParams.get("shop") ?? "");
+        const hmac = requestUrl.searchParams.get("hmac") ?? "";
+        if (!code) throw new Error("Missing Shopify authorization code.");
+        if (callbackState !== state) throw new Error("State verification failed for Shopify OAuth.");
+        if (callbackShop !== normalizedStore) throw new Error("Shopify OAuth callback returned a different shop domain.");
+        const computedHmac = buildOauthHmac(requestUrl.searchParams, clientSecret);
+        if (!hmac || computedHmac !== hmac) throw new Error("Shopify OAuth HMAC verification failed.");
+
+        response.statusCode = 200;
+        response.setHeader("Content-Type", "text/html; charset=utf-8");
+        response.end("<html><body><h1>Shopify authentication complete</h1><p>You can close this window and return to the CLI.</p></body></html>");
+        server.close();
+        codeResolver(code);
+      } catch (error) {
+        response.statusCode = 400;
+        response.setHeader("Content-Type", "text/html; charset=utf-8");
+        response.end(`<html><body><h1>Shopify authentication failed</h1><p>${error instanceof Error ? error.message : String(error)}</p></body></html>`);
+        server.close();
+        codeRejecter(error);
+      }
+    });
+
+    let codeResolver!: (code: string) => void;
+    let codeRejecter!: (error: unknown) => void;
+    const codePromise = new Promise<string>((resolveCode, rejectCode) => {
+      codeResolver = resolveCode;
+      codeRejecter = rejectCode;
+    });
+
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("Failed to start local Shopify OAuth callback server."));
+        return;
+      }
+      resolve({ redirectUri: `http://127.0.0.1:${address.port}/oauth/callback`, codePromise });
+    });
+
+    const timer = setTimeout(() => {
+      server.close();
+      codeRejecter(new Error("Timed out waiting for Shopify OAuth callback."));
+    }, 300000);
+    codePromise.finally(() => clearTimeout(timer)).catch(() => {});
+  });
+
+  const authorizeUrl = new URL(`https://${normalizedStore}/admin/oauth/authorize`);
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("scope", scopes.join(","));
+  authorizeUrl.searchParams.set("redirect_uri", callbackServer.redirectUri);
+  authorizeUrl.searchParams.set("state", state);
+
+  if (openBrowserWindow) {
+    openBrowser(authorizeUrl.toString());
+  }
+
+  const code = await callbackServer.codePromise;
+  const tokenResponse = await fetch(`https://${normalizedStore}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code
+    })
+  });
+  const payload = await tokenResponse.json() as ShopifyOAuthResponse;
+  if (!tokenResponse.ok || !payload.access_token) {
+    throw new Error(`Shopify OAuth token exchange failed: ${tokenResponse.status} ${JSON.stringify(payload)}`);
+  }
+
+  return {
+    ...payload,
+    store: normalizedStore,
+    method: "oauth",
+    obtained_at: new Date().toISOString()
   };
 }
 
@@ -116,6 +277,76 @@ function buildMediaInputs(payload: ShopifyPayload): CreateMediaInput[] {
     alt,
     mediaContentType: "IMAGE" as const
   }));
+}
+
+async function fetchProductMetafieldDefinitionsMap({
+  store,
+  apiVersion = "2025-04",
+  accessToken
+}: {
+  store: string;
+  apiVersion?: string;
+  accessToken: string;
+}): Promise<ShopifyMetafieldDefinitionMap> {
+  const data = await shopifyGraphql<{
+    metafieldDefinitions?: {
+      edges?: Array<{
+        node: {
+          namespace?: string;
+          key?: string;
+          type?: { name?: string };
+        };
+      }>;
+    };
+  }>({
+    store,
+    apiVersion,
+    accessToken,
+    query: `
+      query CatalogToolkitMetafieldDefinitions {
+        metafieldDefinitions(first: 100, ownerType: PRODUCT) {
+          edges {
+            node {
+              namespace
+              key
+              type {
+                name
+              }
+            }
+          }
+        }
+      }
+    `
+  });
+
+  const definitions: ShopifyMetafieldDefinitionMap = new Map();
+  for (const edge of data.metafieldDefinitions?.edges ?? []) {
+    const namespace = edge.node.namespace ?? "";
+    const key = edge.node.key ?? "";
+    const type = edge.node.type?.name ?? "";
+    if (!namespace || !key || !type) continue;
+    definitions.set(`${namespace}.${key}`, { type });
+  }
+  return definitions;
+}
+
+function isMetaobjectGid(value: string): boolean {
+  return /^gid:\/\/shopify\/Metaobject\/.+$/i.test(value.trim());
+}
+
+function isCompatibleMetafieldValue(type: string, value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (type === "metaobject_reference") return isMetaobjectGid(trimmed);
+  if (type === "list.metaobject_reference") {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) && parsed.every((item) => typeof item === "string" && isMetaobjectGid(item));
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export async function testShopifyConnection({
@@ -249,6 +480,8 @@ export async function fetchShopifyPolicyContext({
     required: boolean;
     source_field: string;
     value: string;
+    validation_rules: string[];
+    example_values: string[];
   }>;
 }> {
   const data = await shopifyGraphql<{
@@ -313,7 +546,7 @@ export async function fetchShopifyPolicyContext({
             }
           }
         }
-        metafieldDefinitions(first: 25, ownerType: PRODUCT) {
+        metafieldDefinitions(first: 100, ownerType: PRODUCT) {
           edges {
             node {
               namespace
@@ -358,12 +591,23 @@ export async function fetchShopifyPolicyContext({
       description: node.description ?? node.name ?? "",
       required: (node.validations ?? []).some((validation) => validation.name === "required" && String(validation.value).toLowerCase() === "true"),
       source_field: "",
-      value: ""
+      value: "",
+      validation_rules: (node.validations ?? [])
+        .filter((validation) => typeof validation.name === "string" && validation.name.trim().length > 0)
+        .map((validation) => {
+          const name = String(validation.name);
+          const value = validation.value === undefined || validation.value === null ? "" : String(validation.value);
+          return value ? `${name}: ${value}` : name;
+        }),
+      example_values: []
     })).filter((definition) => definition.namespace && definition.key)
   };
 }
 
-function buildProductInput(payload: ShopifyPayload): Record<string, unknown> {
+function buildProductInput(
+  payload: ShopifyPayload,
+  options?: { includeId?: boolean; definitions?: ShopifyMetafieldDefinitionMap }
+): Record<string, unknown> {
   const metafields: MetafieldInput[] = Array.isArray(payload.metafields)
     ? payload.metafields.flatMap((item) => {
         if (!item || typeof item !== "object") return [];
@@ -372,12 +616,17 @@ function buildProductInput(payload: ShopifyPayload): Record<string, unknown> {
         const type = typeof item.type === "string" ? item.type : "single_line_text_field";
         const value = typeof item.value === "string" ? item.value : "";
         if (!namespace || !key || !value) return [];
+        const definition = options?.definitions?.get(`${namespace}.${key}`);
+        if (definition) {
+          if (definition.type !== type) return [];
+          if (!isCompatibleMetafieldValue(definition.type, value)) return [];
+        }
         return [{ namespace, key, type, value }];
       })
     : [];
 
   return {
-    ...(payload.id ? { id: payload.id } : {}),
+    ...(options?.includeId && isShopifyProductGid(payload.id) ? { id: payload.id } : {}),
     title: payload.title ?? "",
     handle: payload.handle ?? undefined,
     descriptionHtml: payload.descriptionHtml ?? "",
@@ -386,6 +635,84 @@ function buildProductInput(payload: ShopifyPayload): Record<string, unknown> {
     tags: payload.tags ?? [],
     metafields
   };
+}
+
+function getSingleVariantPayload(payload: ShopifyPayload): ProductVariant | null {
+  if (Array.isArray(payload.variants) && payload.variants.length > 0) {
+    return payload.variants[0] as ProductVariant;
+  }
+
+  const hasStandaloneFields = [
+    payload.price,
+    payload.compareAtPrice
+  ].some((value) => typeof value === "string" && value.trim().length > 0);
+
+  if (!hasStandaloneFields) return null;
+
+  return {
+    title: "Default Title",
+    option1: "Default Title",
+    price: payload.price,
+    compare_at_price: payload.compareAtPrice
+  };
+}
+
+async function updateStandaloneVariant({
+  store,
+  apiVersion,
+  accessToken,
+  productId,
+  variantId,
+  payload
+}: {
+  store: string;
+  apiVersion: string;
+  accessToken: string;
+  productId: string;
+  variantId: string;
+  payload: ShopifyPayload;
+}): Promise<void> {
+  const sourceVariant = getSingleVariantPayload(payload);
+  if (!sourceVariant) return;
+
+  const variantsInput: Array<Record<string, unknown>> = [{
+    id: variantId,
+    ...(typeof sourceVariant.price === "string" && sourceVariant.price.trim().length > 0 ? { price: sourceVariant.price } : {}),
+    ...(typeof sourceVariant.compare_at_price === "string" && sourceVariant.compare_at_price.trim().length > 0 ? { compareAtPrice: sourceVariant.compare_at_price } : {}),
+    ...(typeof sourceVariant.sku === "string" && sourceVariant.sku.trim().length > 0 ? { sku: sourceVariant.sku } : {}),
+    ...(typeof sourceVariant.barcode === "string" && sourceVariant.barcode.trim().length > 0 ? { barcode: sourceVariant.barcode } : {})
+  }];
+
+  if (Object.keys(variantsInput[0]).length <= 1) return;
+
+  const data = await shopifyGraphql<{
+    productVariantsBulkUpdate: {
+      userErrors?: Array<{ field?: string[]; message: string }>;
+    };
+  }>({
+    store,
+    apiVersion,
+    accessToken,
+    query: `
+      mutation CatalogToolkitProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+        productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    variables: {
+      productId,
+      variants: variantsInput
+    }
+  });
+
+  const errors = data.productVariantsBulkUpdate.userErrors ?? [];
+  if (errors.length > 0) {
+    throw new Error(`Shopify productVariantsBulkUpdate failed: ${errors.map((item) => item.message).join("; ")}`);
+  }
 }
 
 export async function applyShopifyPayload({
@@ -401,14 +728,15 @@ export async function applyShopifyPayload({
 }): Promise<{ mode: "create" | "update"; productId: string; handle?: string; variantSupport: string }> {
   const variantCount = Array.isArray(payload.variants) ? payload.variants.length : 0;
   const media = buildMediaInputs(payload);
+  const definitions = await fetchProductMetafieldDefinitionsMap({ store, apiVersion, accessToken });
   if (variantCount > 1) {
     throw new Error("Live Shopify apply currently supports products with zero or one variant only. Review multi-variant payloads manually before live apply.");
   }
 
-  if (payload.id) {
+  if (isShopifyProductGid(payload.id)) {
     const data = await shopifyGraphql<{
       productUpdate: {
-        product?: { id: string; handle?: string };
+        product?: { id: string; handle?: string; variants?: { nodes?: Array<{ id: string }> } };
         userErrors?: Array<{ field?: string[]; message: string }>;
       };
     }>({
@@ -421,6 +749,11 @@ export async function applyShopifyPayload({
             product {
               id
               handle
+              variants(first: 1) {
+                nodes {
+                  id
+                }
+              }
               media(first: 10) {
                 nodes {
                   mediaContentType
@@ -435,7 +768,7 @@ export async function applyShopifyPayload({
         }
       `,
       variables: {
-        product: buildProductInput(payload),
+        product: buildProductInput(payload, { includeId: true, definitions }),
         media
       }
     });
@@ -445,9 +778,22 @@ export async function applyShopifyPayload({
       throw new Error(`Shopify productUpdate failed: ${errors.map((item) => item.message).join("; ")}`);
     }
 
+    const updatedProductId = data.productUpdate.product?.id ?? String(payload.id);
+    const updatedVariantId = data.productUpdate.product?.variants?.nodes?.[0]?.id ?? "";
+    if (updatedProductId && updatedVariantId) {
+      await updateStandaloneVariant({
+        store,
+        apiVersion,
+        accessToken,
+        productId: updatedProductId,
+        variantId: updatedVariantId,
+        payload
+      });
+    }
+
     return {
       mode: "update",
-      productId: data.productUpdate.product?.id ?? String(payload.id),
+      productId: updatedProductId,
       handle: data.productUpdate.product?.handle,
       variantSupport: variantCount <= 1 ? "single_variant_or_default" : "unsupported"
     };
@@ -455,7 +801,7 @@ export async function applyShopifyPayload({
 
   const data = await shopifyGraphql<{
     productCreate: {
-      product?: { id: string; handle?: string };
+      product?: { id: string; handle?: string; variants?: { nodes?: Array<{ id: string }> } };
       userErrors?: Array<{ field?: string[]; message: string }>;
     };
   }>({
@@ -468,6 +814,11 @@ export async function applyShopifyPayload({
           product {
             id
             handle
+            variants(first: 1) {
+              nodes {
+                id
+              }
+            }
             media(first: 10) {
               nodes {
                 mediaContentType
@@ -482,7 +833,7 @@ export async function applyShopifyPayload({
       }
     `,
     variables: {
-      product: buildProductInput(payload),
+      product: buildProductInput(payload, { definitions }),
       media
     }
   });
@@ -492,9 +843,22 @@ export async function applyShopifyPayload({
     throw new Error(`Shopify productCreate failed: ${errors.map((item) => item.message).join("; ")}`);
   }
 
+  const createdProductId = data.productCreate.product?.id ?? "";
+  const createdVariantId = data.productCreate.product?.variants?.nodes?.[0]?.id ?? "";
+  if (createdProductId && createdVariantId) {
+    await updateStandaloneVariant({
+      store,
+      apiVersion,
+      accessToken,
+      productId: createdProductId,
+      variantId: createdVariantId,
+      payload
+    });
+  }
+
   return {
     mode: "create",
-    productId: data.productCreate.product?.id ?? "",
+    productId: createdProductId,
     handle: data.productCreate.product?.handle,
     variantSupport: variantCount <= 1 ? "single_variant_or_default" : "unsupported"
   };

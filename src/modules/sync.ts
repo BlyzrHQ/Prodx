@@ -9,12 +9,23 @@ export async function runSync({ root, jobId, input }: { root: string; jobId: str
   const payload = buildShopifyPayload(input);
   const variantCount = Array.isArray(payload.variants) ? payload.variants.length : 0;
   const imageCount = Array.isArray(payload.images) ? payload.images.length : 0;
+  const qaStatus = typeof input.qa_status === "string" ? input.qa_status.toUpperCase() : "";
+  const qaPassed = qaStatus === "PASS";
+  const blockingWarnings = [
+    ...(qaStatus && !qaPassed ? ["QA did not pass. Fix QA findings before syncing."] : []),
+    ...(variantCount > 1 ? ["Live apply currently supports zero or one variant only. Multi-variant payloads must be reviewed manually."] : [])
+  ];
+  const nonBlockingWarnings = [
+    ...(liveReady ? [] : ["Shopify provider is not fully configured for live apply."]),
+    ...(imageCount === 0 ? ["No product image is currently attached to the Shopify payload."] : [])
+  ];
+  const needsReview = blockingWarnings.length > 0;
 
   return createBaseResult({
     jobId,
     module: "shopify-sync",
     status: "success",
-    needsReview: true,
+    needsReview,
     proposedChanges: {
       shopify_payload: payload,
       live_apply_ready: liveReady,
@@ -22,15 +33,13 @@ export async function runSync({ root, jobId, input }: { root: string; jobId: str
       variant_count: variantCount,
       image_count: imageCount
     },
-    warnings: [
-      ...(liveReady ? [] : ["Shopify provider is not fully configured for live apply."]),
-      ...(variantCount > 1 ? ["Live apply currently supports zero or one variant only. Multi-variant payloads must be reviewed manually."] : []),
-      ...(imageCount === 0 ? ["No product image is currently attached to the Shopify payload."] : [])
-    ],
+    warnings: [...blockingWarnings, ...nonBlockingWarnings],
     reasoning: ["Built a Shopify-ready payload from the current product input, including any selected image URLs."],
     artifacts: {
       provider_used: shopifyProvider?.providerAlias ?? null
     },
-    nextActions: ["Review the payload and approve before `catalog apply`."]
+    nextActions: needsReview
+      ? ["Resolve blocking QA or sync issues before applying this payload."]
+      : ["Ready for `catalog apply` or `catalog apply --live`."]
   });
 }

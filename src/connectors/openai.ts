@@ -9,7 +9,8 @@ export async function createOpenAIJsonResponse<T>({
   input,
   schema,
   maxOutputTokens = 1200,
-  reasoningEffort
+  reasoningEffort,
+  webSearch
 }: {
   apiKey: string;
   model: string;
@@ -18,6 +19,12 @@ export async function createOpenAIJsonResponse<T>({
   schema: { name?: string; schema: unknown };
   maxOutputTokens?: number;
   reasoningEffort?: "minimal" | "low" | "medium" | "high";
+  webSearch?: {
+    enabled: boolean;
+    allowedDomains?: string[];
+    externalWebAccess?: boolean;
+    includeSources?: boolean;
+  };
 }): Promise<ConnectorJsonResponse<T>> {
   const requestBody = {
     model,
@@ -25,6 +32,21 @@ export async function createOpenAIJsonResponse<T>({
     input,
     max_output_tokens: maxOutputTokens,
     ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+    ...(webSearch?.enabled ? {
+      tools: [
+        {
+          type: "web_search",
+          ...(Array.isArray(webSearch.allowedDomains) && webSearch.allowedDomains.length > 0
+            ? { filters: { allowed_domains: webSearch.allowedDomains } }
+            : {}),
+          ...(typeof webSearch.externalWebAccess === "boolean"
+            ? { external_web_access: webSearch.externalWebAccess }
+            : {})
+        }
+      ],
+      tool_choice: "auto",
+      ...(webSearch.includeSources ? { include: ["web_search_call.action.sources"] } : {})
+    } : {}),
     text: {
       format: {
         type: "json_schema",
@@ -93,6 +115,7 @@ export async function analyzeImageWithOpenAI<T>({
   instructions,
   prompt,
   imageUrl,
+  imageUrls,
   schema,
   maxOutputTokens = 1200,
   reasoningEffort
@@ -101,11 +124,18 @@ export async function analyzeImageWithOpenAI<T>({
   model: string;
   instructions: string;
   prompt: string;
-  imageUrl: string;
+  imageUrl?: string;
+  imageUrls?: string[];
   schema: { name?: string; schema: unknown };
   maxOutputTokens?: number;
   reasoningEffort?: "minimal" | "low" | "medium" | "high";
 }): Promise<ConnectorJsonResponse<T>> {
+  const resolvedImageUrls = Array.isArray(imageUrls) && imageUrls.length > 0
+    ? imageUrls
+    : imageUrl
+      ? [imageUrl]
+      : [];
+
   return createOpenAIJsonResponse<T>({
     apiKey,
     model,
@@ -121,13 +151,60 @@ export async function analyzeImageWithOpenAI<T>({
             type: "input_text",
             text: prompt
           },
-          {
-            type: "input_image",
-            image_url: imageUrl
-          }
+          ...resolvedImageUrls.map((url) => ({
+            type: "input_image" as const,
+            image_url: url
+          }))
         ]
       }
     ]
+  });
+}
+
+export function extractOpenAIWebSources(raw: unknown): Array<{ title?: string; url?: string; snippet?: string }> {
+  const discovered: Array<{ title?: string; url?: string; snippet?: string }> = [];
+
+  function visit(value: unknown, depth = 0): void {
+    if (depth > 8 || value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    if (typeof value !== "object") return;
+
+    const record = value as Record<string, unknown>;
+    const url = typeof record.url === "string"
+      ? record.url
+      : typeof record.uri === "string"
+        ? record.uri
+        : undefined;
+    const title = typeof record.title === "string"
+      ? record.title
+      : typeof record.name === "string"
+        ? record.name
+        : undefined;
+    const snippet = typeof record.snippet === "string"
+      ? record.snippet
+      : typeof record.text === "string"
+        ? record.text
+        : undefined;
+
+    if (url || title) {
+      discovered.push({ title, url, snippet });
+    }
+
+    Object.values(record).forEach((child) => visit(child, depth + 1));
+  }
+
+  visit(raw);
+
+  const seen = new Set<string>();
+  return discovered.filter((item) => {
+    const key = `${item.url ?? ""}|${item.title ?? ""}`;
+    if (!item.url && !item.title) return false;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
 }
 

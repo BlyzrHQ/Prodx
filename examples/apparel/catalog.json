@@ -1,0 +1,17 @@
+[
+  {
+    "id": "apparel-prod-100",
+    "title": "Oversized Cotton T-Shirt",
+    "price": "31.00"
+  },
+  {
+    "id": "apparel-prod-101",
+    "title": "Relaxed Fit Denim Jacket",
+    "price": "89.00"
+  },
+  {
+    "id": "apparel-prod-102",
+    "title": "Wide-Leg Linen Trousers",
+    "price": "69.00"
+  }
+]

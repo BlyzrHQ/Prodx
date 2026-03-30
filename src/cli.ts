@@ -2,17 +2,22 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { emitKeypressEvents } from "node:readline";
 import { stdin as rlInput, stdout as rlOutput } from "node:process";
 import { pathToFileURL } from "node:url";
 import { parseArgs, requireFlag } from "./lib/args.js";
+import { materializeProposedChanges } from "./lib/change-records.js";
 import { initWorkspace, loadRuntimeConfig, saveRuntimeConfig, setRuntimeValue, getRuntimeValue } from "./lib/runtime.js";
-import { setCredential, listCredentials, testCredential } from "./lib/credentials.js";
+import { setCredential, setOAuthCredential, listCredentials, testCredential } from "./lib/credentials.js";
 import { getWorkspaceRoot, getCatalogPaths } from "./lib/paths.js";
 import { readJson, readText, writeJson } from "./lib/fs.js";
 import { createRun, loadRun, writeModuleArtifacts, writeDecision, writeApplyResult } from "./lib/artifacts.js";
-import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writeReviewQueueCsv, writeShopifyImportCsv } from "./lib/generated.js";
+import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writeReviewQueueCsv, writeShopifyImportCsv, writeWorkflowProductsLedger } from "./lib/generated.js";
 import { resolveProvider } from "./lib/providers.js";
-import { testShopifyConnection, fetchShopifyCatalogSnapshot, applyShopifyPayload } from "./connectors/shopify.js";
+import { getGuidePassingScore } from "./lib/catalog-guide.js";
+import { INDUSTRY_OPTIONS } from "./lib/policy-template.js";
+import { testShopifyConnection, fetchShopifyCatalogSnapshot, applyShopifyPayload, authenticateShopifyViaOAuth } from "./connectors/shopify.js";
+import { authenticateGeminiViaOAuth } from "./connectors/gemini.js";
 import { runExpertGenerate } from "./modules/expert.js";
 import { loadRecordsFromSource, runIngest } from "./modules/ingest.js";
 import { runMatchDecision, buildCatalogIndex } from "./modules/match.js";
@@ -190,6 +195,22 @@ function renderWorkflowSummary(summary: { input: string; total: number; processe
   return `${lines.join("\n")}\n`;
 }
 
+function renderPublishSummary(payload: { live: boolean; published: number; skipped: Array<{ job_id: string; reason: string }>; jobs: string[] }): string {
+  const lines = [
+    `${payload.live ? "Live publish" : "Local publish"} complete`,
+    `Published: ${payload.published}`
+  ];
+  if (payload.jobs.length > 0) {
+    lines.push("", "Published jobs:");
+    payload.jobs.forEach((jobId) => lines.push(`- ${jobId}`));
+  }
+  if (payload.skipped.length > 0) {
+    lines.push("", "Skipped:");
+    payload.skipped.forEach((item) => lines.push(`- ${item.job_id}: ${item.reason}`));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 function renderConfigSet(pathExpression: string, value: unknown): string {
   return `Updated config: ${pathExpression} = ${formatValue(value)}\n`;
 }
@@ -223,7 +244,7 @@ async function loadInputFile(filePath: string): Promise<LooseRecord> {
 
 async function getPolicyOrThrow(root: string): Promise<PolicyDocument> {
   const policy = await readJson<PolicyDocument | null>(getCatalogPaths(root).policyJson, null);
-  if (!policy) throw new Error("No policy found. Run `catalog expert generate` first.");
+  if (!policy) throw new Error("No Catalog Guide found. Run `catalog guide generate` or `catalog expert generate` first.");
   return policy;
 }
 
@@ -231,6 +252,118 @@ async function askText(rl: readline.Interface, prompt: string, defaultValue = ""
   const suffix = defaultValue ? ` [${defaultValue}]` : "";
   const answer = (await rl.question(`${prompt}${suffix}: `)).trim();
   return answer || defaultValue;
+}
+
+async function askChoice(rl: readline.Interface, prompt: string, options: string[], defaultValue: string): Promise<string> {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    return askArrowChoice(prompt, options, defaultValue);
+  }
+  const lines = [prompt];
+  options.forEach((option, index) => {
+    const isDefault = option === defaultValue ? " (default)" : "";
+    lines.push(`  ${index + 1}. ${option}${isDefault}`);
+  });
+  const answer = (await rl.question(`${lines.join("\n")}\nChoose an option: `)).trim();
+  if (!answer) return defaultValue;
+  const index = Number(answer);
+  if (Number.isInteger(index) && index >= 1 && index <= options.length) {
+    return options[index - 1];
+  }
+  return options.includes(answer) ? answer : defaultValue;
+}
+
+async function askArrowChoice(prompt: string, options: string[], defaultValue: string): Promise<string> {
+  const startIndex = Math.max(0, options.indexOf(defaultValue));
+  let selectedIndex = startIndex >= 0 ? startIndex : 0;
+  const input = process.stdin;
+  const output = process.stdout;
+  const linesInBlock = options.length + 4;
+  const linesUpToTop = Math.max(0, linesInBlock - 1);
+  let renderedOnce = false;
+
+  emitKeypressEvents(input);
+  const wasRaw = Boolean((input as typeof input & { isRaw?: boolean }).isRaw);
+  if (typeof input.setRawMode === "function" && !wasRaw) {
+    input.setRawMode(true);
+  }
+
+  const render = () => {
+    if (!renderedOnce) {
+      output.write("\n");
+      renderedOnce = true;
+    } else {
+      output.write(`\x1b[${linesUpToTop}F`);
+    }
+
+    const lines = [
+      `? ${prompt}`,
+      "",
+      ...options.map((option, index) => {
+        const marker = index === selectedIndex ? ">" : " ";
+        const label = option === defaultValue ? `${option} (default)` : option;
+        return ` ${marker} ${label}`;
+      }),
+      "",
+      "Use Up/Down and Enter to choose."
+    ];
+
+    for (let index = 0; index < lines.length; index += 1) {
+      output.write("\x1b[2K\r");
+      output.write(lines[index]);
+      if (index < lines.length - 1) output.write("\n");
+    }
+  };
+
+  const clearBlock = () => {
+    if (!renderedOnce) return;
+    output.write(`\x1b[${linesUpToTop}F`);
+    for (let index = 0; index < linesInBlock; index += 1) {
+      output.write("\x1b[2K\r");
+      if (index < linesInBlock - 1) output.write("\n");
+    }
+    output.write(`\x1b[${linesUpToTop}F`);
+  };
+
+  render();
+
+  return await new Promise<string>((resolve, reject) => {
+    const onKeypress = (_: string, key: { name?: string; ctrl?: boolean }) => {
+      if (key.ctrl && key.name === "c") {
+        cleanup();
+        reject(new Error("Interactive setup cancelled."));
+        return;
+      }
+
+      if (key.name === "up") {
+        selectedIndex = (selectedIndex - 1 + options.length) % options.length;
+        render();
+        return;
+      }
+
+      if (key.name === "down") {
+        selectedIndex = (selectedIndex + 1) % options.length;
+        render();
+        return;
+      }
+
+      if (key.name === "return" || key.name === "enter") {
+        const selected = options[selectedIndex];
+        cleanup();
+        clearBlock();
+        output.write(`? ${prompt}: ${selected}\n`);
+        resolve(selected);
+      }
+    };
+
+    const cleanup = () => {
+      input.off("keypress", onKeypress);
+      if (typeof input.setRawMode === "function" && !wasRaw) {
+        input.setRawMode(false);
+      }
+    };
+
+    input.on("keypress", onKeypress);
+  });
 }
 
 async function askYesNo(rl: readline.Interface, prompt: string, defaultValue = true): Promise<boolean> {
@@ -246,6 +379,35 @@ async function maybePromptCredential(rl: readline.Interface, alias: string, prom
   const value = await askText(rl, prompt, "");
   if (value) await setCredential(alias, value);
   return Boolean(value);
+}
+
+async function configureLlmCredential(rl: readline.Interface, providerName: string, stdout: OutputWriter): Promise<boolean> {
+  if (providerName === "gemini") {
+    const connectionMode = await askChoice(rl, "Connection mode for gemini", ["api", "auth"], "api");
+    if (connectionMode === "auth") {
+      const clientId = await askText(rl, "Google OAuth client ID", "");
+      const clientSecret = await askText(rl, "Google OAuth client secret", "");
+      const projectId = await askText(rl, "Google Cloud project ID", "");
+      if (clientId && clientSecret && projectId) {
+        stdout.write("Starting Google OAuth in your browser...\n");
+        const session = await authenticateGeminiViaOAuth({
+          clientId,
+          clientSecret,
+          projectId
+        });
+        await setOAuthCredential("gemini", session);
+        return true;
+      }
+      return false;
+    }
+  }
+
+  const value = await askText(rl, `${providerName[0].toUpperCase()}${providerName.slice(1)} API key`, "");
+  if (value) {
+    await setCredential(providerName, value);
+    return true;
+  }
+  return false;
 }
 
 function isLiveTextMode(mode: OutputMode): boolean {
@@ -270,6 +432,104 @@ function deriveProductKeyFromRun(run: RunData): string {
   return run.result?.job_id ?? "unknown";
 }
 
+function normalizeIdentityValue(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getExportIdentity(record: LooseRecord | null | undefined): string {
+  if (!record || typeof record !== "object") return "";
+  const handle = typeof record.handle === "string" ? normalizeIdentityValue(record.handle) : "";
+  if (handle) return `handle:${handle}`;
+  const vendor = typeof record.vendor === "string" ? record.vendor : typeof record.brand === "string" ? record.brand : "";
+  const title = typeof record.title === "string" ? record.title : "";
+  const combined = normalizeIdentityValue(`${vendor} ${title}`);
+  return combined ? `title:${combined}` : "";
+}
+
+function getMatchDecision(record: LooseRecord | null | undefined): string {
+  const match = record?._catalog_match;
+  if (!match || typeof match !== "object") return "";
+  const decision = (match as LooseRecord).decision;
+  return typeof decision === "string" ? decision.toUpperCase() : "";
+}
+
+function getMatchNeedsReview(record: LooseRecord | null | undefined): boolean {
+  const match = record?._catalog_match;
+  if (!match || typeof match !== "object") return false;
+  return Boolean((match as LooseRecord).needs_review);
+}
+
+function getMatchBlockReason(record: LooseRecord | null | undefined): string | null {
+  const decision = getMatchDecision(record);
+  if (decision === "DUPLICATE") return "catalogue-match marked this product as DUPLICATE";
+  if (getMatchNeedsReview(record)) return "catalogue-match still needs review";
+  return null;
+}
+
+function getRepresentativeRank(record: LooseRecord | null | undefined): number {
+  const decision = getMatchDecision(record);
+  if (decision === "NEW_PRODUCT") return 0;
+  if (decision === "NEW_VARIANT") return 1;
+  if (!decision) return 2;
+  if (decision === "NEEDS_REVIEW") return 3;
+  if (decision === "DUPLICATE") return 4;
+  return 5;
+}
+
+function getRepresentativeConfidence(record: LooseRecord | null | undefined): number {
+  const match = record?._catalog_match;
+  if (!match || typeof match !== "object") return 0;
+  return Number((match as LooseRecord).confidence ?? 0);
+}
+
+function getRepresentativeQaScore(record: LooseRecord | null | undefined): number {
+  return Number(record?.qa_score ?? 0);
+}
+
+function selectRepresentativeProducts(products: LooseRecord[]): { selected: LooseRecord[]; shadowedKeys: Set<string> } {
+  const selectedByIdentity = new Map<string, LooseRecord>();
+  const shadowedKeys = new Set<string>();
+
+  for (const product of products) {
+    const identity = getExportIdentity(product);
+    if (!identity) {
+      selectedByIdentity.set(`unique:${getProductKey(product, "product")}`, product);
+      continue;
+    }
+
+    const existing = selectedByIdentity.get(identity);
+    if (!existing) {
+      selectedByIdentity.set(identity, product);
+      continue;
+    }
+
+    const currentRank = getRepresentativeRank(product);
+    const existingRank = getRepresentativeRank(existing);
+    const currentConfidence = getRepresentativeConfidence(product);
+    const existingConfidence = getRepresentativeConfidence(existing);
+    const currentQa = getRepresentativeQaScore(product);
+    const existingQa = getRepresentativeQaScore(existing);
+
+    const shouldReplace =
+      currentRank < existingRank
+      || (currentRank === existingRank && currentQa > existingQa)
+      || (currentRank === existingRank && currentQa === existingQa && currentConfidence > existingConfidence);
+
+    if (shouldReplace) {
+      shadowedKeys.add(getProductKey(existing, "product"));
+      selectedByIdentity.set(identity, product);
+    } else {
+      shadowedKeys.add(getProductKey(product, "product"));
+    }
+  }
+
+  return { selected: [...selectedByIdentity.values()], shadowedKeys };
+}
+
 async function loadReviewableRuns(root: string, flags: Flags): Promise<Array<{ run: RunData; product_key: string }>> {
   const runIds = await listRunIds(root);
   const loaded = await Promise.all(runIds.map(async (jobId) => ({ run: await loadRun(root, jobId), product_key: "" })));
@@ -283,6 +543,56 @@ async function loadReviewableRuns(root: string, flags: Flags): Promise<Array<{ r
       if (!flags.all && !item.run.result.needs_review) return false;
       return true;
     });
+}
+
+async function loadGeneratedProductCatalog(root: string): Promise<LooseRecord[]> {
+  const generatedDir = getCatalogPaths(root).generatedProductsDir;
+  const entries = await fs.readdir(generatedDir, { withFileTypes: true }).catch(() => []);
+  const productFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"))
+    .map((entry) => path.join(generatedDir, entry.name));
+  return Promise.all(productFiles.map((filePath) => readJson<LooseRecord>(filePath, {})));
+}
+
+async function loadPublishableSyncRuns(root: string): Promise<Array<{ run: RunData; product_key: string }>> {
+  const policy = await getPolicyOrThrow(root);
+  const passingScore = getGuidePassingScore(policy);
+  const runIds = await listRunIds(root);
+  const loaded = await Promise.all(runIds.map(async (jobId) => ({ run: await loadRun(root, jobId), product_key: "" })));
+  const latestByProduct = new Map<string, { run: RunData; product_key: string }>();
+
+  for (const item of loaded) {
+    if (!item.run.result || item.run.result.module !== "shopify-sync") continue;
+    const productKey = deriveProductKeyFromRun(item.run);
+    latestByProduct.set(productKey, { ...item, product_key: productKey });
+  }
+
+  return [...latestByProduct.values()].filter((item) => {
+    const result = item.run.result;
+    const input = item.run.input as LooseRecord | null;
+    const apply = item.run.apply as LooseRecord | null;
+    if (!result || result.module !== "shopify-sync") return false;
+    if (apply?.status === "applied_live") return false;
+    if (result.needs_review) return false;
+    if (!input || typeof input !== "object") return false;
+    const qaStatus = typeof input.qa_status === "string" ? input.qa_status.toUpperCase() : "";
+    const qaScore = Number(input.qa_score ?? 0);
+    return qaStatus === "PASS" && qaScore >= passingScore;
+  });
+}
+
+async function loadLatestSyncRuns(root: string): Promise<Array<{ run: RunData; product_key: string }>> {
+  const runIds = await listRunIds(root);
+  const loaded = await Promise.all(runIds.map(async (jobId) => ({ run: await loadRun(root, jobId), product_key: "" })));
+  const latestByProduct = new Map<string, { run: RunData; product_key: string }>();
+
+  for (const item of loaded) {
+    if (!item.run.result || item.run.result.module !== "shopify-sync") continue;
+    const productKey = deriveProductKeyFromRun(item.run);
+    latestByProduct.set(productKey, { ...item, product_key: productKey });
+  }
+
+  return [...latestByProduct.values()];
 }
 
 async function executeModule(root: string, moduleName: string, runInput: LooseRecord, handler: (jobId: string, runInput: LooseRecord, runDir: string) => Promise<ModuleResult> | ModuleResult): Promise<ExecutedModule> {
@@ -315,13 +625,38 @@ async function persistGeneratedOutputs(
   return { productPath, imageDirectory, selectedImageUrl, localImagePath };
 }
 
-async function runWorkflowSequence(root: string, record: ProductRecord, flags: Flags, stdout?: OutputWriter, mode: OutputMode = "text", sequenceIndex?: number, total?: number): Promise<WorkflowRunSummary> {
+async function runWorkflowSequence(
+  root: string,
+  record: ProductRecord,
+  flags: Flags,
+  stdout?: OutputWriter,
+  mode: OutputMode = "text",
+  sequenceIndex?: number,
+  total?: number,
+  workflowCatalog?: LooseRecord[],
+  workflowCatalogSource?: string
+): Promise<WorkflowRunSummary> {
   const policy = await getPolicyOrThrow(root);
   const runtimeConfig = await loadRuntimeConfig(root);
   const paths = getCatalogPaths(root);
   const learningText = await readText(paths.learningMarkdown, "");
   const sourceRecordId = String(record.id ?? record.product_id ?? record.sku ?? record.handle ?? record.title ?? "record");
-  let currentRecord: ProductRecord = { ...record };
+  let currentRecord: ProductRecord = {
+    ...record,
+    _catalog_match_basis: {
+      title: record.title ?? "",
+      brand: record.brand ?? record.vendor ?? "",
+      vendor: record.vendor ?? record.brand ?? "",
+      handle: record.handle ?? "",
+      sku: record.sku ?? "",
+      barcode: record.barcode ?? "",
+      size: record.size ?? record.option1 ?? "",
+      type: record.type ?? record.option2 ?? "",
+      option1: record.option1 ?? "",
+      option2: record.option2 ?? "",
+      option3: record.option3 ?? ""
+    }
+  };
   const modules: WorkflowRunSummary["modules"] = [];
   let imageDirectory = paths.generatedImagesDir;
   const productLabel = getProductKey(currentRecord, sourceRecordId);
@@ -340,13 +675,14 @@ async function runWorkflowSequence(root: string, record: ProductRecord, flags: F
     return executed;
   }
 
-  let catalogData: LooseRecord[] | undefined;
-  let catalogSource = "";
-  if (flags.catalog) {
-    const fileCatalog = await loadInputFile(path.resolve(root, String(flags.catalog)));
-    catalogData = Array.isArray(fileCatalog) ? (fileCatalog as LooseRecord[]) : [fileCatalog];
-    catalogSource = "file";
-  } else {
+  let catalogData: LooseRecord[] | undefined = workflowCatalog;
+  let catalogSource = workflowCatalogSource ?? "";
+  if (!catalogData) {
+    if (flags.catalog) {
+      const fileCatalog = await loadInputFile(path.resolve(root, String(flags.catalog)));
+      catalogData = Array.isArray(fileCatalog) ? (fileCatalog as LooseRecord[]) : [fileCatalog];
+      catalogSource = "file";
+    } else {
     const catalogProvider = await resolveProvider(root, "catalogue-match", "catalog_provider");
     if (providerIsReady(catalogProvider)) {
       catalogSource = `shopify:${catalogProvider.provider.store}`;
@@ -356,6 +692,7 @@ async function runWorkflowSequence(root: string, record: ProductRecord, flags: F
         accessToken: catalogProvider.credential.value,
         first: Number(flags.first ?? 50)
       }) as LooseRecord[];
+    }
     }
   }
 
@@ -373,6 +710,18 @@ async function runWorkflowSequence(root: string, record: ProductRecord, flags: F
       result.artifacts = { ...(result.artifacts ?? {}), catalog_source: catalogSource };
       return result;
     });
+    const matchResult = executed.result as unknown as LooseRecord;
+    currentRecord = {
+      ...currentRecord,
+      _catalog_match: {
+        decision: matchResult.decision ?? null,
+        confidence: matchResult.confidence ?? null,
+        needs_review: executed.result.needs_review,
+        matched_product_id: matchResult.matched_product_id ?? null,
+        matched_variant_id: matchResult.matched_variant_id ?? null,
+        proposed_action: matchResult.proposed_action ?? null
+      }
+    };
     modules.push({ module: executed.result.module, job_id: executed.job_id, status: executed.result.status, needs_review: executed.result.needs_review });
   }
 
@@ -388,6 +737,7 @@ async function runWorkflowSequence(root: string, record: ProductRecord, flags: F
   imageDirectory = imageOutput.imageDirectory ?? imageDirectory;
 
   const qaRun = await executeWorkflowModule("catalogue-qa", async (jobId) => runQa({ root, jobId, input: currentRecord, policy }));
+  currentRecord = buildGeneratedProduct(currentRecord, qaRun.result) as ProductRecord;
   modules.push({ module: qaRun.result.module, job_id: qaRun.job_id, status: qaRun.result.status, needs_review: qaRun.result.needs_review });
   await persistGeneratedOutputs(root, currentRecord, qaRun.result);
 
@@ -407,6 +757,21 @@ async function runWorkflowSequence(root: string, record: ProductRecord, flags: F
   };
 }
 
+async function refreshWorkflowGeneratedOutputs(
+  root: string,
+  runs: WorkflowRunSummary[],
+  generatedProducts: LooseRecord[],
+  policy?: PolicyDocument
+): Promise<{ reviewQueueCsv: string; shopifyImportCsv: string; excelWorkbook: string; workflowProductsJson: string; acceptedProducts: LooseRecord[] }> {
+  const { selected: representativeProducts } = selectRepresentativeProducts(generatedProducts);
+  const acceptedProducts = representativeProducts.filter((product) => !getMatchBlockReason(product));
+  const reviewQueueCsv = await writeReviewQueueCsv(root, runs);
+  const workflowProductsJson = await writeWorkflowProductsLedger(root, acceptedProducts);
+  const shopifyImportCsv = await writeShopifyImportCsv(root, acceptedProducts, policy);
+  const excelWorkbook = await writeExcelWorkbook(root, runs, generatedProducts, acceptedProducts, policy);
+  return { reviewQueueCsv, shopifyImportCsv, excelWorkbook, workflowProductsJson, acceptedProducts };
+}
+
 async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> {
   const rl = readline.createInterface({ input: rlInput, output: rlOutput });
   try {
@@ -415,65 +780,107 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
 
     const businessName = await askText(rl, "Business name", "Demo Store");
     const businessDescription = await askText(rl, "Short business description", "A Shopify business selling curated products");
-    const industry = await askText(rl, "Industry", "grocery");
-    const targetMarket = await askText(rl, "Target market", "General ecommerce shoppers");
-    const operatingMode = await askText(rl, "Operating mode (local_files, shopify, both)", "both");
-    let policyJobId = "";
+    const selectedIndustry = await askChoice(rl, "Industry", [...INDUSTRY_OPTIONS], "food_and_beverage");
+    const industry = selectedIndustry === "other"
+      ? await askText(rl, "Custom industry", "generic")
+      : selectedIndustry;
+    const operatingMode = await askChoice(rl, "Operating mode", ["local_files", "shopify", "both"], "both");
+    let guideJobId = "";
 
     const configureProviders = await askYesNo(rl, "Configure providers now?", true);
     const configured: string[] = [];
     let storeUrl = "";
     if (configureProviders) {
       const runtime = await loadRuntimeConfig(root);
-      const openaiReady = await maybePromptCredential(rl, "openai", "OpenAI API key");
-      if (openaiReady) configured.push("openai");
-      const geminiReady = await maybePromptCredential(rl, "gemini", "Gemini API key");
-      if (geminiReady) configured.push("gemini");
+      const providerAliasByName: Record<string, string> = {
+        openai: "openai_default",
+        gemini: "gemini_flash_default",
+        anthropic: "anthropic_default",
+        none: ""
+      };
+      const primaryLlm = await askChoice(rl, "Primary LLM provider", ["openai", "gemini", "anthropic", "none"], "openai");
+      const fallbackLlm = await askChoice(
+        rl,
+        "Fallback LLM provider",
+        ["none", "openai", "gemini", "anthropic"].filter((option) => option === "none" || option !== primaryLlm),
+        "gemini"
+      );
+      const selectedProviders = [...new Set([primaryLlm, fallbackLlm].filter((value) => value !== "none"))];
+      const readiness: Record<string, boolean> = { openai: false, gemini: false, anthropic: false };
+
+      for (const providerName of selectedProviders) {
+        readiness[providerName] = await configureLlmCredential(rl, providerName, stdout);
+        if (readiness[providerName]) configured.push(providerName);
+      }
+
+      stdout.write("Serper is currently required for image search.\n");
       const serperReady = await maybePromptCredential(rl, "serper", "Serper API key");
       if (serperReady) configured.push("serper");
 
       const shopifyNow = await askYesNo(rl, "Configure Shopify now?", false);
-      let shopifyTokenReady = false;
+      let shopifyReady = false;
       if (shopifyNow) {
+        const shopifyMode = await askChoice(rl, "Shopify connection mode", ["api", "oauth"], "api");
         const store = await askText(rl, "Shopify store domain", "");
-        const token = await askText(rl, "Shopify admin token", "");
         storeUrl = store;
         if (store) {
           runtime.providers.shopify_default.store = store;
           configured.push(`shopify-store:${store}`);
         }
-        if (token) {
-          await setCredential("shopify", token);
-          configured.push("shopify");
-          shopifyTokenReady = true;
+        if (shopifyMode === "api") {
+          const token = await askText(rl, "Shopify admin token", "");
+          if (token) {
+            await setCredential("shopify", token);
+            configured.push("shopify-api");
+            shopifyReady = true;
+          }
+        } else if (store) {
+          const clientId = await askText(rl, "Shopify app client ID", "");
+          const clientSecret = await askText(rl, "Shopify app client secret", "");
+          if (clientId && clientSecret) {
+            stdout.write("Starting Shopify OAuth in your browser...\n");
+            const session = await authenticateShopifyViaOAuth({
+              store,
+              clientId,
+              clientSecret,
+              scopes: ["write_products", "read_products", "read_metafields", "write_metafields"]
+            });
+            await setOAuthCredential("shopify", session);
+            runtime.providers.shopify_default.client_id = clientId;
+            runtime.providers.shopify_default.scopes = session.scopes ?? session.scope?.split(",").map((item) => item.trim()).filter(Boolean) ?? runtime.providers.shopify_default.scopes;
+            configured.push("shopify-oauth");
+            shopifyReady = true;
+          }
         }
       }
 
-      if (openaiReady && geminiReady) {
-        const primary = await askText(rl, "Primary enrichment provider", "openai");
-        runtime.modules["product-enricher"].llm_provider = primary === "gemini" ? "gemini_flash_default" : "openai_default";
-        runtime.modules["product-enricher"].fallback_llm_provider = primary === "gemini" ? "openai_default" : "gemini_flash_default";
-      } else if (geminiReady) {
-        runtime.modules["product-enricher"].llm_provider = "gemini_flash_default";
-        runtime.modules["product-enricher"].fallback_llm_provider = "";
-      } else if (openaiReady) {
-        runtime.modules["product-enricher"].llm_provider = "openai_default";
-        runtime.modules["product-enricher"].fallback_llm_provider = "";
-      }
-
-      if (!openaiReady && !geminiReady) runtime.modules["product-enricher"].llm_provider = "";
+      const readyProviderAlias = (providerName: string): string => readiness[providerName] ? providerAliasByName[providerName] : "";
+      runtime.modules["catalogue-expert"].llm_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
+      runtime.modules["catalogue-qa"].llm_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
+      runtime.modules["catalogue-match"].reasoning_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
+      runtime.modules["product-enricher"].llm_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
+      runtime.modules["product-enricher"].fallback_llm_provider = readyProviderAlias(primaryLlm) && readyProviderAlias(fallbackLlm)
+        ? readyProviderAlias(fallbackLlm)
+        : "";
       if (!serperReady) runtime.modules["image-optimizer"].search_provider = "";
-      if (!openaiReady) runtime.modules["image-optimizer"].vision_provider = geminiReady ? "gemini_flash_default" : "";
-      if (!(runtime.providers.shopify_default.store && shopifyTokenReady)) {
+      runtime.modules["image-optimizer"].vision_provider = readiness.openai
+        ? "openai_vision_default"
+        : readiness.gemini
+          ? "gemini_flash_default"
+          : "";
+      if (!(runtime.providers.shopify_default.store && shopifyReady)) {
         runtime.modules["catalogue-match"].catalog_provider = "";
         runtime.modules["shopify-sync"].shopify_provider = "";
+      } else {
+        runtime.modules["catalogue-match"].catalog_provider = "shopify_default";
+        runtime.modules["shopify-sync"].shopify_provider = "shopify_default";
       }
 
       await saveRuntimeConfig(root, runtime);
     }
 
-    const generatePolicy = await askYesNo(rl, "Generate a catalog policy now?", true);
-    if (generatePolicy) {
+    const generateGuide = await askYesNo(rl, "Generate a Catalog Guide now?", true);
+    if (generateGuide) {
       const executed = await executeModule(root, "catalogue-expert", { source: "init-wizard" }, async (jobId) => runExpertGenerate({
         root,
         jobId,
@@ -481,17 +888,16 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
           industry,
           businessName,
           businessDescription,
-          targetMarket,
           operatingMode,
           storeUrl,
           notes: "Generated from init wizard"
         }
       }));
-      policyJobId = executed.job_id;
+      guideJobId = executed.job_id;
     }
 
     const lines = ["Guided setup complete."];
-    if (policyJobId) lines.push(`Policy generated in run: ${policyJobId}`);
+    if (guideJobId) lines.push(`Catalog Guide generated in run: ${guideJobId}`);
     if (configured.length > 0) lines.push(`Configured: ${configured.join(", ")}`);
     lines.push("Next: run `catalog doctor` to confirm readiness.");
     stdout.write(`${lines.join("\n")}\n`);
@@ -521,6 +927,8 @@ export async function runCli(
         return await handleDoctor(root, flags, stdout);
       case "expert":
         return await handleExpert(root, subcommand, flags, stdout);
+      case "guide":
+        return await handleGuide(root, subcommand, flags, stdout);
       case "ingest":
         return await handleIngest(root, flags, stdout);
       case "match":
@@ -541,6 +949,8 @@ export async function runCli(
         return await handleReview(root, positional[1], flags, stdout);
       case "apply":
         return await handleApply(root, positional[1], flags, stdout);
+      case "publish":
+        return await handlePublish(root, flags, stdout);
       case "learn":
         return await handleLearn(root, flags, stdout);
       case "help":
@@ -561,7 +971,10 @@ async function handleInit(root: string, flags: Flags, stdout: OutputWriter): Pro
   const paths = await withSpinner("Initializing workspace", mode, () => initWorkspace(root));
   writeOutput(stdout, getOutputMode(flags), { base: paths.base }, `Initialized workspace at ${paths.base}\n`);
   if (isInteractive(flags)) {
-    await withSpinner("Running setup wizard", mode, () => runInitWizard(root, stdout));
+    if (mode === "text") {
+      stdout.write("Starting setup wizard...\n");
+    }
+    await runInitWizard(root, stdout);
   }
   return 0;
 }
@@ -613,7 +1026,53 @@ async function handleAuth(root: string, subcommand: string | undefined, extraPos
     return payload.ok ? 0 : 1;
   }
 
-  throw new Error("Supported auth commands: set, list, test");
+  if (subcommand === "login") {
+    const alias = String(flags.provider ?? extraPositional[0] ?? "");
+    const runtime = await loadRuntimeConfig(root);
+
+    if (alias === "shopify") {
+      const store = String(flags.store ?? runtime.providers.shopify_default.store ?? "");
+      const clientId = String(flags["client-id"] ?? runtime.providers.shopify_default.client_id ?? "");
+      const clientSecret = String(flags["client-secret"] ?? "");
+      if (!store || !clientId || !clientSecret) {
+        throw new Error("Use `catalog auth login --provider shopify --store <shop> --client-id <id> --client-secret <secret>`.");
+      }
+      const session = await withSpinner("Authenticating Shopify", mode, () => authenticateShopifyViaOAuth({
+        store,
+        clientId,
+        clientSecret,
+        scopes: ["write_products", "read_products", "read_metafields", "write_metafields"]
+      }));
+      runtime.providers.shopify_default.store = session.store;
+      runtime.providers.shopify_default.client_id = clientId;
+      runtime.providers.shopify_default.scopes = session.scopes ?? session.scope?.split(",").map((item) => item.trim()).filter(Boolean) ?? runtime.providers.shopify_default.scopes;
+      await saveRuntimeConfig(root, runtime);
+      await setOAuthCredential("shopify", session);
+      writeOutput(stdout, mode, { alias, ok: true, source: "oauth", store: session.store }, `Stored Shopify OAuth session for ${session.store}\n`);
+      return 0;
+    }
+
+    if (alias === "gemini") {
+      const clientId = String(flags["client-id"] ?? "");
+      const clientSecret = String(flags["client-secret"] ?? "");
+      const projectId = String(flags["project-id"] ?? "");
+      if (!clientId || !clientSecret || !projectId) {
+        throw new Error("Use `catalog auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project>`.");
+      }
+      const session = await withSpinner("Authenticating Gemini", mode, () => authenticateGeminiViaOAuth({
+        clientId,
+        clientSecret,
+        projectId
+      }));
+      await setOAuthCredential("gemini", session);
+      writeOutput(stdout, mode, { alias, ok: true, source: "oauth", project_id: projectId }, `Stored Gemini OAuth session for project ${projectId}\n`);
+      return 0;
+    }
+
+    throw new Error("Supported auth login providers: shopify, gemini");
+  }
+
+  throw new Error("Supported auth commands: set, list, test, login");
 }
 
 async function handleConfig(root: string, subcommand: string | undefined, extraPositional: string[], flags: Flags, stdout: OutputWriter): Promise<number> {
@@ -676,14 +1135,14 @@ async function handleDoctor(root: string, flags: Flags, stdout: OutputWriter): P
 async function handleExpert(root: string, subcommand: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
   if (subcommand !== "generate") throw new Error("Use `catalog expert generate`.");
   const mode = getOutputMode(flags);
-  const executed = await withSpinner("Generating catalog policy", mode, () => executeModule(root, "catalogue-expert", {}, async (jobId) => runExpertGenerate({
+  const executed = await withSpinner("Generating Catalog Guide", mode, () => executeModule(root, "catalogue-expert", {}, async (jobId) => runExpertGenerate({
     root,
     jobId,
     input: {
-      industry: String(flags.industry ?? "grocery"),
+      industry: String(flags.industry ?? "food_and_beverage"),
       businessName: String(flags["business-name"] ?? "Demo Store"),
       businessDescription: String(flags["business-description"] ?? ""),
-      targetMarket: String(flags["target-market"] ?? "General ecommerce shoppers"),
+      targetMarket: String(flags["target-market"] ?? ""),
       operatingMode: String(flags["operating-mode"] ?? "both"),
       storeUrl: String(flags["store-url"] ?? ""),
       notes: String(flags.notes ?? ""),
@@ -692,6 +1151,31 @@ async function handleExpert(root: string, subcommand: string | undefined, flags:
   })));
   writeOutput(stdout, mode, executed, renderModuleResult(executed));
   return 0;
+}
+
+async function handleGuide(root: string, subcommand: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
+  if (subcommand === "generate") {
+    return handleExpert(root, "generate", flags, stdout);
+  }
+
+  if (subcommand === "show") {
+    await initWorkspace(root);
+    const mode = getOutputMode(flags);
+    const paths = getCatalogPaths(root);
+    const policy = await getPolicyOrThrow(root);
+    const markdown = await readText(paths.policyMarkdown, "");
+    const payload = {
+      title: "Catalog Guide",
+      business_name: policy.meta?.business_name ?? "",
+      industry: policy.meta?.industry ?? "",
+      operating_mode: policy.meta?.operating_mode ?? "",
+      markdown
+    };
+    writeOutput(stdout, mode, payload, markdown || "Catalog Guide is empty.\n");
+    return 0;
+  }
+
+  throw new Error("Use `catalog guide generate` or `catalog guide show`.");
 }
 
 async function handleIngest(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
@@ -877,30 +1361,67 @@ async function handleWorkflow(root: string, subcommand: string | undefined, flag
   const selected = records.slice(0, limit) as ProductRecord[];
   const mode = getOutputMode(flags);
   const policy = await getPolicyOrThrow(root);
+  const generatedCatalog = await loadGeneratedProductCatalog(root);
+  let workflowCatalog: LooseRecord[] | undefined;
+  let workflowCatalogSource = "";
+  let externalCatalog: LooseRecord[] = [];
+  if (flags.catalog) {
+    const fileCatalog = await loadInputFile(path.resolve(root, String(flags.catalog)));
+    externalCatalog = Array.isArray(fileCatalog) ? [...(fileCatalog as LooseRecord[])] : [fileCatalog];
+    workflowCatalog = [...generatedCatalog, ...externalCatalog];
+    workflowCatalogSource = generatedCatalog.length > 0 ? "generated+file" : "file";
+  } else {
+    const catalogProvider = await resolveProvider(root, "catalogue-match", "catalog_provider");
+    if (providerIsReady(catalogProvider)) {
+      externalCatalog = await fetchShopifyCatalogSnapshot({
+        store: catalogProvider.provider.store,
+        apiVersion: catalogProvider.provider.api_version ?? "2025-04",
+        accessToken: catalogProvider.credential.value,
+        first: Number(flags.first ?? 50)
+      }) as LooseRecord[];
+      workflowCatalog = [...generatedCatalog, ...externalCatalog];
+      workflowCatalogSource = generatedCatalog.length > 0 ? `generated+shopify:${catalogProvider.provider.store}` : `shopify:${catalogProvider.provider.store}`;
+    } else if (generatedCatalog.length > 0) {
+      workflowCatalog = [...generatedCatalog];
+      workflowCatalogSource = "generated";
+    }
+  }
+  const generatedProducts: LooseRecord[] = [...generatedCatalog];
+  let refreshedOutputs = await refreshWorkflowGeneratedOutputs(root, [], generatedProducts, policy);
   const runWork = async () => {
     const items: WorkflowRunSummary[] = [];
     for (const [index, record] of selected.entries()) {
-      const summary = await runWorkflowSequence(root, record, flags, stdout, mode, index, selected.length);
+      const summary = await runWorkflowSequence(
+        root,
+        record,
+        flags,
+        stdout,
+        mode,
+        index,
+        selected.length,
+        workflowCatalog,
+        workflowCatalogSource
+      );
       items.push({ ...summary, index });
+      const generatedProduct = await readJson<LooseRecord>(summary.generated_product_path, {});
+      generatedProducts.push(generatedProduct);
+      refreshedOutputs = await refreshWorkflowGeneratedOutputs(root, items, generatedProducts, policy);
+      workflowCatalog = [...refreshedOutputs.acceptedProducts, ...externalCatalog];
+      workflowCatalogSource = externalCatalog.length > 0 ? "generated-ledger+external" : "generated-ledger";
     }
     return items;
   };
   const runs = isLiveTextMode(mode)
     ? await runWork()
     : await withSpinner("Running full workflow", mode, runWork);
-
-  const generatedProducts = await Promise.all(runs.map((run) => readJson<LooseRecord>(run.generated_product_path, {})));
-  const reviewQueueCsv = await writeReviewQueueCsv(root, runs);
-  const shopifyImportCsv = await writeShopifyImportCsv(root, generatedProducts, policy);
-  const excelWorkbook = await writeExcelWorkbook(root, runs, generatedProducts, generatedProducts, policy);
   const payload = {
     input: inputPath,
     total: records.length,
     processed: runs.length,
     runs,
-    review_queue_csv: reviewQueueCsv,
-    shopify_import_csv: shopifyImportCsv,
-    excel_workbook: excelWorkbook
+    review_queue_csv: refreshedOutputs.reviewQueueCsv,
+    shopify_import_csv: refreshedOutputs.shopifyImportCsv,
+    excel_workbook: refreshedOutputs.excelWorkbook
   };
   if (mode === "text") {
     const reviewItems = runs.flatMap((run) =>
@@ -986,11 +1507,18 @@ async function handleApply(root: string, jobOrPath: string | undefined, flags: F
   const run: RunData = await withSpinner("Loading approved run", mode, () => loadRun(root, jobOrPath));
   if (!run.result) throw new Error("Run result not found.");
   const decision = run.decision as ReviewDecision | null;
-  if (!decision || !["approve", "approve_with_edits"].includes(decision.action)) {
+  const requiresApproval = run.result.needs_review;
+  if (requiresApproval && (!decision || !["approve", "approve_with_edits"].includes(decision.action))) {
     throw new Error("Run must be approved before apply.");
   }
+  if (!requiresApproval && decision && !["approve", "approve_with_edits"].includes(decision.action)) {
+    throw new Error("Run has a review decision that blocks apply.");
+  }
 
-  const appliedChanges = { ...run.result.proposed_changes, ...decision.edits };
+  const appliedChanges = materializeProposedChanges({
+    ...run.result.proposed_changes,
+    ...(decision?.edits ?? {})
+  });
   const applyResult: ApplyResult = {
     job_id: run.result.job_id,
     module: run.result.module,
@@ -1047,6 +1575,107 @@ async function handleApply(root: string, jobOrPath: string | undefined, flags: F
   return 0;
 }
 
+async function handlePublish(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
+  const mode = getOutputMode(flags);
+  const policy = await getPolicyOrThrow(root);
+  const passingScore = getGuidePassingScore(policy);
+  const latestRuns = await withSpinner("Loading latest sync runs", mode, () => loadLatestSyncRuns(root));
+  const skipped: Array<{ job_id: string; reason: string }> = [];
+  const representativeByIdentity = new Map<string, { run: RunData; product_key: string }>();
+  const shadowedJobIds = new Set<string>();
+
+  for (const item of latestRuns) {
+    const input = item.run.input as LooseRecord | null;
+    const identity = getExportIdentity(input);
+    if (!identity) {
+      representativeByIdentity.set(`unique:${item.run.result?.job_id ?? item.product_key}`, item);
+      continue;
+    }
+    const existing = representativeByIdentity.get(identity);
+    if (!existing) {
+      representativeByIdentity.set(identity, item);
+      continue;
+    }
+
+    const currentRank = getRepresentativeRank(input);
+    const existingRank = getRepresentativeRank(existing.run.input as LooseRecord | null);
+    const currentQa = getRepresentativeQaScore(input);
+    const existingQa = getRepresentativeQaScore(existing.run.input as LooseRecord | null);
+    const currentConfidence = getRepresentativeConfidence(input);
+    const existingConfidence = getRepresentativeConfidence(existing.run.input as LooseRecord | null);
+    const shouldReplace =
+      currentRank < existingRank
+      || (currentRank === existingRank && currentQa > existingQa)
+      || (currentRank === existingRank && currentQa === existingQa && currentConfidence > existingConfidence);
+
+    if (shouldReplace) {
+      if (existing.run.result?.job_id) shadowedJobIds.add(existing.run.result.job_id);
+      representativeByIdentity.set(identity, item);
+    } else if (item.run.result?.job_id) {
+      shadowedJobIds.add(item.run.result.job_id);
+    }
+  }
+
+  const publishable = [...representativeByIdentity.values()].filter((item) => {
+    const result = item.run.result;
+    const input = item.run.input as LooseRecord | null;
+    const apply = item.run.apply as LooseRecord | null;
+    if (!result || result.module !== "shopify-sync") return false;
+    if (shadowedJobIds.has(result.job_id)) {
+      skipped.push({ job_id: result.job_id, reason: "shadowed by a better representative of the same product identity" });
+      return false;
+    }
+    if (apply?.status === "applied_live") {
+      skipped.push({ job_id: result.job_id, reason: "already applied live" });
+      return false;
+    }
+    if (!input || typeof input !== "object") {
+      skipped.push({ job_id: result.job_id, reason: "missing sync input context" });
+      return false;
+    }
+    const matchBlockReason = getMatchBlockReason(input);
+    if (matchBlockReason) {
+      skipped.push({ job_id: result.job_id, reason: matchBlockReason });
+      return false;
+    }
+    const qaStatus = typeof input.qa_status === "string" ? input.qa_status.toUpperCase() : "";
+    const qaScore = Number(input.qa_score ?? 0);
+    if (qaStatus !== "PASS") {
+      skipped.push({ job_id: result.job_id, reason: "qa_status is not PASS" });
+      return false;
+    }
+    if (qaScore < passingScore) {
+      skipped.push({ job_id: result.job_id, reason: `qa_score ${qaScore} is below passing score ${passingScore}` });
+      return false;
+    }
+    if (result.needs_review) {
+      skipped.push({ job_id: result.job_id, reason: "sync run still needs review" });
+      return false;
+    }
+    return true;
+  });
+
+  const jobs: string[] = [];
+  for (const item of publishable) {
+    const code = await handleApply(
+      root,
+      item.run.result?.job_id,
+      { live: Boolean(flags.live), json: true },
+      { write() {} }
+    );
+    if (code === 0 && item.run.result?.job_id) jobs.push(item.run.result.job_id);
+  }
+
+  const payload = {
+    live: Boolean(flags.live),
+    published: jobs.length,
+    skipped,
+    jobs
+  };
+  writeOutput(stdout, mode, payload, renderPublishSummary(payload));
+  return 0;
+}
+
 async function handleLearn(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
   await initWorkspace(root);
   let payload: LooseRecord;
@@ -1077,12 +1706,16 @@ function printHelp(stdout: OutputWriter): void {
   stdout.write(`catalog commands:
   init [--no-wizard] [--json]
   auth set --provider <name> --value <secret> [--json]
+  auth login --provider shopify --store <shop> --client-id <id> --client-secret <secret> [--json]
+  auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> [--json]
   auth list [--json]
   auth test --provider <name> [--json]
   config set <path> <value> [--json]
   config get <path> [--json]
   doctor [--json]
-  expert generate --industry grocery --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
+  expert generate --industry food_and_beverage --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
+  guide generate --industry food_and_beverage --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
+  guide show [--json]
   ingest --input <file> [--json]
   match --input <file> [--catalog <file>] [--first 50] [--json]
   enrich --input <file> [--json]
@@ -1095,6 +1728,7 @@ function printHelp(stdout: OutputWriter): void {
   review queue [--module <name>] [--product <product-key>] [--all] [--json]
   review bulk --action approve|approve_with_edits|reject|defer [--module <name>] [--product <product-key>] [--all] [--json]
   apply <job-id> [--live] [--json]
+  publish [--live] [--json]
   learn --run <job-id> [--lesson "..."] [--json]
 `);
 }

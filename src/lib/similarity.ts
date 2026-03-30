@@ -1,13 +1,26 @@
 export function normalizeValue(value) {
   return String(value ?? "")
     .toLowerCase()
+    .replace(/([a-z])([0-9])/g, "$1 $2")
+    .replace(/([0-9])([a-z])/g, "$1 $2")
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
+export function compactValue(value) {
+  return normalizeValue(value).replace(/\s+/g, "");
+}
+
 export function tokenize(value) {
-  return normalizeValue(value).split(" ").filter(Boolean);
+  const baseTokens = normalizeValue(value).split(" ").filter(Boolean);
+  const expandedTokens = new Set(baseTokens);
+
+  for (let index = 0; index < baseTokens.length - 1; index += 1) {
+    expandedTokens.add(`${baseTokens[index]}${baseTokens[index + 1]}`);
+  }
+
+  return [...expandedTokens];
 }
 
 export function jaccardSimilarity(a, b) {

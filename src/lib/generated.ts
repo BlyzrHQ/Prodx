@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
+import { materializeProposedChanges } from "./change-records.js";
 import { ensureDir, readJson, writeJson, writeText } from "./fs.js";
 import { getCatalogPaths } from "./paths.js";
+import { dedupeTitleLikeText, normalizeDescriptionPair } from "./product.js";
 import type { LooseRecord, ModuleResult, PolicyDocument, ProductRecord, ProductVariant, WorkflowRunSummary } from "../types.js";
 
 function slugify(value: string): string {
@@ -27,7 +29,8 @@ export function getProductKey(record: LooseRecord, fallback = "product"): string
 
 export function buildGeneratedProduct(input: ProductRecord, result: ModuleResult): LooseRecord {
   const merged: LooseRecord = { ...input };
-  for (const [key, value] of Object.entries(result.proposed_changes ?? {})) {
+  const materializedChanges = materializeProposedChanges(result.proposed_changes);
+  for (const [key, value] of Object.entries(materializedChanges)) {
     if (
       key === "shopify_payload" ||
       key === "image_search" ||
@@ -36,7 +39,6 @@ export function buildGeneratedProduct(input: ProductRecord, result: ModuleResult
       key === "live_apply_ready" ||
       key === "target_store" ||
       key === "variant_count" ||
-      key === "qa_score" ||
       key === "missing_fields" ||
       key === "policy_findings" ||
       key === "success_criteria_summary"
@@ -48,6 +50,14 @@ export function buildGeneratedProduct(input: ProductRecord, result: ModuleResult
 
   if (!merged.handle && typeof merged.title === "string") {
     merged.handle = slugify(merged.title);
+  }
+
+  if (result.proposed_changes?.image_review) {
+    merged._catalog_image_review = result.proposed_changes.image_review;
+  }
+
+  if (result.proposed_changes?.image_search) {
+    merged._catalog_image_search = result.proposed_changes.image_search;
   }
 
   merged._catalog = {
@@ -186,6 +196,16 @@ export async function writeReviewQueueCsv(root: string, runs: WorkflowRunSummary
   return paths.generatedReviewCsv;
 }
 
+export async function writeWorkflowProductsLedger(root: string, products: LooseRecord[]): Promise<string> {
+  const paths = getCatalogPaths(root);
+  await writeJson(paths.generatedWorkflowProductsJson, {
+    generated_at: new Date().toISOString(),
+    count: products.length,
+    products
+  });
+  return paths.generatedWorkflowProductsJson;
+}
+
 function toShopifyBoolean(value: unknown, fallback = "TRUE"): string {
   if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
   if (typeof value === "string") {
@@ -198,6 +218,12 @@ function toShopifyBoolean(value: unknown, fallback = "TRUE"): string {
 function normalizeTags(tags: unknown): string {
   if (!Array.isArray(tags)) return "";
   return tags.filter((item) => typeof item === "string" && item.trim().length > 0).join(", ");
+}
+
+function getVendor(product: LooseRecord): string {
+  if (typeof product.vendor === "string" && product.vendor.trim()) return product.vendor.trim();
+  if (typeof product.brand === "string" && product.brand.trim()) return product.brand.trim();
+  return "";
 }
 
 function normalizeMetafields(value: unknown): string {
@@ -214,15 +240,64 @@ function normalizeMetafields(value: unknown): string {
     .join("; ");
 }
 
-function defaultOptionNames(policy?: PolicyDocument): [string, string, string] {
-  const dimensions = Array.isArray(policy?.variant_structure?.primary_dimensions)
-    ? policy.variant_structure.primary_dimensions.map(String)
-    : [];
-  return [
-    dimensions[0] ?? "Default Title",
-    dimensions[1] ?? "",
-    dimensions[2] ?? ""
-  ];
+type ShopifyCsvMetafieldColumn = {
+  header: string;
+  namespace: string;
+  key: string;
+};
+
+function toTitleCase(input: string): string {
+  return input
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function collectShopifyCsvMetafieldColumns(products: LooseRecord[], policy?: PolicyDocument): ShopifyCsvMetafieldColumn[] {
+  const seen = new Set<string>();
+  const columns: ShopifyCsvMetafieldColumn[] = [];
+
+  const appendColumn = (namespace: unknown, key: unknown) => {
+    if (typeof namespace !== "string" || typeof key !== "string") return;
+    const normalizedNamespace = namespace.trim();
+    const normalizedKey = key.trim();
+    if (!normalizedNamespace || !normalizedKey) return;
+    const identifier = `${normalizedNamespace}.${normalizedKey}`;
+    if (seen.has(identifier)) return;
+    seen.add(identifier);
+    columns.push({
+      header: `${toTitleCase(normalizedKey)} (product.metafields.${normalizedNamespace}.${normalizedKey})`,
+      namespace: normalizedNamespace,
+      key: normalizedKey
+    });
+  };
+
+  for (const metafield of policy?.attributes_metafields_schema?.metafields ?? []) {
+    appendColumn(metafield.namespace, metafield.key);
+  }
+
+  for (const product of products) {
+    const metafields = Array.isArray(product.metafields) ? product.metafields : [];
+    for (const metafield of metafields) {
+      if (!metafield || typeof metafield !== "object") continue;
+      appendColumn((metafield as LooseRecord).namespace, (metafield as LooseRecord).key);
+    }
+  }
+
+  return columns;
+}
+
+function buildProductMetafieldMap(product: LooseRecord): Map<string, string> {
+  const values = new Map<string, string>();
+  const metafields = Array.isArray(product.metafields) ? product.metafields : [];
+  for (const metafield of metafields) {
+    if (!metafield || typeof metafield !== "object") continue;
+    const record = metafield as LooseRecord;
+    if (typeof record.namespace !== "string" || typeof record.key !== "string") continue;
+    values.set(`${record.namespace}.${record.key}`, typeof record.value === "string" ? record.value : String(record.value ?? ""));
+  }
+  return values;
 }
 
 function getVariantRows(product: LooseRecord, policy?: PolicyDocument): ProductVariant[] {
@@ -242,29 +317,52 @@ function getVariantRows(product: LooseRecord, policy?: PolicyDocument): ProductV
   ];
 }
 
-function buildShopifyCsvRows(products: LooseRecord[], policy?: PolicyDocument): string[][] {
-  const [option1Name, option2Name, option3Name] = defaultOptionNames(policy);
+function hasMeaningfulVariantOptions(variants: ProductVariant[]): boolean {
+  return variants.some((variant) => {
+    const values = [variant.option1, variant.option2, variant.option3]
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    return values.some((value) => value.toLowerCase() !== "default title");
+  });
+}
+
+function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyCsvMetafieldColumn[], policy?: PolicyDocument): string[][] {
   const rows: string[][] = [];
 
   for (const product of products) {
     const variants = getVariantRows(product, policy);
+    const useRealOptionNames = hasMeaningfulVariantOptions(variants);
+    const configuredDimensions = Array.isArray(policy?.variant_structure?.primary_dimensions)
+      ? policy.variant_structure.primary_dimensions.map(String)
+      : [];
+    const option1Name = useRealOptionNames ? (configuredDimensions[0] ?? "Option1") : "Title";
+    const option2Name = useRealOptionNames ? (configuredDimensions[1] ?? "") : "";
+    const option3Name = useRealOptionNames ? (configuredDimensions[2] ?? "") : "";
     const images = Array.isArray(product.images) ? product.images.filter((item) => typeof item === "string") as string[] : [];
     const featuredImage = typeof product.featured_image === "string" ? product.featured_image : images[0] ?? "";
+    const normalizedDescription = normalizeDescriptionPair(
+      typeof product.description_html === "string" && product.description_html.trim().length > 0
+        ? product.description_html
+        : typeof product.description === "string"
+          ? product.description
+          : ""
+    );
+    const vendor = getVendor(product);
     const imageAltText = typeof product.image_alt_text === "string" && product.image_alt_text.trim().length > 0
       ? product.image_alt_text
-      : [product.brand, product.title, product.size, product.type]
-          .filter((item) => typeof item === "string" && item.trim().length > 0)
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
+      : (typeof product.title === "string" && product.title.trim().length > 0
+          ? product.title.trim()
+          : dedupeTitleLikeText(vendor, typeof product.size === "string" ? product.size : "", typeof product.type === "string" ? product.type : ""));
     const handle = typeof product.handle === "string" && product.handle ? product.handle : getProductKey(product, "product");
+    const metafieldMap = buildProductMetafieldMap(product);
 
     variants.forEach((variant, index) => {
       rows.push([
         typeof product.title === "string" ? product.title : "",
         handle,
-        typeof product.description_html === "string" ? product.description_html : typeof product.description === "string" ? product.description : "",
-        typeof product.brand === "string" ? product.brand : typeof product.vendor === "string" ? product.vendor : "",
+        normalizedDescription.description_html,
+        vendor,
         "",
         typeof product.product_type === "string" ? product.product_type : "",
         normalizeTags(product.tags),
@@ -275,9 +373,9 @@ function buildShopifyCsvRows(products: LooseRecord[], policy?: PolicyDocument): 
         option1Name,
         typeof variant.option1 === "string" && variant.option1 ? variant.option1 : "Default Title",
         option2Name,
-        typeof variant.option2 === "string" ? variant.option2 : "",
+        useRealOptionNames && typeof variant.option2 === "string" ? variant.option2 : "",
         option3Name,
-        typeof variant.option3 === "string" ? variant.option3 : "",
+        useRealOptionNames && typeof variant.option3 === "string" ? variant.option3 : "",
         typeof (variant as LooseRecord).price === "string" ? String((variant as LooseRecord).price) : typeof product.price === "string" ? product.price : "",
         typeof (variant as LooseRecord)["compare_at_price"] === "string"
           ? String((variant as LooseRecord)["compare_at_price"])
@@ -287,7 +385,8 @@ function buildShopifyCsvRows(products: LooseRecord[], policy?: PolicyDocument): 
         toShopifyBoolean((variant as LooseRecord)["requires_shipping"], "TRUE"),
         toShopifyBoolean((variant as LooseRecord).taxable, "TRUE"),
         index === 0 ? featuredImage : "",
-        imageAltText
+        imageAltText,
+        ...metafieldColumns.map((column) => metafieldMap.get(`${column.namespace}.${column.key}`) ?? "")
       ]);
     });
   }
@@ -297,6 +396,7 @@ function buildShopifyCsvRows(products: LooseRecord[], policy?: PolicyDocument): 
 
 export async function writeShopifyImportCsv(root: string, products: LooseRecord[], policy?: PolicyDocument): Promise<string> {
   const paths = getCatalogPaths(root);
+  const metafieldColumns = collectShopifyCsvMetafieldColumns(products, policy);
   const header = [
     "Title",
     "Handle",
@@ -320,10 +420,11 @@ export async function writeShopifyImportCsv(root: string, products: LooseRecord[
     "Variant Requires Shipping",
     "Variant Taxable",
     "Image Src",
-    "Image Alt Text"
+    "Image Alt Text",
+    ...metafieldColumns.map((column) => column.header)
   ];
 
-  const rows = buildShopifyCsvRows(products, policy).map((row) => row.map(csvEscape).join(","));
+  const rows = buildShopifyCsvRows(products, metafieldColumns, policy).map((row) => row.map(csvEscape).join(","));
   await writeText(paths.generatedShopifyCsv, `${header.join(",")}\n${rows.join("\n")}\n`);
   return paths.generatedShopifyCsv;
 }
@@ -361,10 +462,12 @@ export async function writeExcelWorkbook(
       "Product Key": getProductKey(product, "product"),
       Title: String(product.title ?? ""),
       Handle: String(product.handle ?? ""),
-      Brand: String(product.brand ?? product.vendor ?? ""),
+      Brand: getVendor(product),
       "Product Type": String(product.product_type ?? ""),
       Tags: normalizeTags(product.tags),
-      Description: String(product.description ?? ""),
+      Description: normalizeDescriptionPair(
+        String(product.description_html ?? product.description ?? "")
+      ).description_html,
       "Featured Image": String(product.featured_image ?? ""),
       "Additional Images": images.join(", "),
       Metafields: normalizeMetafields(product.metafields),
@@ -431,7 +534,8 @@ export async function writeExcelWorkbook(
     }
   }
 
-  const shopifyRows = buildShopifyCsvRows(shopifyProducts, policy);
+  const shopifyMetafieldColumns = collectShopifyCsvMetafieldColumns(shopifyProducts, policy);
+  const shopifyRows = buildShopifyCsvRows(shopifyProducts, shopifyMetafieldColumns, policy);
   const shopifyHeader = [
     "Title",
     "Handle",
@@ -455,7 +559,8 @@ export async function writeExcelWorkbook(
     "Variant Requires Shipping",
     "Variant Taxable",
     "Image Src",
-    "Image Alt Text"
+    "Image Alt Text",
+    ...shopifyMetafieldColumns.map((column) => column.header)
   ];
 
   const workbook = XLSX.utils.book_new();

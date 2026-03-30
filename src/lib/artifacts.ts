@@ -61,6 +61,7 @@ export async function loadRun(root, jobOrPath) {
     result: await readJson(path.join(runDir, "result.json"), null),
     review: await readJson(path.join(runDir, "review.json"), null),
     decision: await readJson(path.join(runDir, "decision.json"), null),
+    apply: await readJson(path.join(runDir, "apply.json"), null),
     reviewMarkdown: await readText(path.join(runDir, "review.md"), "")
   };
 }

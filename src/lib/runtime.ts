@@ -8,6 +8,7 @@ export function defaultRuntimeConfig(): RuntimeConfig {
     providers: {
       openai_default: { type: "openai", credential: "openai", model: "gpt-5" },
       gemini_flash_default: { type: "gemini", credential: "gemini", model: "gemini-2.5-flash" },
+      anthropic_default: { type: "anthropic", credential: "anthropic", model: "claude-sonnet-4-20250514" },
       openai_vision_default: { type: "openai", credential: "openai", model: "gpt-4.1-mini" },
       serper_default: { type: "serper", credential: "serper" },
       shopify_default: { type: "shopify", credential: "shopify", store: "", api_version: "2025-04" }

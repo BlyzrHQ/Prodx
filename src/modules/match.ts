@@ -1,28 +1,46 @@
 import { createBaseResult } from "./shared.js";
-import { jaccardSimilarity, normalizeValue } from "../lib/similarity.js";
+import { compactValue, jaccardSimilarity, normalizeValue } from "../lib/similarity.js";
 
 function getVariantSignature(product, variantKeys) {
   return variantKeys.map((key) => normalizeValue(product[key])).filter(Boolean).join("|");
 }
 
+function buildComparableTitle(brand, title) {
+  const normalizedBrand = normalizeValue(brand);
+  const normalizedTitle = normalizeValue(title);
+  if (!normalizedBrand) return String(title ?? "").trim();
+  if (!normalizedTitle) return String(brand ?? "").trim();
+  if (normalizedTitle === normalizedBrand || normalizedTitle.startsWith(`${normalizedBrand} `)) {
+    return String(title ?? "").trim();
+  }
+  return `${String(brand ?? "").trim()} ${String(title ?? "").trim()}`.trim();
+}
+
 export function buildCatalogIndex(catalog) {
-  return catalog.map((product) => ({
-    id: product.id ?? product.product_id ?? product.handle ?? product.sku ?? product.title,
-    sku: product.sku ?? "",
-    barcode: product.barcode ?? "",
-    title: product.title ?? "",
-    brand: product.brand ?? product.vendor ?? "",
-    handle: product.handle ?? "",
-    variant_signature: getVariantSignature(product, ["size", "type", "color", "storage", "option1", "option2"]),
-    raw: product
-  }));
+  return catalog.map((product) => {
+    const basis = product?._catalog_match_basis && typeof product._catalog_match_basis === "object"
+      ? product._catalog_match_basis
+      : null;
+    const source = basis && typeof basis === "object" ? basis : product;
+    return {
+      id: product.id ?? product.product_id ?? product.handle ?? product.sku ?? product.title,
+      sku: source.sku ?? product.sku ?? "",
+      barcode: source.barcode ?? product.barcode ?? "",
+      title: source.title ?? product.title ?? "",
+      brand: source.brand ?? source.vendor ?? product.brand ?? product.vendor ?? "",
+      handle: source.handle ?? product.handle ?? "",
+      variant_signature: getVariantSignature(source, ["size", "type", "color", "storage", "option1", "option2"]),
+      raw: product
+    };
+  });
 }
 
 export function runMatchDecision({ jobId, input, catalog, policy, learningText = "" }) {
   const candidates = buildCatalogIndex(catalog);
   const targetSku = normalizeValue(input.sku);
   const targetBarcode = normalizeValue(input.barcode);
-  const targetTitle = `${input.brand ?? ""} ${input.title ?? ""}`.trim();
+  const targetTitle = buildComparableTitle(input.brand, input.title);
+  const canonicalTargetTitle = compactValue(targetTitle);
 
   const exactSku = targetSku ? candidates.find((item) => normalizeValue(item.sku) === targetSku) : null;
   if (exactSku) {
@@ -62,8 +80,29 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
     };
   }
 
+  const exactCanonicalTitle = canonicalTargetTitle
+    ? candidates.find((candidate) => compactValue(buildComparableTitle(candidate.brand, candidate.title)) === canonicalTargetTitle)
+    : null;
+  if (exactCanonicalTitle) {
+    return {
+      ...createBaseResult({
+        jobId,
+        module: "catalogue-match",
+        status: "success",
+        needsReview: false,
+        reasoning: [`Canonical product title match found for ${input.title ?? targetTitle}.`],
+        nextActions: ["Treat as duplicate unless overridden by a human review."]
+      }),
+      decision: "DUPLICATE",
+      confidence: 0.97,
+      matched_product_id: exactCanonicalTitle.id,
+      matched_variant_id: exactCanonicalTitle.id,
+      proposed_action: { action: "skip_duplicate", product_id: exactCanonicalTitle.id }
+    };
+  }
+
   const scored = candidates
-    .map((candidate) => ({ ...candidate, score: jaccardSimilarity(targetTitle, `${candidate.brand} ${candidate.title}`) }))
+    .map((candidate) => ({ ...candidate, score: jaccardSimilarity(targetTitle, buildComparableTitle(candidate.brand, candidate.title)) }))
     .sort((a, b) => b.score - a.score);
   const best = scored[0];
   const variantKeys = policy?.variant_structure?.primary_dimensions?.map((item) => item.toLowerCase()) ?? ["size", "type"];
