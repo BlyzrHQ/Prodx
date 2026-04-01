@@ -86,8 +86,10 @@ export async function createGeminiJsonResponse<T>({
         ]
       } : {}),
       generationConfig: {
-        responseMimeType: "application/json",
-        responseJsonSchema: normalizedSchema
+        ...(!googleSearch ? {
+          responseMimeType: "application/json",
+          responseJsonSchema: normalizedSchema
+        } : {})
       }
     })
   });
@@ -98,6 +100,13 @@ export async function createGeminiJsonResponse<T>({
   }
 
   const text = extractGeminiText(data);
+  if (googleSearch) {
+    return {
+      raw: data,
+      text,
+      json: JSON.parse(text) as T
+    };
+  }
   return {
     raw: data,
     text,

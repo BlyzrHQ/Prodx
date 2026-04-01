@@ -3,15 +3,43 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import * as XLSX from "xlsx";
-import { runCli } from "../dist/cli.js";
+import { resolveLiveVariantAttachPayload, runCli, shouldSkipAfterMatch } from "../dist/cli.js";
 import { buildShopifyPayload } from "../dist/connectors/shopify.js";
-import { buildStarterPolicy } from "../dist/lib/policy-template.js";
-import { shouldUseWebVerification } from "../dist/modules/enrich.js";
+import { analyzeImageWithOpenAI } from "../dist/connectors/openai.js";
+import { createOpenAIJsonResponse } from "../dist/connectors/openai.js";
+import { createGeminiJsonResponse } from "../dist/connectors/gemini.js";
+import { buildGeneratedProduct, writeShopifyImportCsv } from "../dist/lib/generated.js";
+import { buildStarterPolicy, initialLearningMarkdown, renderPolicyMarkdown } from "../dist/lib/policy-template.js";
+import { sanitizeCustomerFacingDescription, shouldUseWebVerification } from "../dist/modules/enrich.js";
+import { buildImageSearchQueries, buildImageSearchQuery, evaluateImageCandidateUrl, rankImageCandidates } from "../dist/modules/image-optimize.js";
 import { loadRecordsFromSource } from "../dist/modules/ingest.js";
 import { runMatchDecision } from "../dist/modules/match.js";
 
 async function createTempProject() {
   return fs.mkdtemp(path.join(os.tmpdir(), "catalog-toolkit-"));
+}
+
+async function seedGuideFiles(
+  cwd: string,
+  input: { industry: string; businessName: string; businessDescription?: string; operatingMode?: string }
+) {
+  const policy = buildStarterPolicy({
+    industry: input.industry,
+    businessName: input.businessName,
+    businessDescription: input.businessDescription ?? "",
+    operatingMode: input.operatingMode ?? "both"
+  });
+  const policyDir = path.join(cwd, ".catalog", "policy");
+  const learningDir = path.join(cwd, ".catalog", "learning");
+  await fs.mkdir(policyDir, { recursive: true });
+  await fs.mkdir(learningDir, { recursive: true });
+  await fs.writeFile(path.join(policyDir, "catalog-policy.json"), JSON.stringify(policy, null, 2));
+  await fs.writeFile(path.join(policyDir, "catalog-policy.md"), renderPolicyMarkdown(policy));
+  try {
+    await fs.access(path.join(learningDir, "catalog-learning.md"));
+  } catch {
+    await fs.writeFile(path.join(learningDir, "catalog-learning.md"), initialLearningMarkdown(policy));
+  }
 }
 
 function writer() {
@@ -35,6 +63,20 @@ const tests = [
       assert.equal(Array.isArray(policy.attributes_metafields_schema.metafields), true);
       assert.equal(typeof policy.attributes_metafields_schema.metafields[0].namespace, "string");
       assert.equal(Array.isArray(policy.attributes_metafields_schema.fill_rules), true);
+    }
+  },
+  {
+    name: "rendered catalog guide reads like an expert playbook with worked examples and edge cases",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "food_and_beverage", businessName: "Playbook Store" });
+      const markdown = renderPolicyMarkdown(policy);
+      assert.match(markdown, /## How To Use This Guide/);
+      assert.match(markdown, /### Variant Decision Playbook/);
+      assert.match(markdown, /## Worked Examples/);
+      assert.match(markdown, /duplicates/i);
+      assert.match(markdown, /new variants/i);
+      assert.match(markdown, /## Agentic Commerce Readiness/);
+      assert.match(markdown, /Recommended Metafields/);
     }
   },
   {
@@ -86,6 +128,178 @@ const tests = [
     }
   },
   {
+    name: "shopify payload carries variant attachment metadata for NEW_VARIANT matches",
+    run: async () => {
+      const payload = buildShopifyPayload({
+        id: "child-1",
+        title: "Uniqlo Club T-Shirt",
+        handle: "uniqlo-club-t-shirt-large",
+        vendor: "Uniqlo",
+        product_type: "T-Shirt",
+        size: "Large",
+        price: "29.00",
+        _catalog_match: {
+          decision: "NEW_VARIANT",
+          proposed_action: {
+            action: "attach_as_variant",
+            product_id: "parent-1",
+            product_handle: "uniqlo-club-t-shirt",
+            product_title: "Uniqlo Club T-Shirt",
+            option_values: [{ name: "size", value: "Large" }]
+          }
+        }
+      });
+      assert.equal(payload.id, null);
+      assert.equal(payload.attachToProductId, "parent-1");
+      assert.equal(payload.attachToProductHandle, "uniqlo-club-t-shirt");
+      assert.equal(payload.variantOptionValues?.[0].value, "Large");
+    }
+  },
+  {
+    name: "openai image analysis omits reasoning parameters for vision requests",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          assert.equal("reasoning" in body, false);
+          return {
+            ok: true,
+            json: async () => ({
+              output_text: "{\"status\":\"PASS\",\"confidence\":0.9,\"selected\":{\"hero\":{\"url\":\"https://example.com/hero.jpg\",\"confidence\":0.9},\"secondary\":[]},\"scored_candidates\":[],\"rejected\":[],\"findings\":[],\"skipped_reasons\":[]}"
+            })
+          } as Response;
+        };
+
+        const result = await analyzeImageWithOpenAI({
+          apiKey: "test-key",
+          model: "gpt-4.1-mini",
+          instructions: "Review product images.",
+          prompt: "Pick the best image.",
+          imageUrls: ["https://example.com/hero.jpg"],
+          schema: {
+            name: "catalog_image_review",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["status", "confidence", "selected", "scored_candidates", "rejected", "findings", "skipped_reasons"],
+              properties: {
+                status: { type: "string" },
+                confidence: { type: "number" },
+                selected: { type: "object" },
+                scored_candidates: { type: "array", items: { type: "object" } },
+                rejected: { type: "array", items: { type: "object" } },
+                findings: { type: "array", items: { type: "object" } },
+                skipped_reasons: { type: "array", items: { type: "string" } }
+              }
+            }
+          }
+        });
+        assert.equal(result.json.status, "PASS");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  },
+  {
+    name: "openai json connector retries with a larger output budget after truncation",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      let callCount = 0;
+      try {
+        globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+          callCount += 1;
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          if (callCount === 1) {
+            assert.equal(body.max_output_tokens, 1200);
+            return {
+              ok: true,
+              json: async () => ({
+                status: "incomplete",
+                incomplete_details: { reason: "max_output_tokens" }
+              })
+            } as Response;
+          }
+          assert.equal(body.max_output_tokens > 1200, true);
+          return {
+            ok: true,
+            json: async () => ({
+              output_text: "{\"value\":\"ok\"}"
+            })
+          } as Response;
+        };
+
+        const result = await createOpenAIJsonResponse<{ value: string }>({
+          apiKey: "test-key",
+          model: "gpt-5-mini",
+          instructions: "Return JSON.",
+          input: "hello",
+          schema: {
+            name: "simple",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["value"],
+              properties: { value: { type: "string" } }
+            }
+          },
+          maxOutputTokens: 1200
+        });
+        assert.equal(result.json.value, "ok");
+        assert.equal(callCount, 2);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  },
+  {
+    name: "gemini json connector omits responseMimeType when google search is enabled",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          assert.equal(Boolean(body.tools?.[0]?.google_search), true);
+          assert.equal("responseMimeType" in body.generationConfig, false);
+          assert.equal("responseJsonSchema" in body.generationConfig, false);
+          return {
+            ok: true,
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      { text: "{\"value\":\"ok\"}" }
+                    ]
+                  }
+                }
+              ]
+            })
+          } as Response;
+        };
+
+        const result = await createGeminiJsonResponse<{ value: string }>({
+          apiKey: "test-key",
+          model: "gemini-2.5-flash",
+          systemInstruction: "Return JSON.",
+          textPrompt: "hello",
+          schema: {
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["value"],
+              properties: { value: { type: "string" } }
+            }
+          },
+          googleSearch: true
+        });
+        assert.equal(result.json.value, "ok");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  },
+  {
     name: "init creates .catalog structure and runtime config",
     run: async () => {
       const cwd = await createTempProject();
@@ -104,11 +318,12 @@ const tests = [
     }
   },
   {
-    name: "expert generate creates policy files",
+    name: "guide generation fails cleanly without writing a fallback template when no provider is ready",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      io.text = "";
       const code = await runCli([
         "expert",
         "generate",
@@ -123,37 +338,24 @@ const tests = [
         "--json"
       ], { cwd, stdout: io, stderr: io });
       assert.equal(code, 0);
-      const policy = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "policy", "catalog-policy.json"), "utf8"));
-      assert.equal(policy.meta.business_name, "Test Store");
-      assert.equal(policy.meta.business_description, "A grocery business focused on fresh dairy products.");
-      assert.equal(policy.meta.operating_mode, "both");
-      assert.equal(Array.isArray(policy.taxonomy_design.hierarchy), true);
-      assert.equal(Array.isArray(policy.product_description_system.structure_template), true);
-      assert.equal(Array.isArray(policy.automation_playbook.fully_automated), true);
-      assert.equal(typeof policy.qa_validation_system.passing_score, "number");
+      const output = JSON.parse(io.text);
+      assert.equal(output.result.status, "failed");
+      assert.equal(Array.isArray(output.result.errors), true);
+      assert.equal(output.result.errors.length > 0, true);
+      await assert.rejects(fs.access(path.join(cwd, ".catalog", "policy", "catalog-policy.json")));
     }
   },
   {
-    name: "guide alias can generate and show the Catalog Guide",
+    name: "guide show renders an existing Catalog Guide",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      io.text = "";
-      const generateCode = await runCli([
-        "guide",
-        "generate",
-        "--industry",
-        "electronics",
-        "--business-name",
-        "Guide Store",
-        "--business-description",
-        "A store selling practical consumer electronics.",
-        "--json"
-      ], { cwd, stdout: io, stderr: io });
-      assert.equal(generateCode, 0);
-      const guide = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "policy", "catalog-policy.json"), "utf8"));
-      assert.equal(guide.meta.industry, "electronics");
+      await seedGuideFiles(cwd, {
+        industry: "electronics",
+        businessName: "Guide Store",
+        businessDescription: "A store selling practical consumer electronics."
+      });
       io.text = "";
       const showCode = await runCli(["guide", "show", "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(showCode, 0);
@@ -226,7 +428,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "QA Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "QA Store" });
       const inputPath = path.join(cwd, "qa-input.json");
       await fs.writeFile(inputPath, JSON.stringify({
         title: "Baladna Greek Yogurt Plain 500g",
@@ -247,12 +449,67 @@ const tests = [
     }
   },
   {
+    name: "qa returns agentic commerce readiness recommendations when recommended metafields are missing",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "apparel", businessName: "Agentic Store" });
+      const inputPath = path.join(cwd, "agentic-qa-input.json");
+      await fs.writeFile(inputPath, JSON.stringify({
+        title: "Uniqlo Club T-Shirt",
+        product_type: "T-Shirt",
+        vendor: "Uniqlo",
+        handle: "uniqlo-club-t-shirt",
+        price: "29.00",
+        description_html: "<h3>Overview</h3><p>A cotton t-shirt for everyday wear.</p><h3>Key Features</h3><p>Soft and breathable.</p><h3>Material And Fit</h3><p>Cotton fabric.</p><h3>Care Or Usage</h3><p>Machine wash cold.</p>",
+        featured_image: "https://example.com/shirt.jpg"
+      }, null, 2));
+      io.text = "";
+      const code = await runCli(["qa", "--input", inputPath, "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const output = JSON.parse(io.text);
+      const changes = output.result.proposed_changes;
+      assert.equal(typeof changes.agentic_commerce_readiness_score, "number");
+      assert.equal(Array.isArray(changes.agentic_commerce_recommendations), true);
+      assert.equal(Array.isArray(changes.recommended_metafields_to_add), true);
+      assert.match(JSON.stringify(changes.recommended_metafields_to_add), /custom\.use_case|use_case|audience|faq_summary/);
+    }
+  },
+  {
+    name: "enrich sanitizer removes uncertain sections from customer-facing descriptions instead of leaking review text",
+    run: async () => {
+      const sanitized = sanitizeCustomerFacingDescription({
+        title: "Baladna Greek Yogurt Plain 500g",
+        description: "",
+        description_html: "<h3>Overview</h3><p>Thick and creamy yogurt for breakfasts and cooking.</p><h3>Ingredients Or Composition</h3><p>Exact on-pack ingredients require verification before publishing.</p><h3>Storage Or Handling</h3><p>Keep refrigerated.</p>",
+        handle: "baladna-greek-yogurt-plain-500g",
+        vendor: "Baladna",
+        brand: "Baladna",
+        product_type: "Yogurt",
+        tags: [],
+        ingredients_text: null,
+        allergen_note: null,
+        nutritional_facts: null,
+        metafields: [],
+        warnings: [],
+        summary: "",
+        confidence: 0.8,
+        skipped_reasons: []
+      });
+      assert.match(sanitized.description_html, /Overview/);
+      assert.match(sanitized.description_html, /Storage Or Handling/);
+      assert.doesNotMatch(sanitized.description_html, /Ingredients Or Composition/);
+      assert.equal(sanitized.removedPlaceholderContent, true);
+    }
+  },
+  {
     name: "match detects exact duplicate by SKU",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["expert", "generate", "--industry", "grocery", "--business-name", "Test Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Test Store" });
       const inputPath = path.join(cwd, "input.json");
       const catalogPath = path.join(cwd, "catalog.json");
       await fs.writeFile(inputPath, JSON.stringify({ title: "Fresh Milk", brand: "Almarai", sku: "ALM-MILK-1L-FC", size: "1L", type: "Full Cream" }, null, 2));
@@ -287,12 +544,280 @@ const tests = [
     }
   },
   {
+    name: "match does not route different-brand lookalike products to review when only generic category terms overlap",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "electronics", businessName: "Test Store" });
+      const result = runMatchDecision({
+        jobId: "job-2",
+        input: {
+          title: "Belkin BoostCharge 45W USB-C Wall Charger White"
+        },
+        catalog: [
+          {
+            id: "prod-anker",
+            title: "Anker Nano 30W USB-C Wall Charger White"
+          }
+        ],
+        policy
+      });
+      assert.equal(result.decision, "NEW_PRODUCT");
+      assert.equal(result.needs_review, false);
+    }
+  },
+  {
+    name: "match infers title-only variant option values for safe new variants",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "electronics", businessName: "Test Store" });
+      const result = runMatchDecision({
+        jobId: "job-3",
+        input: {
+          title: "JBL Tune 520BT Wireless On-Ear Headphones Black"
+        },
+        catalog: [
+          {
+            id: "prod-jbl",
+            title: "JBL Tune 520BT Wireless On-Ear Headphones Blue"
+          }
+        ],
+        policy
+      });
+      assert.equal(result.decision, "NEW_VARIANT");
+      assert.equal(result.proposed_action.action, "attach_as_variant");
+      assert.equal(Array.isArray(result.proposed_action.option_values), true);
+      assert.equal(result.proposed_action.option_values[0].name, "Color");
+      assert.equal(result.proposed_action.option_values[0].value, "Black");
+    }
+  },
+  {
+    name: "generated variant product reuses the matched parent handle",
+    run: async () => {
+      const generated = buildGeneratedProduct(
+        {
+          id: "shirt-large",
+          title: "Uniqlo Club T-Shirt",
+          handle: "uniqlo-club-t-shirt-large",
+          _catalog_match: {
+            decision: "NEW_VARIANT",
+            matched_product_handle: "uniqlo-club-t-shirt"
+          }
+        },
+        {
+          job_id: "job-generated-variant",
+          module: "catalogue-match",
+          status: "success",
+          needs_review: false,
+          proposed_changes: {},
+          warnings: [],
+          errors: [],
+          reasoning: [],
+          artifacts: {},
+          next_actions: []
+        }
+      );
+
+      assert.equal(generated.handle, "uniqlo-club-t-shirt");
+    }
+  },
+  {
+    name: "live variant attach resolves the parent Shopify product id from generated live state",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "apparel", businessName: "Variant Live Resolve Store" });
+      await fs.mkdir(path.join(cwd, ".catalog", "generated", "products"), { recursive: true });
+      await fs.writeFile(
+        path.join(cwd, ".catalog", "generated", "products", "shirt-parent.json"),
+        JSON.stringify({
+          id: "shirt-parent",
+          title: "Uniqlo Club T-Shirt",
+          handle: "uniqlo-club-t-shirt",
+          _catalog_apply: {
+            status: "applied_live",
+            live_result: {
+              productId: "gid://shopify/Product/1234567890",
+              handle: "uniqlo-club-t-shirt"
+            }
+          }
+        }, null, 2)
+      );
+
+      const resolved = await resolveLiveVariantAttachPayload(cwd, {
+        attachToProductId: "shirt-parent",
+        attachToProductHandle: "uniqlo-club-t-shirt",
+        attachToProductTitle: "Uniqlo Club T-Shirt"
+      });
+
+      assert.equal(resolved.attachToProductId, "gid://shopify/Product/1234567890");
+      assert.equal(resolved.attachToProductHandle, "uniqlo-club-t-shirt");
+    }
+  },
+  {
+    name: "match treats retail title synonyms like tee and jogger singular-plural forms as duplicates when identity is otherwise the same",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "apparel", businessName: "Synonym Store" });
+      const teeResult = runMatchDecision({
+        jobId: "job-tee",
+        input: {
+          id: "input-tee",
+          title: "Uniqlo Oversized Cotton Tee Black Medium",
+          price: "29.00"
+        },
+        catalog: [
+          {
+            id: "catalog-tee",
+            title: "Uniqlo Oversized Cotton T-Shirt Black Medium",
+            price: "29.00"
+          }
+        ],
+        policy
+      });
+      assert.equal(teeResult.decision, "DUPLICATE");
+
+      const joggerResult = runMatchDecision({
+        jobId: "job-jogger",
+        input: {
+          id: "input-jogger",
+          title: "Nike Club Fleece Jogger Grey Large",
+          price: "65.00"
+        },
+        catalog: [
+          {
+            id: "catalog-jogger",
+            title: "Nike Club Fleece Joggers Grey Large",
+            price: "65.00"
+          }
+        ],
+        policy
+      });
+      assert.equal(joggerResult.decision, "DUPLICATE");
+    }
+  },
+  {
+    name: "image search query uses high quality product image wording and ranks product-like candidates ahead of weak assets",
+    run: async () => {
+      const query = buildImageSearchQuery({
+        title: "Baladna Greek Yogurt Plain 500g"
+      });
+      assert.equal(query, "\"Baladna Greek Yogurt Plain 500g\" high quality product image");
+
+      const queries = buildImageSearchQueries({
+        title: "Baladna Greek Yogurt Plain 500g"
+      });
+      assert.deepEqual(queries, [
+        "\"Baladna Greek Yogurt Plain 500g\" high quality product image",
+        "\"Baladna Greek Yogurt Plain 500g\" product packaging front"
+      ]);
+
+      const ranked = rankImageCandidates(
+        { title: "Baladna Greek Yogurt Plain 500g", brand: "Baladna" },
+        [
+          {
+            url: "https://baladna.com/storage/brand_image/logo.png",
+            title: "Greek Style Yoghurt",
+            source: "Baladna",
+            domain: "baladna.com",
+            page_url: "https://baladna.com/product/yoghurt/greek-style-yoghurt",
+            position: 1
+          },
+          {
+            url: "https://retailer.example.com/images/baladna-greek-yogurt-plain-500g-front.jpg",
+            title: "Baladna Greek Yogurt Plain 500g Product Image",
+            source: "Retailer",
+            domain: "retailer.example.com",
+            page_url: "https://retailer.example.com/products/baladna-greek-yogurt-plain-500g",
+            position: 5
+          }
+        ]
+      );
+
+      assert.equal(ranked[0].url, "https://retailer.example.com/images/baladna-greek-yogurt-plain-500g-front.jpg");
+    }
+  },
+  {
+    name: "image candidate ranking keeps real product images ahead of brand asset URLs",
+    run: async () => {
+      const ranked = rankImageCandidates(
+        { title: "Acme Protein Bar Chocolate 60g", brand: "Acme" },
+        [
+          {
+            url: "https://acme.example.com/storage/brand_image/protein-bar.png",
+            title: "Protein Bar",
+            source: "Acme",
+            domain: "acme.example.com",
+            page_url: "https://acme.example.com/products/protein-bar"
+          },
+          {
+            url: "https://shop.example.com/images/acme-protein-bar-chocolate-60g-front.jpg",
+            title: "Acme Protein Bar Chocolate 60g Product Image",
+            source: "Retailer",
+            domain: "shop.example.com",
+            page_url: "https://shop.example.com/products/acme-protein-bar-chocolate-60g"
+          }
+        ]
+      );
+
+      assert.equal(ranked[0].url, "https://shop.example.com/images/acme-protein-bar-chocolate-60g-front.jpg");
+    }
+  },
+  {
+    name: "image candidate preflight accepts supported image content types",
+    run: async () => {
+      const result = await evaluateImageCandidateUrl(
+        "https://images.example.com/product/front.jpg",
+        async () =>
+          new Response(null, {
+            status: 200,
+            headers: { "content-type": "image/jpeg" }
+          })
+      );
+
+      assert.equal(result.status, "usable");
+      assert.equal(result.contentType, "image/jpeg");
+    }
+  },
+  {
+    name: "image candidate preflight rejects non-image content",
+    run: async () => {
+      const result = await evaluateImageCandidateUrl(
+        "https://images.example.com/product/front.jpg",
+        async () =>
+          new Response("<html></html>", {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8" }
+          })
+      );
+
+      assert.equal(result.status, "unusable");
+      assert.match(String(result.reason), /unsupported_content_type/i);
+    }
+  },
+  {
+    name: "image candidate preflight keeps uncertain URLs for later review",
+    run: async () => {
+      let calls = 0;
+      const result = await evaluateImageCandidateUrl(
+        "https://images.example.com/product/front.jpg",
+        async () => {
+          calls += 1;
+          if (calls === 1) {
+            return new Response(null, { status: 403 });
+          }
+          throw new Error("network timeout");
+        }
+      );
+
+      assert.equal(result.status, "inconclusive");
+      assert.equal(result.reason, "preflight_inconclusive");
+    }
+  },
+  {
     name: "apply can proceed without review when the run does not require it",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["expert", "generate", "--industry", "grocery", "--business-name", "Test Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Test Store" });
       const inputPath = path.join(cwd, "input.json");
       await fs.writeFile(inputPath, JSON.stringify({ title: "Fresh Milk", brand: "Almarai", size: "1L", type: "Low Fat" }, null, 2));
       io.text = "";
@@ -334,14 +859,13 @@ const tests = [
     }
   },
   {
-    name: "expert generate preserves existing learning content",
+    name: "seeding a guide preserves existing learning content",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
       await runCli(["learn", "--lesson", "Do not publish customer-facing placeholder text.", "--json"], { cwd, stdout: io, stderr: io });
-      io.text = "";
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "Learning Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Learning Store" });
       const learning = await fs.readFile(path.join(cwd, ".catalog", "learning", "catalog-learning.md"), "utf8");
       assert.match(learning, /Do not publish customer-facing placeholder text/);
     }
@@ -352,7 +876,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["expert", "generate", "--industry", "grocery", "--business-name", "Test Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Test Store" });
       const inputPath = path.join(cwd, "products.json");
       await fs.writeFile(inputPath, JSON.stringify([
         { id: "p1", title: "Fresh Milk", brand: "Almarai", size: "1L" },
@@ -372,17 +896,11 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli([
-        "expert",
-        "generate",
-        "--industry",
-        "grocery",
-        "--business-name",
-        "Workflow Store",
-        "--business-description",
-        "A grocery store using local files for listings.",
-        "--json"
-      ], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, {
+        industry: "grocery",
+        businessName: "Workflow Store",
+        businessDescription: "A grocery store using local files for listings."
+      });
       const inputPath = path.join(cwd, "workflow-products.json");
       const catalogPath = path.join(cwd, "workflow-catalog.json");
       await fs.writeFile(inputPath, JSON.stringify([
@@ -445,17 +963,11 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli([
-        "guide",
-        "generate",
-        "--industry",
-        "electronics",
-        "--business-name",
-        "Device Store",
-        "--business-description",
-        "A store focused on practical device accessories.",
-        "--json"
-      ], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, {
+        industry: "electronics",
+        businessName: "Device Store",
+        businessDescription: "A store focused on practical device accessories."
+      });
       const inputPath = path.join(cwd, "devices.json");
       const catalogPath = path.join(cwd, "devices-catalog.json");
       await fs.writeFile(inputPath, JSON.stringify([
@@ -487,7 +999,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "Export Gate Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Export Gate Store" });
       const inputPath = path.join(cwd, "match-blocked-products.json");
       const catalogPath = path.join(cwd, "match-blocked-catalog.json");
       await fs.writeFile(inputPath, JSON.stringify([
@@ -520,7 +1032,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "Representative Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Representative Store" });
       const inputPath = path.join(cwd, "representative-products.json");
       const catalogPath = path.join(cwd, "representative-catalog.json");
       await fs.writeFile(inputPath, JSON.stringify([
@@ -557,7 +1069,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "electronics", "--business-name", "Sibling Match Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "electronics", businessName: "Sibling Match Store" });
       const inputPath = path.join(cwd, "sibling-duplicates.json");
       const catalogPath = path.join(cwd, "sibling-catalog.json");
       await fs.writeFile(inputPath, JSON.stringify([
@@ -583,16 +1095,146 @@ const tests = [
     }
   },
   {
+    name: "workflow stops after match when a row is classified as duplicate",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Duplicate Stop Store" });
+      const inputPath = path.join(cwd, "stop-after-match.json");
+      const catalogPath = path.join(cwd, "stop-after-match-catalog.json");
+      await fs.writeFile(inputPath, JSON.stringify([{ id: "dup-1", title: "Fresh Milk", brand: "Almarai" }], null, 2));
+      await fs.writeFile(catalogPath, JSON.stringify([{ id: "catalog-1", title: "Fresh Milk", brand: "Almarai" }], null, 2));
+      io.text = "";
+      const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const workflow = JSON.parse(io.text);
+      assert.equal(workflow.runs[0].modules.length, 1);
+      assert.equal(workflow.runs[0].modules[0].module, "catalogue-match");
+    }
+  },
+  {
+    name: "workflow stops after match when a row is classified as needs review",
+    run: async () => {
+      assert.equal(shouldSkipAfterMatch({
+        id: "review-1",
+        title: "Review Candidate",
+        _catalog_match: {
+          decision: "NEEDS_REVIEW",
+          needs_review: true
+        }
+      }), true);
+    }
+  },
+  {
+    name: "workflow export writes parent and attached variant rows under the same Shopify handle",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "apparel", businessName: "Variant Export Store" });
+      const inputPath = path.join(cwd, "variant-family.json");
+      const catalogPath = path.join(cwd, "variant-family-catalog.json");
+      await fs.writeFile(inputPath, JSON.stringify([
+        {
+          id: "shirt-parent",
+          title: "Uniqlo Club T-Shirt",
+          brand: "Uniqlo",
+          vendor: "Uniqlo",
+          handle: "uniqlo-club-t-shirt",
+          product_type: "T-Shirt",
+          description_html: "<h3>Overview</h3><p>Club T-Shirt.</p><h3>Key Product Details</h3><p>Soft cotton.</p><h3>Ingredients Or Composition</h3><p>Cotton.</p><h3>Storage Or Handling</h3><p>Machine wash cold.</p>",
+          featured_image: "https://example.com/shirt.jpg",
+          images: ["https://example.com/shirt.jpg"],
+          size: "Medium",
+          price: "29.00"
+        },
+        {
+          id: "shirt-large",
+          title: "Uniqlo Club T-Shirt",
+          brand: "Uniqlo",
+          vendor: "Uniqlo",
+          handle: "uniqlo-club-t-shirt-large",
+          product_type: "T-Shirt",
+          description_html: "<h3>Overview</h3><p>Club T-Shirt.</p><h3>Key Product Details</h3><p>Soft cotton.</p><h3>Ingredients Or Composition</h3><p>Cotton.</p><h3>Storage Or Handling</h3><p>Machine wash cold.</p>",
+          featured_image: "https://example.com/shirt.jpg",
+          images: ["https://example.com/shirt.jpg"],
+          size: "Large",
+          price: "29.00"
+        }
+      ], null, 2));
+      await fs.writeFile(catalogPath, JSON.stringify([], null, 2));
+      io.text = "";
+      const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
+      assert.match(shopifyImport, /uniqlo-club-t-shirt/);
+      assert.match(shopifyImport, /Medium/);
+      assert.match(shopifyImport, /Large/);
+    }
+  },
+  {
+    name: "shopify export uses inferred attached variant option names instead of guide default dimensions",
+    run: async () => {
+      const cwd = await createTempProject();
+      const policy = buildStarterPolicy({ industry: "apparel", businessName: "Variant Names Store" });
+      await seedGuideFiles(cwd, { industry: "apparel", businessName: "Variant Names Store" });
+      await writeShopifyImportCsv(cwd, [
+        {
+          id: "variant-parent",
+          title: "Uniqlo Club T-Shirt",
+          handle: "uniqlo-club-t-shirt",
+          vendor: "Uniqlo",
+          brand: "Uniqlo",
+          product_type: "T-Shirts",
+          price: "29.00"
+        },
+        {
+          id: "variant-child",
+          title: "Uniqlo Club T-Shirt",
+          handle: "uniqlo-club-t-shirt-black",
+          vendor: "Uniqlo",
+          brand: "Uniqlo",
+          product_type: "T-Shirts",
+          price: "29.00",
+          _catalog_match: {
+            decision: "NEW_VARIANT",
+            needs_review: false,
+            matched_product_id: "variant-parent",
+            proposed_action: {
+              action: "attach_as_variant",
+              product_id: "variant-parent",
+              product_title: "Uniqlo Club T-Shirt",
+              option_values: [
+                {
+                  name: "color",
+                  value: "Black"
+                }
+              ]
+            }
+          }
+        }
+      ], policy);
+
+      const csv = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
+      const workbook = XLSX.read(csv, { type: "string" });
+      const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]]);
+      const blackRow = rows.find((row) => row["Option1 Value"] === "Black");
+      assert.ok(blackRow);
+      assert.equal(blackRow["Option1 Name"], "color");
+    }
+  },
+  {
     name: "review queue and bulk review work on workflow outputs",
     run: async () => {
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["expert", "generate", "--industry", "grocery", "--business-name", "Queue Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Queue Store" });
       const inputPath = path.join(cwd, "queue-products.json");
       const catalogPath = path.join(cwd, "queue-catalog.json");
-      await fs.writeFile(inputPath, JSON.stringify([{ id: "p1", title: "Fresh Milk", brand: "Almarai" }], null, 2));
-      await fs.writeFile(catalogPath, JSON.stringify([{ id: "prod-100", title: "Fresh Milk", brand: "Almarai" }], null, 2));
+      await fs.writeFile(inputPath, JSON.stringify([{ id: "p1", title: "Fresh Milk", brand: "Almarai", price: "8.95" }], null, 2));
+      await fs.writeFile(catalogPath, JSON.stringify([], null, 2));
       io.text = "";
       await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
       io.text = "";
@@ -613,7 +1255,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "Publish Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Publish Store" });
       const inputPath = path.join(cwd, "publish-products.json");
       await fs.writeFile(inputPath, JSON.stringify({
         id: "p1",
@@ -645,7 +1287,7 @@ const tests = [
       const cwd = await createTempProject();
       const io = writer();
       await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
-      await runCli(["guide", "generate", "--industry", "grocery", "--business-name", "Publish Match Gate Store", "--json"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Publish Match Gate Store" });
       const inputPath = path.join(cwd, "publish-match-blocked.json");
       await fs.writeFile(inputPath, JSON.stringify({
         id: "p1",

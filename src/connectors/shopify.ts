@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import type { ProductRecord, ProductVariant, ShopifyPayload } from "../types.js";
+import type { LooseRecord, ProductRecord, ProductVariant, ShopifyPayload } from "../types.js";
 
 interface CreateMediaInput {
   originalSource: string;
@@ -104,9 +104,28 @@ export function buildShopifyPayload(product: ProductRecord): ShopifyPayload {
   const firstVariant = Array.isArray(product.variants) && product.variants.length > 0
     ? product.variants[0] as ProductVariant
     : null;
+  const match = product._catalog_match && typeof product._catalog_match === "object"
+    ? product._catalog_match as LooseRecord
+    : null;
+  const proposedAction = match?.proposed_action && typeof match.proposed_action === "object"
+    ? match.proposed_action as LooseRecord
+    : null;
+  const isVariantAttach = String(match?.decision ?? "").toUpperCase() === "NEW_VARIANT"
+    && String(proposedAction?.action ?? "") === "attach_as_variant"
+    && typeof proposedAction?.product_id === "string"
+    && proposedAction.product_id.length > 0;
+  const variantOptionValues = Array.isArray(proposedAction?.option_values)
+    ? proposedAction.option_values
+        .filter((item): item is LooseRecord => Boolean(item) && typeof item === "object")
+        .map((item) => ({
+          name: String(item.name ?? "").trim(),
+          value: String(item.value ?? "").trim()
+        }))
+        .filter((item) => item.name.length > 0 && item.value.length > 0)
+    : [];
 
   return {
-    id: product.id ?? null,
+    id: isVariantAttach ? null : product.id ?? null,
     title: product.title,
     handle: product.handle,
     descriptionHtml: product.description_html ?? product.description ?? "",
@@ -119,7 +138,11 @@ export function buildShopifyPayload(product: ProductRecord): ShopifyPayload {
     featuredImage: imageCandidates[0] ?? "",
     images: imageCandidates,
     imageAltText: typeof product.image_alt_text === "string" ? product.image_alt_text : product.title ?? "",
-    metafields: Array.isArray(product.metafields) ? product.metafields : []
+    metafields: Array.isArray(product.metafields) ? product.metafields : [],
+    attachToProductId: isVariantAttach ? String(proposedAction?.product_id ?? "") : null,
+    attachToProductHandle: isVariantAttach ? String(proposedAction?.product_handle ?? "") : null,
+    attachToProductTitle: isVariantAttach ? String(proposedAction?.product_title ?? "") : null,
+    variantOptionValues
   };
 }
 
@@ -715,6 +738,90 @@ async function updateStandaloneVariant({
   }
 }
 
+async function attachVariantToExistingProduct({
+  store,
+  apiVersion,
+  accessToken,
+  payload
+}: {
+  store: string;
+  apiVersion: string;
+  accessToken: string;
+  payload: ShopifyPayload;
+}): Promise<{ mode: "attach_variant"; productId: string; handle?: string; variantSupport: string }> {
+  const productId = typeof payload.attachToProductId === "string" ? payload.attachToProductId.trim() : "";
+  const optionValues = Array.isArray(payload.variantOptionValues) ? payload.variantOptionValues : [];
+  if (!productId) {
+    throw new Error("Variant attach requires attachToProductId.");
+  }
+  if (optionValues.length === 0) {
+    throw new Error("Variant attach requires at least one option value.");
+  }
+
+  const sourceVariant = getSingleVariantPayload(payload) ?? (Array.isArray(payload.variants) ? payload.variants[0] as ProductVariant : null);
+  const normalizedOptionValues = optionValues
+    .map((item) => ({
+      optionName: String((item as LooseRecord).name ?? "").trim(),
+      name: String((item as LooseRecord).value ?? "").trim()
+    }))
+    .filter((item) => item.optionName.length > 0 && item.name.length > 0);
+
+  if (normalizedOptionValues.length === 0) {
+    throw new Error("Variant attach requires valid option values.");
+  }
+
+  const data = await shopifyGraphql<{
+    productVariantsBulkCreate: {
+      product?: { id: string; handle?: string };
+      productVariants?: Array<{ id: string }>;
+      userErrors?: Array<{ field?: string[]; message: string }>;
+    };
+  }>({
+    store,
+    apiVersion,
+    accessToken,
+    query: `
+      mutation CatalogToolkitProductVariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+        productVariantsBulkCreate(productId: $productId, variants: $variants) {
+          product {
+            id
+            handle
+          }
+          productVariants {
+            id
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    variables: {
+      productId,
+      variants: [{
+        optionValues: normalizedOptionValues,
+        ...(typeof sourceVariant?.price === "string" && sourceVariant.price.trim().length > 0 ? { price: sourceVariant.price } : {}),
+        ...(typeof sourceVariant?.compare_at_price === "string" && sourceVariant.compare_at_price.trim().length > 0 ? { compareAtPrice: sourceVariant.compare_at_price } : {}),
+        ...(typeof sourceVariant?.barcode === "string" && sourceVariant.barcode.trim().length > 0 ? { barcode: sourceVariant.barcode } : {}),
+        ...(typeof sourceVariant?.sku === "string" && sourceVariant.sku.trim().length > 0 ? { inventoryItem: { sku: sourceVariant.sku } } : {})
+      }]
+    }
+  });
+
+  const errors = data.productVariantsBulkCreate.userErrors ?? [];
+  if (errors.length > 0) {
+    throw new Error(`Shopify productVariantsBulkCreate failed: ${errors.map((item) => item.message).join("; ")}`);
+  }
+
+  return {
+    mode: "attach_variant",
+    productId: data.productVariantsBulkCreate.product?.id ?? productId,
+    handle: data.productVariantsBulkCreate.product?.handle,
+    variantSupport: "attached_variant"
+  };
+}
+
 export async function applyShopifyPayload({
   store,
   apiVersion = "2025-04",
@@ -725,7 +832,16 @@ export async function applyShopifyPayload({
   apiVersion?: string;
   accessToken: string;
   payload: ShopifyPayload;
-}): Promise<{ mode: "create" | "update"; productId: string; handle?: string; variantSupport: string }> {
+}): Promise<{ mode: "create" | "update" | "attach_variant"; productId: string; handle?: string; variantSupport: string }> {
+  if (typeof payload.attachToProductId === "string" && payload.attachToProductId.trim().length > 0) {
+    return attachVariantToExistingProduct({
+      store,
+      apiVersion,
+      accessToken,
+      payload
+    });
+  }
+
   const variantCount = Array.isArray(payload.variants) ? payload.variants.length : 0;
   const media = buildMediaInputs(payload);
   const definitions = await fetchProductMetafieldDefinitionsMap({ store, apiVersion, accessToken });

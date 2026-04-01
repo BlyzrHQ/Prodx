@@ -1,19 +1,170 @@
 import { createBaseResult } from "./shared.js";
 import { compactValue, jaccardSimilarity, normalizeValue } from "../lib/similarity.js";
+import { inferVendorFromTitle } from "../lib/product.js";
+
+const COLOR_VALUES = [
+  "black",
+  "white",
+  "blue",
+  "red",
+  "green",
+  "pink",
+  "purple",
+  "yellow",
+  "gray",
+  "grey",
+  "silver",
+  "gold",
+  "beige",
+  "brown",
+  "orange",
+  "navy"
+];
+
+const TITLE_SYNONYMS = new Map([
+  ["tee", "t shirt"],
+  ["tees", "t shirt"],
+  ["tshirt", "t shirt"],
+  ["tshirts", "t shirt"],
+  ["jogger", "joggers"],
+  ["sneaker", "sneakers"],
+  ["earbud", "earbuds"],
+  ["headphone", "headphones"]
+]);
+
+function normalizeRetailTitle(value) {
+  return normalizeValue(value)
+    .split(" ")
+    .filter(Boolean)
+    .map((token) => TITLE_SYNONYMS.get(token) ?? token)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniqStrings(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const normalized = String(value ?? "").trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
 
 function getVariantSignature(product, variantKeys) {
   return variantKeys.map((key) => normalizeValue(product[key])).filter(Boolean).join("|");
 }
 
+function toTitleCase(value) {
+  return String(value ?? "")
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+    .join(" ");
+}
+
+function findOptionValueFromTitle(title, key) {
+  const text = String(title ?? "");
+  const normalized = normalizeValue(text);
+  if (!normalized) return "";
+
+  if (key === "color") {
+    const matchedColor = COLOR_VALUES.find((color) => new RegExp(`(?:^|\\s)${color}(?:$|\\s)`, "i").test(normalized));
+    return matchedColor ? toTitleCase(matchedColor) : "";
+  }
+
+  if (key === "size" || key === "pack_size") {
+    const match = text.match(/\b\d+(?:[\.,]\d+)?\s?(?:kg|g|mg|lb|oz|l|ml|cl|cm|mm|m|tb|gb)\b/i);
+    return match ? match[0].replace(/\s+/g, "") : "";
+  }
+
+  if (key === "storage") {
+    const match = text.match(/\b\d+(?:[\.,]\d+)?\s?(?:tb|gb)\b/i);
+    return match ? match[0].replace(/\s+/g, "") : "";
+  }
+
+  if (key === "type") {
+    const knownTypes = ["low fat", "full fat", "full cream", "nonfat", "plain", "vanilla"];
+    const matchedType = knownTypes.find((candidate) => normalized.includes(candidate));
+    return matchedType ? toTitleCase(matchedType) : "";
+  }
+
+  return "";
+}
+
+function getVariantOptionValues(product, variantEntries) {
+  const explicit = variantEntries
+    .map(({ fieldKey, optionName }) => {
+      const raw = product?.[fieldKey];
+      const value = typeof raw === "string" ? raw.trim() : String(raw ?? "").trim();
+      if (!value || value.toLowerCase() === "default title") return null;
+      return {
+        name: optionName,
+        value
+      };
+    })
+    .filter(Boolean);
+
+  if (explicit.length > 0) return uniqStrings(explicit.map((item) => JSON.stringify(item))).map((value) => JSON.parse(value));
+
+  const inferred = variantEntries
+    .map(({ fieldKey, optionName }) => {
+      const value = findOptionValueFromTitle(product?.title, fieldKey);
+      if (!value) return null;
+      return {
+        name: optionName,
+        value
+      };
+    })
+    .filter(Boolean);
+
+  return uniqStrings(inferred.map((item) => JSON.stringify(item))).map((value) => JSON.parse(value));
+}
+
 function buildComparableTitle(brand, title) {
-  const normalizedBrand = normalizeValue(brand);
-  const normalizedTitle = normalizeValue(title);
+  const normalizedBrand = normalizeRetailTitle(brand);
+  const normalizedTitle = normalizeRetailTitle(title);
   if (!normalizedBrand) return String(title ?? "").trim();
   if (!normalizedTitle) return String(brand ?? "").trim();
   if (normalizedTitle === normalizedBrand || normalizedTitle.startsWith(`${normalizedBrand} `)) {
     return String(title ?? "").trim();
   }
   return `${String(brand ?? "").trim()} ${String(title ?? "").trim()}`.trim();
+}
+
+function resolveBrand(product) {
+  const explicit = typeof product?.brand === "string" && product.brand.trim()
+    ? product.brand.trim()
+    : typeof product?.vendor === "string" && product.vendor.trim()
+      ? product.vendor.trim()
+      : "";
+  if (explicit) return explicit;
+  if (typeof product?.title === "string" && product.title.trim()) {
+    return inferVendorFromTitle(product.title.trim());
+  }
+  return "";
+}
+
+function getFamilyTokenSet(title) {
+  const tokens = normalizeRetailTitle(title)
+    .split(" ")
+    .filter(Boolean)
+    .filter((token) => !/^\d+$/.test(token))
+    .filter((token) => !["black", "white", "blue", "red", "green", "pink", "silver", "gold", "gray", "grey"].includes(token))
+    .filter((token) => !["usb", "c", "wall", "charger", "wireless", "headphones", "milk", "yogurt"].includes(token));
+  return new Set(tokens);
+}
+
+function familyOverlapScore(leftTitle, rightTitle) {
+  const left = getFamilyTokenSet(leftTitle);
+  const right = getFamilyTokenSet(rightTitle);
+  if (left.size === 0 || right.size === 0) return 0;
+  let shared = 0;
+  for (const token of left) {
+    if (right.has(token)) shared += 1;
+  }
+  return shared / Math.max(left.size, right.size);
 }
 
 export function buildCatalogIndex(catalog) {
@@ -27,7 +178,7 @@ export function buildCatalogIndex(catalog) {
       sku: source.sku ?? product.sku ?? "",
       barcode: source.barcode ?? product.barcode ?? "",
       title: source.title ?? product.title ?? "",
-      brand: source.brand ?? source.vendor ?? product.brand ?? product.vendor ?? "",
+      brand: resolveBrand(source) || resolveBrand(product),
       handle: source.handle ?? product.handle ?? "",
       variant_signature: getVariantSignature(source, ["size", "type", "color", "storage", "option1", "option2"]),
       raw: product
@@ -39,8 +190,22 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
   const candidates = buildCatalogIndex(catalog);
   const targetSku = normalizeValue(input.sku);
   const targetBarcode = normalizeValue(input.barcode);
-  const targetTitle = buildComparableTitle(input.brand, input.title);
-  const canonicalTargetTitle = compactValue(targetTitle);
+  const resolvedTargetBrand = resolveBrand(input);
+  const targetTitle = buildComparableTitle(resolvedTargetBrand, input.title);
+  const canonicalTargetTitle = compactValue(normalizeRetailTitle(targetTitle));
+  const variantEntries = (
+    policy?.variant_structure?.primary_dimensions
+    ?? policy?.variant_architecture?.allowed_dimensions
+    ?? ["size", "type", "color", "storage"]
+  ).map((item) => {
+    const optionName = String(item).trim();
+    return {
+      optionName: optionName || toTitleCase(String(item).replace(/_/g, " ")),
+      fieldKey: String(item).toLowerCase().replace(/\s+/g, "_")
+    };
+  });
+  const variantKeys = variantEntries.map((entry) => entry.fieldKey);
+  const targetVariant = getVariantSignature(input, variantKeys);
 
   const exactSku = targetSku ? candidates.find((item) => normalizeValue(item.sku) === targetSku) : null;
   if (exactSku) {
@@ -81,9 +246,12 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
   }
 
   const exactCanonicalTitle = canonicalTargetTitle
-    ? candidates.find((candidate) => compactValue(buildComparableTitle(candidate.brand, candidate.title)) === canonicalTargetTitle)
+    ? candidates.find((candidate) => compactValue(normalizeRetailTitle(buildComparableTitle(candidate.brand, candidate.title))) === canonicalTargetTitle)
     : null;
   if (exactCanonicalTitle) {
+    const exactTitleVariant = getVariantSignature(exactCanonicalTitle.raw, variantKeys);
+    const canTreatAsDuplicate = !targetVariant || !exactTitleVariant || targetVariant === exactTitleVariant;
+    if (canTreatAsDuplicate) {
     return {
       ...createBaseResult({
         jobId,
@@ -99,14 +267,32 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
       matched_variant_id: exactCanonicalTitle.id,
       proposed_action: { action: "skip_duplicate", product_id: exactCanonicalTitle.id }
     };
+    }
   }
 
   const scored = candidates
-    .map((candidate) => ({ ...candidate, score: jaccardSimilarity(targetTitle, buildComparableTitle(candidate.brand, candidate.title)) }))
+    .map((candidate) => {
+      const candidateTitle = buildComparableTitle(candidate.brand, candidate.title);
+      const similarity = jaccardSimilarity(targetTitle, candidateTitle);
+      const familyScore = familyOverlapScore(targetTitle, candidateTitle);
+      const brandMismatch = Boolean(
+        resolvedTargetBrand
+        && candidate.brand
+        && normalizeValue(resolvedTargetBrand) !== normalizeValue(candidate.brand)
+      );
+      const adjustedScore = brandMismatch
+        ? Math.max(0, similarity - 0.2)
+        : similarity;
+      return {
+        ...candidate,
+        score: adjustedScore,
+        raw_score: similarity,
+        family_score: familyScore,
+        brand_mismatch: brandMismatch
+      };
+    })
     .sort((a, b) => b.score - a.score);
   const best = scored[0];
-  const variantKeys = policy?.variant_structure?.primary_dimensions?.map((item) => item.toLowerCase()) ?? ["size", "type"];
-  const targetVariant = getVariantSignature(input, variantKeys);
   const bestVariant = best ? getVariantSignature(best.raw, variantKeys) : "";
   const learningFlag = /generic values like default or regular/i.test(learningText) || /generic values like default or regular/i.test(JSON.stringify(policy));
 
@@ -122,6 +308,27 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
       }),
       decision: "NEW_PRODUCT",
       confidence: 0.9,
+      matched_product_id: null,
+      matched_variant_id: null,
+      proposed_action: { action: "create_product" }
+    };
+  }
+
+  if (best.brand_mismatch && best.family_score < 0.5) {
+    return {
+      ...createBaseResult({
+        jobId,
+        module: "catalogue-match",
+        status: "success",
+        needsReview: false,
+        reasoning: [
+          `Closest candidate: ${best.title}`,
+          "Candidate shares only generic category terms and does not match the same brand or product family strongly enough."
+        ],
+        nextActions: ["Treat as a new product unless stronger identity signals appear later."]
+      }),
+      decision: "NEW_PRODUCT",
+      confidence: 0.82,
       matched_product_id: null,
       matched_variant_id: null,
       proposed_action: { action: "create_product" }
@@ -167,6 +374,7 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
   }
 
   if (best.score >= 0.6) {
+    const variantOptionValues = getVariantOptionValues(input, variantEntries);
     return {
       ...createBaseResult({
         jobId,
@@ -180,7 +388,13 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
       confidence: 0.82,
       matched_product_id: best.id,
       matched_variant_id: null,
-      proposed_action: { action: "attach_as_variant", product_id: best.id }
+      proposed_action: {
+        action: "attach_as_variant",
+        product_id: best.id,
+        product_handle: best.handle ?? "",
+        product_title: best.title ?? "",
+        option_values: variantOptionValues
+      }
     };
   }
 

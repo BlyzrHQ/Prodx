@@ -26,11 +26,11 @@ export async function createOpenAIJsonResponse<T>({
     includeSources?: boolean;
   };
 }): Promise<ConnectorJsonResponse<T>> {
-  const requestBody = {
+  const buildRequestBody = (tokenBudget: number, instructionOverride?: string) => ({
     model,
-    instructions,
+    instructions: instructionOverride ?? instructions,
     input,
-    max_output_tokens: maxOutputTokens,
+    max_output_tokens: tokenBudget,
     ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
     ...(webSearch?.enabled ? {
       tools: [
@@ -55,8 +55,9 @@ export async function createOpenAIJsonResponse<T>({
         strict: true
       }
     }
-  };
+  });
 
+  const requestBody = buildRequestBody(maxOutputTokens);
   const response = await fetch(OPENAI_BASE_URL, {
     method: "POST",
     headers: {
@@ -69,6 +70,33 @@ export async function createOpenAIJsonResponse<T>({
   const data = await response.json();
   if (!response.ok) {
     throw new Error(`OpenAI request failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+
+  if (data?.status === "incomplete" && data?.incomplete_details?.reason === "max_output_tokens") {
+    const retryBody = buildRequestBody(Math.max(maxOutputTokens + 2000, Math.ceil(maxOutputTokens * 1.5)), `${instructions} Return concise minified JSON only. Keep field values compact and avoid unnecessary prose.`);
+    const retryResponse = await fetch(OPENAI_BASE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(retryBody)
+    });
+    const retryData = await retryResponse.json();
+    if (!retryResponse.ok) {
+      throw new Error(`OpenAI retry request failed: ${retryResponse.status} ${JSON.stringify(retryData)}`);
+    }
+    const retryText = extractOpenAIText(retryData);
+    const retryParsed = parseJsonWithRecovery<T>(retryText);
+    if (!retryParsed.ok) {
+      const retryError = (retryParsed as { ok: false; error: string }).error;
+      throw new Error(`OpenAI returned invalid JSON after truncation retry: ${retryError}`);
+    }
+    return {
+      raw: retryData,
+      text: retryText,
+      json: retryParsed.value
+    };
   }
 
   let text = extractOpenAIText(data);
@@ -117,8 +145,7 @@ export async function analyzeImageWithOpenAI<T>({
   imageUrl,
   imageUrls,
   schema,
-  maxOutputTokens = 1200,
-  reasoningEffort
+  maxOutputTokens = 1200
 }: {
   apiKey: string;
   model: string;
@@ -128,7 +155,6 @@ export async function analyzeImageWithOpenAI<T>({
   imageUrls?: string[];
   schema: { name?: string; schema: unknown };
   maxOutputTokens?: number;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high";
 }): Promise<ConnectorJsonResponse<T>> {
   const resolvedImageUrls = Array.isArray(imageUrls) && imageUrls.length > 0
     ? imageUrls
@@ -141,7 +167,6 @@ export async function analyzeImageWithOpenAI<T>({
     model,
     instructions,
     maxOutputTokens,
-    reasoningEffort,
     schema,
     input: [
       {

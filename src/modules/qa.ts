@@ -3,7 +3,7 @@ import { resolveProvider } from "../lib/providers.js";
 import { createOpenAIJsonResponse } from "../connectors/openai.js";
 import { createGeminiJsonResponse } from "../connectors/gemini.js";
 import { createAnthropicJsonResponse } from "../connectors/anthropic.js";
-import { getGuideAllowedFields, getGuideDescriptionSections, getGuidePassingScore, getGuideRequiredFields, getGuideVariantDimensions } from "../lib/catalog-guide.js";
+import { getGuideAgenticDescriptionRequirements, getGuideAgenticRecommendedMetafields, getGuideAgenticRequiredSignals, getGuideAllowedFields, getGuideDescriptionSections, getGuidePassingScore, getGuideRequiredFields, getGuideVariantDimensions } from "../lib/catalog-guide.js";
 import { buildQaPromptPayload, buildSystemPrompt, getQaPromptSpec } from "../lib/prompt-specs.js";
 import { readText } from "../lib/fs.js";
 import { getCatalogPaths } from "../lib/paths.js";
@@ -123,6 +123,36 @@ function hasVariantProblems(input: ProductRecord, guideDimensions: string[]): Qa
   return findings;
 }
 
+function hasVariantTitleProblems(input: ProductRecord): QaFinding[] {
+  const findings: QaFinding[] = [];
+  if (!Array.isArray(input.variants) || input.variants.length === 0 || typeof input.title !== "string" || !input.title.trim()) {
+    return findings;
+  }
+
+  const normalizedTitle = input.title.toLowerCase();
+  const uniqueOptionValues = [...new Set(
+    input.variants
+      .flatMap((variant) => [variant.option1, variant.option2, variant.option3])
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.toLowerCase() !== "default title")
+  )];
+
+  const repeatedInTitle = uniqueOptionValues.filter((value) => normalizedTitle.includes(value.toLowerCase()));
+  if (repeatedInTitle.length > 0) {
+    findings.push(createFinding(
+      "title",
+      "format",
+      "major",
+      "Base product title repeats variant option values that should usually live in option fields.",
+      "Stable family-level base title with shopper-facing differentiators in variant options unless the category explicitly requires them in title.",
+      repeatedInTitle.join(", ")
+    ));
+  }
+
+  return findings;
+}
+
 function getUpstreamImageReview(input: ProductRecord): LooseRecord | null {
   const value = input._catalog_image_review;
   return value && typeof value === "object" ? value as LooseRecord : null;
@@ -137,7 +167,7 @@ function upstreamImageReviewPassed(input: ProductRecord): boolean {
     ? (review.selected as LooseRecord).hero
     : null;
   const heroUrl = hero && typeof hero === "object" ? String((hero as LooseRecord).url ?? "") : "";
-  return status === "PASS" && confidence >= 0.8 && heroUrl.length > 0;
+  return status === "PASS" && confidence >= 0.7 && heroUrl.length > 0;
 }
 
 function validateDeterministically(input: ProductRecord, policy: PolicyDocument): QaOutput {
@@ -219,6 +249,7 @@ function validateDeterministically(input: ProductRecord, policy: PolicyDocument)
   }
 
   findings.push(...hasVariantProblems(input, variantDimensions));
+  findings.push(...hasVariantTitleProblems(input));
 
   if (!input.featured_image && (!Array.isArray(input.images) || input.images.length === 0)) {
     findings.push(createFinding("images", "missing", "major", "No primary image is attached.", "At least one compliant product image", "missing"));
@@ -365,6 +396,120 @@ function sanitizeQaEvaluationForImageEvidence(input: ProductRecord, evaluation: 
   };
 }
 
+function hasNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function buildMetafieldIndex(input: ProductRecord): Set<string> {
+  const values = new Set<string>();
+  for (const metafield of Array.isArray(input.metafields) ? input.metafields : []) {
+    if (!metafield || typeof metafield !== "object") continue;
+    if (!hasNonEmptyString(metafield.namespace) || !hasNonEmptyString(metafield.key)) continue;
+    values.add(`${metafield.namespace}.${metafield.key}`);
+  }
+  return values;
+}
+
+function computeAgenticReadiness(input: ProductRecord, policy: PolicyDocument): {
+  score: number;
+  strengths: string[];
+  recommendations: string[];
+  recommended_metafields: Array<{ namespace: string; key: string; type: string; purpose: string }>;
+} {
+  let score = 0;
+  const strengths: string[] = [];
+  const recommendations: string[] = [];
+  const missingRecommendedMetafields: Array<{ namespace: string; key: string; type: string; purpose: string }> = [];
+  const descriptionText = typeof input.description_html === "string" && input.description_html.trim()
+    ? htmlToText(input.description_html)
+    : String(input.description ?? "");
+  const lowerDescription = descriptionText.toLowerCase();
+  const metafieldIndex = buildMetafieldIndex(input);
+  const requiredSignals = getGuideAgenticRequiredSignals(policy);
+  const recommendedMetafields = getGuideAgenticRecommendedMetafields(policy);
+  const descriptionRequirements = getGuideAgenticDescriptionRequirements(policy);
+
+  if (hasNonEmptyString(input.title) && hasNonEmptyString(input.vendor ?? input.brand) && hasNonEmptyString(input.product_type) && hasNonEmptyString(input.handle) && hasNonEmptyString(input.price)) {
+    score += 30;
+    strengths.push("Core product identity fields are present for AI-driven discovery.");
+  } else {
+    recommendations.push("Ensure title, vendor or brand, product type, handle, and price are all present and stable.");
+  }
+
+  if (hasNonEmptyString(descriptionText) && descriptionRequirements.some((rule) => /who it is for|when to use|what the product is|strongest attributes/i.test(rule)) ) {
+    const heuristicHits = [
+      /\bfor\b/.test(lowerDescription),
+      /\buse\b/.test(lowerDescription) || /\bideal\b/.test(lowerDescription) || /\bperfect\b/.test(lowerDescription),
+      /\bmade of\b/.test(lowerDescription) || /\bingredient\b/.test(lowerDescription) || /\bmaterial\b/.test(lowerDescription) || /\bcompatib/i.test(lowerDescription)
+    ].filter(Boolean).length;
+    if (heuristicHits >= 2) {
+      score += 25;
+      strengths.push("Description appears decision-ready for both shoppers and AI recommendation systems.");
+    } else {
+      recommendations.push("Strengthen the description with clearer use-case, audience, and decision-driving attributes.");
+    }
+  } else if (hasNonEmptyString(descriptionText)) {
+    score += 10;
+  } else {
+    recommendations.push("Add a structured, decision-ready description that explains what the product is, who it is for, and when it is useful.");
+  }
+
+  const signalCoverage = requiredSignals.filter((signal) => {
+    const normalized = signal.toLowerCase();
+    if (normalized.includes("use case")) return metafieldIndex.has("custom.use_case") || /\buse\b|\bideal\b|\bperfect\b/.test(lowerDescription);
+    if (normalized.includes("audience")) return metafieldIndex.has("custom.audience") || /\bkids\b|\badults\b|\bfamily\b|\bguests\b/.test(lowerDescription);
+    if (normalized.includes("occasion")) return metafieldIndex.has("custom.occasion") || /\bramadan\b|\beid\b|\bbreakfast\b|\bgift\b/.test(lowerDescription);
+    if (normalized.includes("ingredient")) return hasNonEmptyString(input.ingredients_text) || metafieldIndex.has("custom.ingredients_text");
+    if (normalized.includes("material")) return metafieldIndex.has("custom.material") || /\bcotton\b|\blinen\b|\bpolyester\b/.test(lowerDescription);
+    if (normalized.includes("compatib")) return metafieldIndex.has("custom.compatibility") || /\bcompatible\b/.test(lowerDescription);
+    return false;
+  }).length;
+  if (requiredSignals.length > 0) {
+    const ratio = signalCoverage / requiredSignals.length;
+    score += Math.round(ratio * 20);
+    if (ratio >= 0.6) {
+      strengths.push("The listing includes useful intent and recommendation signals for agentic commerce.");
+    } else {
+      recommendations.push("Add more explicit intent signals such as use case, audience, occasion, compatibility, material, or ingredient context.");
+    }
+  }
+
+  for (const field of recommendedMetafields) {
+    const identifier = `${field.namespace}.${field.key}`;
+    if (!metafieldIndex.has(identifier)) {
+      missingRecommendedMetafields.push({
+        namespace: field.namespace,
+        key: field.key,
+        type: field.type,
+        purpose: field.purpose
+      });
+    }
+  }
+  const fulfilledRecommendedMetafields = recommendedMetafields.length - missingRecommendedMetafields.length;
+  if (recommendedMetafields.length > 0) {
+    score += Math.round((fulfilledRecommendedMetafields / recommendedMetafields.length) * 15);
+    if (missingRecommendedMetafields.length > 0) {
+      recommendations.push(`Consider adding recommended metafields to improve agentic commerce readiness: ${missingRecommendedMetafields.map((field) => `${field.namespace}.${field.key}`).join(", ")}.`);
+    } else {
+      strengths.push("Recommended AI-discovery metafields are already present.");
+    }
+  }
+
+  if ((Array.isArray(input.images) && input.images.length > 0) || hasNonEmptyString(input.featured_image)) {
+    score += 10;
+    strengths.push("The product has image coverage for visual recommendation surfaces.");
+  } else {
+    recommendations.push("Add at least one strong product image because AI channels rely on visual confidence too.");
+  }
+
+  return {
+    score: Math.max(0, Math.min(100, score)),
+    strengths,
+    recommendations,
+    recommended_metafields: missingRecommendedMetafields
+  };
+}
+
 export async function runQa({
   root,
   jobId,
@@ -416,6 +561,7 @@ export async function runQa({
   if (appendedLessons.length > 0) {
     reasoning.push(`Captured ${appendedLessons.length} durable learning(s) from QA findings.`);
   }
+  const agenticReadiness = computeAgenticReadiness(input, policy);
 
   return createBaseResult({
     jobId,
@@ -427,7 +573,11 @@ export async function runQa({
       qa_status: finalEvaluation.status,
       qa_summary: finalEvaluation.summary,
       qa_findings: finalEvaluation.findings,
-      skipped_reasons: finalEvaluation.skipped_reasons
+      skipped_reasons: finalEvaluation.skipped_reasons,
+      agentic_commerce_readiness_score: agenticReadiness.score,
+      agentic_commerce_strengths: agenticReadiness.strengths,
+      agentic_commerce_recommendations: agenticReadiness.recommendations,
+      recommended_metafields_to_add: agenticReadiness.recommended_metafields
     },
     warnings: [...new Set([
       ...warnings,

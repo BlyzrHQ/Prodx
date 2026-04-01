@@ -25,6 +25,14 @@ export interface ProductMetafieldValue extends LooseRecord {
   inferred?: boolean;
 }
 
+export interface RecommendedMetafield extends LooseRecord {
+  namespace: string;
+  key: string;
+  type: string;
+  purpose: string;
+  example_values?: string[];
+}
+
 export interface AutomationClassification extends LooseRecord {
   safe_for_automation?: boolean;
   requires_human_review?: boolean;
@@ -221,6 +229,15 @@ export interface PolicyDocument extends LooseRecord {
     pass_fail_conditions?: string[];
     auto_fix_rules?: string[];
     passing_score?: number;
+  };
+  agentic_commerce_readiness?: {
+    principles?: string[];
+    required_signals?: string[];
+    description_requirements?: string[];
+    faq_requirements?: string[];
+    catalog_mapping_recommendations?: string[];
+    recommended_metafields?: RecommendedMetafield[];
+    scoring_model?: string[];
   };
   product_title_structure?: {
     pattern?: string;
@@ -477,6 +494,10 @@ export interface ShopifyPayload extends LooseRecord {
   images?: string[];
   imageAltText?: string;
   metafields?: ProductMetafieldValue[];
+  attachToProductId?: string | null;
+  attachToProductHandle?: string | null;
+  attachToProductTitle?: string | null;
+  variantOptionValues?: Array<{ name: string; value: string }>;
 }
 
 export interface ReviewDecision extends LooseRecord {

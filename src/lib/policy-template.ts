@@ -1,7 +1,54 @@
 import { applyCatalogGuideCompatibility, getGuideDescriptionSections, getGuideMetafields, getGuideVariantDimensions } from "./catalog-guide.js";
-import type { PolicyDocument, ProductMetafieldValue } from "../types.js";
+import type { PolicyDocument, ProductMetafieldValue, RecommendedMetafield } from "../types.js";
 
 const REVIEW_SENTINEL = "requires_review";
+
+function makeRecommendedMetafield(
+  namespace: string,
+  key: string,
+  type: string,
+  purpose: string,
+  example_values: string[]
+): RecommendedMetafield {
+  return { namespace, key, type, purpose, example_values };
+}
+
+function buildAgenticRecommendedMetafields(industry: string): RecommendedMetafield[] {
+  const base = [
+    makeRecommendedMetafield("custom", "use_case", "single_line_text_field", "Captures the primary shopper or agent intent the product solves.", ["daily essential", "giftable", "quick meal", "desk accessory"]),
+    makeRecommendedMetafield("custom", "audience", "single_line_text_field", "Identifies who the product is best suited for.", ["adults", "kids", "family", "travelers"]),
+    makeRecommendedMetafield("custom", "key_attributes", "list.single_line_text_field", "Summarizes the strongest selection-driving attributes in a structured way.", ["cotton", "lightweight", "wireless", "ready to eat"]),
+    makeRecommendedMetafield("custom", "faq_summary", "multi_line_text_field", "Stores short decision-ready FAQ content that helps AI channels answer buyer questions.", ["Who it is for, when to use it, and key limitations."])
+  ];
+
+  if (industry === "food_and_beverage") {
+    return [
+      ...base,
+      makeRecommendedMetafield("custom", "occasion", "single_line_text_field", "Captures the meal, event, or occasion the product is suited for.", ["ramadan", "breakfast", "after iftar", "family dinner"]),
+      makeRecommendedMetafield("custom", "ingredients_text", "multi_line_text_field", "Provides exact ingredient text for recommendation, trust, and compliance-sensitive discovery.", ["Paste exact label ingredients here."]),
+      makeRecommendedMetafield("custom", "allergen_note", "multi_line_text_field", "Provides exact allergen disclosures when available.", ["Contains milk and soy."]),
+      makeRecommendedMetafield("custom", "nutritional_facts", "multi_line_text_field", "Stores verified nutrition highlights or label facts in plain text.", ["Per 100g: Energy 120 kcal, Protein 4g."])
+    ];
+  }
+
+  if (industry === "apparel") {
+    return [
+      ...base,
+      makeRecommendedMetafield("custom", "material", "single_line_text_field", "Improves matching for material-specific shopping intent.", ["100% cotton", "linen blend"]),
+      makeRecommendedMetafield("custom", "fit", "single_line_text_field", "Improves matching for fit- and silhouette-led search intent.", ["regular fit", "oversized", "slim fit"])
+    ];
+  }
+
+  if (industry === "electronics") {
+    return [
+      ...base,
+      makeRecommendedMetafield("custom", "compatibility", "multi_line_text_field", "Helps AI channels match the product to device, platform, or setup intent.", ["Compatible with USB-C iPhone and Android devices."]),
+      makeRecommendedMetafield("custom", "technical_specs", "multi_line_text_field", "Captures key technical specs in concise plain text.", ["20W USB-C PD output."])
+    ];
+  }
+
+  return base;
+}
 
 const INDUSTRY_TEMPLATES: Record<string, {
   hierarchy: string[];
@@ -252,7 +299,8 @@ export function buildStarterPolicy({
       disallowed_patterns: [
         "Do not use all caps.",
         "Do not include unsupported claims, emojis, or excessive punctuation.",
-        "Do not repeat the brand twice."
+        "Do not repeat the brand twice.",
+        "Do not stuff multiple variant attributes into the base title when those values belong in option fields."
       ],
       seo_rules: [
         "Keep the highest-intent search terms in the first half of the title.",
@@ -260,7 +308,9 @@ export function buildStarterPolicy({
       ],
       edge_case_rules: [
         "Bundle titles must clearly signal the bundle or kit structure.",
-        "Variant values belong in the title only when the store and category require it."
+        "Variant values belong in the title only when the store and category require it.",
+        "When products are represented as variants, keep the base title at the family level and move size, color, storage, pack size, or similar values into variant options unless the category explicitly requires title-level distinction.",
+        "If a category requires a variant descriptor in title, include only the minimum shopper-facing differentiator needed to avoid ambiguity."
       ]
     },
     product_description_system: {
@@ -286,14 +336,16 @@ export function buildStarterPolicy({
       ],
       guidance: [
         "Lead with product identity and strongest customer decision points.",
-        "Include only details that can be supported by input data, store context, or approved inference rules."
+        "Include only details that can be supported by input data, store context, or approved inference rules.",
+        "Write descriptions so a catalog specialist can understand exactly what is auto-generated, what is source-backed, and what still requires review."
       ]
     },
     variant_architecture: {
       allowed_dimensions: template.variantDimensions,
       split_vs_variant_rules: [
         "Use variants only when the product family stays meaningfully the same across shopper-facing options.",
-        "Split into separate products when identity, compatibility, or buying intent changes materially."
+        "Split into separate products when identity, compatibility, or buying intent changes materially.",
+        "Keep the parent product title, handle, and taxonomy stable across safe variants in the same family."
       ],
       max_variant_logic: [
         "Avoid variant structures that become hard to browse, search, or sync safely.",
@@ -301,11 +353,13 @@ export function buildStarterPolicy({
       ],
       naming_conventions: [
         "Use clean shopper-facing option names like Size, Color, Storage, or Pack Size.",
-        "Do not emit placeholder option names without real values."
+        "Do not emit placeholder option names without real values.",
+        "Option names must represent how customers actually compare products."
       ],
       duplicate_rules: [
         "Generic values like Default Title are not real differentiators.",
-        "Different shopper-facing values within the same family may form variants if the category supports it."
+        "Different shopper-facing values within the same family may form variants if the category supports it.",
+        "A duplicate should be skipped immediately; a safe new variant should attach to the matched parent product."
       ]
     },
     attributes_metafields_schema: {
@@ -388,7 +442,8 @@ export function buildStarterPolicy({
       validation_checkpoints: [
         "Variant structure changes.",
         "Inferred attributes or metafields.",
-        "Image replacement decisions."
+        "Image replacement decisions.",
+        "Variant attachment decisions when parent mapping is ambiguous."
       ],
       human_approval_required: [
         "Compliance-sensitive claims.",
@@ -409,7 +464,8 @@ export function buildStarterPolicy({
     },
     qa_validation_system: {
       title_validation: [
-        "Title must follow the approved formula and avoid disallowed patterns."
+        "Title must follow the approved formula and avoid disallowed patterns.",
+        "When a product is represented as a variant family, the base title must not repeat option values that belong in variant fields unless the guide explicitly allows it."
       ],
       variant_validation: [
         "Variant dimensions must be real shopper-facing options, not placeholders."
@@ -431,6 +487,38 @@ export function buildStarterPolicy({
         "Whitespace, casing, and simple taxonomy normalization can be auto-fixed when the intended value is obvious."
       ],
       passing_score: 85
+    },
+    agentic_commerce_readiness: {
+      principles: [
+        "Optimize product listings for AI-driven discovery and recommendation, not just page-level SEO.",
+        "Structured, explicit, and decision-ready product data improves recommendation fitness across agentic commerce surfaces.",
+        "Products should communicate what they are, who they are for, when they are useful, and why they are a good fit."
+      ],
+      required_signals: [
+        "Clear product identity with stable title, vendor/brand, product type, and pricing.",
+        "Decision-driving attributes such as material, ingredients, compatibility, size, fit, flavor, or pack size.",
+        "Intent-supporting signals such as use case, audience, occasion, or scenario when relevant to the category.",
+        "Reliable product availability, pricing, and media quality signals."
+      ],
+      description_requirements: [
+        "Descriptions should state what the product is, who it is for, when to use it, and the strongest reasons to choose it.",
+        "Descriptions should include explicit selection-driving attributes that help AI systems disambiguate the product from similar alternatives.",
+        "Descriptions should avoid vague marketing fluff and instead reduce decision uncertainty."
+      ],
+      faq_requirements: [
+        "Add concise decision-ready FAQ content when the category benefits from buyer clarification.",
+        "FAQ content should answer the most likely agent or shopper questions about suitability, usage, compatibility, or experience."
+      ],
+      catalog_mapping_recommendations: [
+        "Map Shopify Catalog attributes and grouping logic so variants and duplicate items are represented consistently.",
+        "Prefer explicit structured fields or metafields over title parsing wherever possible.",
+        "Keep titles, options, tags, and metafields aligned so AI channels see a consistent product identity."
+      ],
+      recommended_metafields: buildAgenticRecommendedMetafields(normalizedIndustry),
+      scoring_model: [
+        "Agentic readiness should be evaluated across structured data completeness, decision-ready description quality, intent signal coverage, and recommended field adoption.",
+        "Missing recommended metafields should produce actionable recommendations even when they are not yet hard requirements."
+      ]
     }
   };
 
@@ -452,6 +540,11 @@ export function renderPolicyMarkdown(policy: PolicyDocument) {
   const metafields = getGuideMetafields(policy);
   const descriptionSections = getGuideDescriptionSections(policy);
   const variantDimensions = getGuideVariantDimensions(policy);
+  const titleExamples = Array.isArray(policy.product_title_system?.examples) ? policy.product_title_system.examples : [];
+  const titleEdgeCases = Array.isArray(policy.product_title_system?.edge_case_rules) ? policy.product_title_system.edge_case_rules : [];
+  const descriptionGuidance = Array.isArray(policy.product_description_system?.guidance) ? policy.product_description_system.guidance : [];
+  const imageAvoid = Array.isArray(policy.image_media_standards?.avoid) ? policy.image_media_standards.avoid : [];
+  const agentic = policy.agentic_commerce_readiness ?? {};
 
   return `# Catalog Guide
 
@@ -462,6 +555,13 @@ export function renderPolicyMarkdown(policy: PolicyDocument) {
 - Operating Mode: ${policy.meta?.operating_mode ?? "Not provided"}
 - Store URL: ${policy.meta?.store_url || "Not provided"}
 - Summary: ${policy.industry_business_context?.summary ?? "Not provided"}
+- Audience: ${policy.industry_business_context?.audience ?? "Not provided"}
+- Notes: ${policy.industry_business_context?.notes ?? "Not provided"}
+
+## How To Use This Guide
+- Purpose: Use this guide as the source of truth for catalog creation, enrichment, QA, and Shopify publishing.
+- Inside the system: Agents should treat the rules below as deterministic operating constraints wherever they are explicit.
+- Outside the system: Catalog, merchandising, and operations teams can use the same rules for manual listing work, audits, onboarding, and QA review.
 
 ## Taxonomy Design
 ### Hierarchy
@@ -476,30 +576,79 @@ ${renderList(Array.isArray(policy.taxonomy_design?.collection_logic) ? policy.ta
 ### Tagging System
 ${renderList(Array.isArray(policy.taxonomy_design?.tagging_system) ? policy.taxonomy_design.tagging_system : [])}
 
+### Product Type Rules
+${renderList(Array.isArray(policy.taxonomy_design?.product_type_rules) ? policy.taxonomy_design.product_type_rules : [])}
+
+### Handle Structure Rules
+${renderList(Array.isArray(policy.taxonomy_design?.handle_structure_rules) ? policy.taxonomy_design.handle_structure_rules : [])}
+
+### Categorization Edge Cases
+- Duplicates: A duplicate should be skipped, not re-enriched as a new product.
+- Near duplicates: Route to review when the product family is similar but the distinction is not yet safe.
+- New variants: Attach to the parent family when the shopper-facing option mapping is clear.
+- Bundles and multipacks: Treat as separate products when the buying intent is materially different from the single unit.
+
 ## Product Title System
 - Formula: ${policy.product_title_system?.formula ?? "Not defined"}
 - Examples:
-${renderIndentedList(Array.isArray(policy.product_title_system?.examples) ? policy.product_title_system.examples : [])}
+${renderIndentedList(titleExamples)}
 - Disallowed patterns:
 ${renderIndentedList(Array.isArray(policy.product_title_system?.disallowed_patterns) ? policy.product_title_system.disallowed_patterns : [])}
+- SEO rules:
+${renderIndentedList(Array.isArray(policy.product_title_system?.seo_rules) ? policy.product_title_system.seo_rules : [])}
+- Edge-case rules:
+${renderIndentedList(titleEdgeCases)}
+
+### Good vs Bad Title Guidance
+- Good titles identify the product family cleanly, include only the right decision-driving attributes, and stay stable across the same family.
+- Bad titles repeat the brand, stuff multiple option values unnecessarily, or include attributes that should live in variants/options instead.
 
 ## Product Description System
 - Structure template:
 ${renderIndentedList(descriptionSections)}
 - Tone rules:
 ${renderIndentedList(Array.isArray(policy.product_description_system?.tone_rules) ? policy.product_description_system.tone_rules : [])}
+- Length rules:
+${renderIndentedList(Array.isArray(policy.product_description_system?.length_rules) ? policy.product_description_system.length_rules : [])}
 - Formatting rules:
 ${renderIndentedList(Array.isArray(policy.product_description_system?.formatting_rules) ? policy.product_description_system.formatting_rules : [])}
+- Auto-generatable:
+${renderIndentedList(Array.isArray(policy.product_description_system?.auto_generatable) ? policy.product_description_system.auto_generatable : [])}
+- Manual-required:
+${renderIndentedList(Array.isArray(policy.product_description_system?.manual_required) ? policy.product_description_system.manual_required : [])}
+- Guidance:
+${renderIndentedList(descriptionGuidance)}
+
+### Description Edge Cases
+- If exact factual data is verified from trusted sources, include it in the appropriate section.
+- If exact factual data is not verified, leave it empty rather than inserting placeholder or internal review text.
+- If the category is specs-heavy, keep the structure scannable and separate decision-critical facts from long-form supporting detail.
 
 ## Variant Architecture
 - Allowed dimensions: ${variantDimensions.join(", ") || "Not defined"}
 - Split vs variant rules:
 ${renderIndentedList(Array.isArray(policy.variant_architecture?.split_vs_variant_rules) ? policy.variant_architecture.split_vs_variant_rules : [])}
+- Max variant logic:
+${renderIndentedList(Array.isArray(policy.variant_architecture?.max_variant_logic) ? policy.variant_architecture.max_variant_logic : [])}
+- Naming conventions:
+${renderIndentedList(Array.isArray(policy.variant_architecture?.naming_conventions) ? policy.variant_architecture.naming_conventions : [])}
+- Duplicate rules:
+${renderIndentedList(Array.isArray(policy.variant_architecture?.duplicate_rules) ? policy.variant_architecture.duplicate_rules : [])}
+
+### Variant Decision Playbook
+- New product: use when identity, compatibility, or buying intent materially changes.
+- New variant: use when the family stays the same and the shopper-facing difference is a safe option dimension.
+- Duplicate: skip when the product identity and variant signature already exist.
+- Needs review: use when family similarity is high but the safe attachment path is unclear.
 
 ## Attributes & Metafields Schema
 - Required Fields: ${JSON.stringify(policy.attributes_metafields_schema?.required_fields ?? [])}
 - Optional Fields: ${JSON.stringify(policy.attributes_metafields_schema?.optional_fields ?? [])}
 - Standard Shopify Fields: ${JSON.stringify(policy.attributes_metafields_schema?.standard_shopify_fields ?? [])}
+- Fill Rules:
+${renderIndentedList(Array.isArray(policy.attributes_metafields_schema?.fill_rules) ? policy.attributes_metafields_schema.fill_rules : [])}
+- Guidance:
+${policy.attributes_metafields_schema?.guidance ?? "Not defined"}
 - Metafields:
 ${metafields.length > 0
   ? metafields.map((field) => [
@@ -522,14 +671,74 @@ ${metafields.length > 0
 ${renderIndentedList(Array.isArray(policy.image_media_standards?.image_types) ? policy.image_media_standards.image_types : [])}
 - Background rules:
 ${renderIndentedList(Array.isArray(policy.image_media_standards?.background_rules) ? policy.image_media_standards.background_rules : [])}
+- Aspect ratios:
+${renderIndentedList(Array.isArray(policy.image_media_standards?.aspect_ratios) ? policy.image_media_standards.aspect_ratios : [])}
 - Alt text rules:
 ${renderIndentedList(Array.isArray(policy.image_media_standards?.alt_text_rules) ? policy.image_media_standards.alt_text_rules : [])}
+- Automation tagging rules:
+${renderIndentedList(Array.isArray(policy.image_media_standards?.automation_tagging_rules) ? policy.image_media_standards.automation_tagging_rules : [])}
+- Avoid:
+${renderIndentedList(imageAvoid)}
+
+### Image Edge Cases
+- If exact-pack imagery is available and compliant, prefer it.
+- If exact-pack imagery is unavailable, only use a same-family fallback when there are no conflicting visible markers.
+- Reject logo-only, unrelated, cropped, unreadable, or clearly mismatched product images.
 
 ## Merchandising Rules
+### Collection Sorting Logic
 ${renderList(Array.isArray(policy.merchandising_rules?.collection_sorting_logic) ? policy.merchandising_rules.collection_sorting_logic : [])}
 
+### Cross-sell Rules
+${renderList(Array.isArray(policy.merchandising_rules?.cross_sell_rules) ? policy.merchandising_rules.cross_sell_rules : [])}
+
+### Upsell Rules
+${renderList(Array.isArray(policy.merchandising_rules?.upsell_rules) ? policy.merchandising_rules.upsell_rules : [])}
+
+### Product Grouping Logic
+${renderList(Array.isArray(policy.merchandising_rules?.product_grouping_logic) ? policy.merchandising_rules.product_grouping_logic : [])}
+
 ## SEO & Discovery Rules
+### Meta Title Format
+${renderList(Array.isArray(policy.seo_discovery_rules?.meta_title_format) ? policy.seo_discovery_rules.meta_title_format : [])}
+
+### Meta Description Rules
+${renderList(Array.isArray(policy.seo_discovery_rules?.meta_description_rules) ? policy.seo_discovery_rules.meta_description_rules : [])}
+
+### URL Handle Rules
 ${renderList(Array.isArray(policy.seo_discovery_rules?.url_handle_rules) ? policy.seo_discovery_rules.url_handle_rules : [])}
+
+### Keyword Usage Patterns
+${renderList(Array.isArray(policy.seo_discovery_rules?.keyword_usage_patterns) ? policy.seo_discovery_rules.keyword_usage_patterns : [])}
+
+## Agentic Commerce Readiness
+### Principles
+${renderList(Array.isArray(agentic.principles) ? agentic.principles : [])}
+
+### Required Signals
+${renderList(Array.isArray(agentic.required_signals) ? agentic.required_signals : [])}
+
+### Description Requirements
+${renderList(Array.isArray(agentic.description_requirements) ? agentic.description_requirements : [])}
+
+### FAQ Requirements
+${renderList(Array.isArray(agentic.faq_requirements) ? agentic.faq_requirements : [])}
+
+### Catalog Mapping Recommendations
+${renderList(Array.isArray(agentic.catalog_mapping_recommendations) ? agentic.catalog_mapping_recommendations : [])}
+
+### Recommended Metafields
+${Array.isArray(agentic.recommended_metafields) && agentic.recommended_metafields.length > 0
+  ? agentic.recommended_metafields.map((field) => [
+      `- ${field.namespace}.${field.key}`,
+      `  - Type: ${field.type}`,
+      `  - Purpose: ${field.purpose}`,
+      `  - Example Values: ${(field.example_values ?? []).join(" | ") || "None defined"}`
+    ].join("\n")).join("\n")
+  : "- None defined"}
+
+### Scoring Model
+${renderList(Array.isArray(agentic.scoring_model) ? agentic.scoring_model : [])}
 
 ## Automation Playbook
 - Fully automated:
@@ -538,11 +747,36 @@ ${renderIndentedList(Array.isArray(policy.automation_playbook?.fully_automated) 
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.validation_checkpoints) ? policy.automation_playbook.validation_checkpoints : [])}
 - Human approval required:
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.human_approval_required) ? policy.automation_playbook.human_approval_required : [])}
+- Transformation logic:
+${renderIndentedList(Array.isArray(policy.automation_playbook?.transformation_logic) ? policy.automation_playbook.transformation_logic : [])}
+- Fallback rules:
+${renderIndentedList(Array.isArray(policy.automation_playbook?.fallback_rules) ? policy.automation_playbook.fallback_rules : [])}
+- Error handling rules:
+${renderIndentedList(Array.isArray(policy.automation_playbook?.error_handling_rules) ? policy.automation_playbook.error_handling_rules : [])}
 
 ## QA & Validation System
 - Passing Score: ${policy.qa_validation_system?.passing_score ?? "Not defined"}
+- Title validation:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.title_validation) ? policy.qa_validation_system.title_validation : [])}
+- Variant validation:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.variant_validation) ? policy.qa_validation_system.variant_validation : [])}
+- Metafield completeness:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.metafield_completeness) ? policy.qa_validation_system.metafield_completeness : [])}
+- Image checks:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.image_checks) ? policy.qa_validation_system.image_checks : [])}
+- SEO checks:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.seo_checks) ? policy.qa_validation_system.seo_checks : [])}
 - Pass/fail conditions:
 ${renderIndentedList(Array.isArray(policy.qa_validation_system?.pass_fail_conditions) ? policy.qa_validation_system.pass_fail_conditions : [])}
+- Auto-fix rules:
+${renderIndentedList(Array.isArray(policy.qa_validation_system?.auto_fix_rules) ? policy.qa_validation_system.auto_fix_rules : [])}
+
+## Worked Examples
+- Good title example: ${titleExamples[0] ?? "Not defined"}
+- Good description sections example: ${descriptionSections.join(" -> ") || "Not defined"}
+- Variant example: Parent title stays stable, option values carry the shopper-facing differentiation.
+- Duplicate example: If identity and variant signature already exist, skip instead of re-creating.
+- Missing factual data example: Leave unverifiable ingredients, nutrition, or specs empty rather than inventing them.
 `;
 }
 

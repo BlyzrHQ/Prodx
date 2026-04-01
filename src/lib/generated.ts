@@ -60,6 +60,16 @@ export function buildGeneratedProduct(input: ProductRecord, result: ModuleResult
     merged._catalog_image_search = result.proposed_changes.image_search;
   }
 
+  const matchDecision = typeof (merged._catalog_match as LooseRecord | undefined)?.decision === "string"
+    ? String((merged._catalog_match as LooseRecord).decision).toUpperCase()
+    : "";
+  const matchedHandle = typeof (merged._catalog_match as LooseRecord | undefined)?.matched_product_handle === "string"
+    ? String((merged._catalog_match as LooseRecord).matched_product_handle).trim()
+    : "";
+  if (matchDecision === "NEW_VARIANT" && matchedHandle) {
+    merged.handle = matchedHandle;
+  }
+
   merged._catalog = {
     last_module: result.module,
     last_job_id: result.job_id,
@@ -317,6 +327,133 @@ function getVariantRows(product: LooseRecord, policy?: PolicyDocument): ProductV
   ];
 }
 
+function getCatalogMatch(product: LooseRecord): LooseRecord | null {
+  const match = product._catalog_match;
+  return match && typeof match === "object" ? match as LooseRecord : null;
+}
+
+function getAttachedVariantOptionValues(product: LooseRecord): Array<{ name: string; value: string }> {
+  if (!isAttachedVariant(product)) return [];
+  const match = getCatalogMatch(product);
+  const action = match?.proposed_action && typeof match.proposed_action === "object"
+    ? match.proposed_action as LooseRecord
+    : null;
+  return Array.isArray(action?.option_values)
+    ? action.option_values
+        .filter((item): item is LooseRecord => Boolean(item) && typeof item === "object")
+        .map((item) => ({
+          name: String(item.name ?? "").trim(),
+          value: String(item.value ?? "").trim()
+        }))
+        .filter((item) => item.name.length > 0 && item.value.length > 0)
+    : [];
+}
+
+function isAttachedVariant(product: LooseRecord): boolean {
+  const match = getCatalogMatch(product);
+  const decision = String(match?.decision ?? "").toUpperCase();
+  const action = match?.proposed_action && typeof match.proposed_action === "object"
+    ? match.proposed_action as LooseRecord
+    : null;
+  return decision === "NEW_VARIANT" && String(action?.action ?? "") === "attach_as_variant";
+}
+
+function getAttachedVariantRows(product: LooseRecord, optionNames: string[] = []): ProductVariant[] {
+  if (!isAttachedVariant(product)) return [];
+  const existing = getVariantRows(product);
+  if (existing.length > 0 && existing.some((variant) => [variant.option1, variant.option2, variant.option3].some((value) => typeof value === "string" && value.trim() && value.trim().toLowerCase() !== "default title"))) {
+    return existing;
+  }
+
+  const optionValues = getAttachedVariantOptionValues(product);
+  const resolvedOptionNames = optionNames.length > 0
+    ? optionNames
+    : optionValues.map((item) => item.name);
+  const valueByName = new Map(optionValues.map((item) => [item.name.toLowerCase(), item.value]));
+  const values = resolvedOptionNames
+    .map((name) => valueByName.get(name.toLowerCase()) ?? "")
+    .filter(Boolean);
+
+  return [{
+    title: values.join(" / ") || "Variant",
+    sku: typeof product.sku === "string" ? product.sku : "",
+    barcode: typeof product.barcode === "string" ? product.barcode : "",
+    option1: values[0] ?? "Default Title",
+    option2: values[1] ?? "",
+    option3: values[2] ?? "",
+    price: typeof product.price === "string" ? product.price : "",
+    compare_at_price: typeof product.compare_at_price === "string" ? product.compare_at_price : ""
+  }];
+}
+
+function buildImplicitVariantRows(product: LooseRecord, optionNames: string[]): ProductVariant[] {
+  const dimensionMap: Record<string, string> = {
+    size: typeof product.size === "string" ? product.size : "",
+    type: typeof product.type === "string" ? product.type : "",
+    color: typeof product.color === "string" ? product.color : "",
+    storage: typeof product.storage === "string" ? product.storage : "",
+    packsize: typeof product.size === "string" ? product.size : "",
+    "pack size": typeof product.size === "string" ? product.size : ""
+  };
+  const values = optionNames
+    .map((dimension) => {
+      const normalized = dimension.toLowerCase();
+      return dimensionMap[normalized] ?? "";
+    })
+    .filter((value) => typeof value === "string" && value.trim().length > 0);
+
+  if (values.length === 0) return getVariantRows(product);
+
+  return [{
+    title: values.join(" / "),
+    sku: typeof product.sku === "string" ? product.sku : "",
+    barcode: typeof product.barcode === "string" ? product.barcode : "",
+    option1: values[0] ?? "Default Title",
+    option2: values[1] ?? "",
+    option3: values[2] ?? "",
+    price: typeof product.price === "string" ? product.price : "",
+    compare_at_price: typeof product.compare_at_price === "string" ? product.compare_at_price : ""
+  }];
+}
+
+function resolveVariantBaseProduct(product: LooseRecord, productById: Map<string, LooseRecord>): LooseRecord {
+  if (!isAttachedVariant(product)) return product;
+  const match = getCatalogMatch(product);
+  const action = match?.proposed_action && typeof match.proposed_action === "object"
+    ? match.proposed_action as LooseRecord
+    : null;
+  const matchedProductId = String(match?.matched_product_id ?? action?.product_id ?? "").trim();
+  const parent = matchedProductId ? productById.get(matchedProductId) : null;
+  if (parent) return parent;
+
+  return {
+    ...product,
+    title: String(action?.product_title ?? product.title ?? ""),
+    handle: String(action?.product_handle ?? product.handle ?? ""),
+    vendor: typeof product.vendor === "string" && product.vendor.trim() ? product.vendor : product.brand ?? "",
+    brand: typeof product.brand === "string" && product.brand.trim() ? product.brand : product.vendor ?? ""
+  };
+}
+
+function getProductFamilyKey(product: LooseRecord): string {
+  const match = getCatalogMatch(product);
+  if (match) {
+    const action = match.proposed_action && typeof match.proposed_action === "object"
+      ? match.proposed_action as LooseRecord
+      : null;
+    const matchedProductId = String(match.matched_product_id ?? action?.product_id ?? "").trim();
+    if (matchedProductId) return `id:${matchedProductId}`;
+    const matchedHandle = String(match.matched_product_handle ?? action?.product_handle ?? "").trim();
+    if (matchedHandle) return `handle:${matchedHandle}`;
+    const matchedTitle = String(match.matched_product_title ?? action?.product_title ?? "").trim();
+    if (matchedTitle) return `title:${normalizeDescriptionPair(matchedTitle).description}`;
+  }
+  if (typeof product.id === "string" && product.id.trim()) return `id:${product.id}`;
+  if (typeof product.handle === "string" && product.handle.trim()) return `handle:${product.handle}`;
+  if (typeof product.title === "string" && product.title.trim()) return `title:${product.title}`;
+  return `generated:${getProductKey(product, "product")}`;
+}
+
 function hasMeaningfulVariantOptions(variants: ProductVariant[]): boolean {
   return variants.some((variant) => {
     const values = [variant.option1, variant.option2, variant.option3]
@@ -327,47 +464,89 @@ function hasMeaningfulVariantOptions(variants: ProductVariant[]): boolean {
   });
 }
 
+function collectFamilyAttachedOptionNames(products: LooseRecord[]): Map<string, string[]> {
+  const namesByFamily = new Map<string, string[]>();
+  for (const product of products) {
+    if (!isAttachedVariant(product)) continue;
+    const familyKey = getProductFamilyKey(product);
+    const names = getAttachedVariantOptionValues(product)
+      .map((item) => item.name)
+      .filter(Boolean);
+    if (names.length === 0) continue;
+
+    const existing = namesByFamily.get(familyKey) ?? [];
+    for (const name of names) {
+      if (!existing.some((item) => item.toLowerCase() === name.toLowerCase())) {
+        existing.push(name);
+      }
+    }
+    namesByFamily.set(familyKey, existing);
+  }
+  return namesByFamily;
+}
+
 function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyCsvMetafieldColumn[], policy?: PolicyDocument): string[][] {
   const rows: string[][] = [];
+  const productById = new Map<string, LooseRecord>();
+  const familiesWithAttachedVariants = new Set<string>();
+  const familyOptionNames = collectFamilyAttachedOptionNames(products);
+  for (const product of products) {
+    const candidates = [product.id, product.product_id, product.handle, getProductKey(product, "product")];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) {
+        productById.set(candidate, product);
+      }
+    }
+    if (isAttachedVariant(product)) {
+      familiesWithAttachedVariants.add(getProductFamilyKey(product));
+    }
+  }
 
   for (const product of products) {
-    const variants = getVariantRows(product, policy);
-    const useRealOptionNames = hasMeaningfulVariantOptions(variants);
+    const baseProduct = resolveVariantBaseProduct(product, productById);
     const configuredDimensions = Array.isArray(policy?.variant_structure?.primary_dimensions)
       ? policy.variant_structure.primary_dimensions.map(String)
       : [];
-    const option1Name = useRealOptionNames ? (configuredDimensions[0] ?? "Option1") : "Title";
-    const option2Name = useRealOptionNames ? (configuredDimensions[1] ?? "") : "";
-    const option3Name = useRealOptionNames ? (configuredDimensions[2] ?? "") : "";
-    const images = Array.isArray(product.images) ? product.images.filter((item) => typeof item === "string") as string[] : [];
-    const featuredImage = typeof product.featured_image === "string" ? product.featured_image : images[0] ?? "";
+    const familyUsesAttachedVariants = familiesWithAttachedVariants.has(getProductFamilyKey(product));
+    const resolvedOptionNames = familyOptionNames.get(getProductFamilyKey(product)) ?? configuredDimensions;
+    const variants = isAttachedVariant(product)
+      ? getAttachedVariantRows(product, resolvedOptionNames)
+      : familyUsesAttachedVariants
+        ? buildImplicitVariantRows(product, resolvedOptionNames)
+        : getVariantRows(product, policy);
+    const useRealOptionNames = hasMeaningfulVariantOptions(variants);
+    const option1Name = useRealOptionNames ? (resolvedOptionNames[0] ?? "Option1") : "Title";
+    const option2Name = useRealOptionNames ? (resolvedOptionNames[1] ?? "") : "";
+    const option3Name = useRealOptionNames ? (resolvedOptionNames[2] ?? "") : "";
+    const images = Array.isArray(baseProduct.images) ? baseProduct.images.filter((item) => typeof item === "string") as string[] : [];
+    const featuredImage = typeof baseProduct.featured_image === "string" ? baseProduct.featured_image : images[0] ?? "";
     const normalizedDescription = normalizeDescriptionPair(
-      typeof product.description_html === "string" && product.description_html.trim().length > 0
-        ? product.description_html
-        : typeof product.description === "string"
-          ? product.description
+      typeof baseProduct.description_html === "string" && baseProduct.description_html.trim().length > 0
+        ? baseProduct.description_html
+        : typeof baseProduct.description === "string"
+          ? baseProduct.description
           : ""
     );
-    const vendor = getVendor(product);
-    const imageAltText = typeof product.image_alt_text === "string" && product.image_alt_text.trim().length > 0
-      ? product.image_alt_text
-      : (typeof product.title === "string" && product.title.trim().length > 0
-          ? product.title.trim()
+    const vendor = getVendor(baseProduct);
+    const imageAltText = typeof baseProduct.image_alt_text === "string" && baseProduct.image_alt_text.trim().length > 0
+      ? baseProduct.image_alt_text
+      : (typeof baseProduct.title === "string" && baseProduct.title.trim().length > 0
+          ? baseProduct.title.trim()
           : dedupeTitleLikeText(vendor, typeof product.size === "string" ? product.size : "", typeof product.type === "string" ? product.type : ""));
-    const handle = typeof product.handle === "string" && product.handle ? product.handle : getProductKey(product, "product");
+    const handle = typeof baseProduct.handle === "string" && baseProduct.handle ? baseProduct.handle : getProductKey(baseProduct, "product");
     const metafieldMap = buildProductMetafieldMap(product);
 
     variants.forEach((variant, index) => {
       rows.push([
-        typeof product.title === "string" ? product.title : "",
+        typeof baseProduct.title === "string" ? baseProduct.title : "",
         handle,
         normalizedDescription.description_html,
         vendor,
         "",
-        typeof product.product_type === "string" ? product.product_type : "",
-        normalizeTags(product.tags),
-        toShopifyBoolean(product["published_on_online_store"], "TRUE"),
-        typeof product.status === "string" ? product.status : "active",
+        typeof baseProduct.product_type === "string" ? baseProduct.product_type : "",
+        normalizeTags(baseProduct.tags),
+        toShopifyBoolean(baseProduct["published_on_online_store"], "TRUE"),
+        typeof baseProduct.status === "string" ? baseProduct.status : "active",
         typeof variant.sku === "string" ? variant.sku : "",
         typeof variant.barcode === "string" ? variant.barcode : "",
         option1Name,

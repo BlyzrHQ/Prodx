@@ -26,7 +26,7 @@ import { runImageOptimize } from "./modules/image-optimize.js";
 import { runQa } from "./modules/qa.js";
 import { runSync } from "./modules/sync.js";
 import { runLearn } from "./modules/learn.js";
-import type { ApplyResult, CliStreams, LooseRecord, ModuleResult, OutputWriter, PolicyDocument, ProductRecord, ReviewDecision, RunData, RuntimeConfig, WorkflowRunSummary } from "./types.js";
+import type { ApplyResult, CliStreams, LooseRecord, ModuleResult, OutputWriter, PolicyDocument, ProductRecord, ReviewDecision, RunData, RuntimeConfig, ShopifyPayload, WorkflowRunSummary } from "./types.js";
 
 type Flags = Record<string, string | boolean>;
 type OutputMode = "json" | "text";
@@ -69,8 +69,96 @@ function providerIsReady(resolved: Awaited<ReturnType<typeof resolveProvider>>):
   return true;
 }
 
+function isShopifyProductGid(value: unknown): value is string {
+  return typeof value === "string" && /^gid:\/\/shopify\/Product\/.+$/i.test(value.trim());
+}
+
+export function isVariantAttachPayload(payload: LooseRecord | null | undefined): boolean {
+  return typeof payload?.attachToProductId === "string" && payload.attachToProductId.trim().length > 0;
+}
+
+export async function resolveLiveVariantAttachPayload(root: string, payload: LooseRecord): Promise<LooseRecord> {
+  const attachToProductId = typeof payload.attachToProductId === "string" ? payload.attachToProductId.trim() : "";
+  if (!attachToProductId || isShopifyProductGid(attachToProductId)) {
+    return payload;
+  }
+
+  const attachToProductHandle = typeof payload.attachToProductHandle === "string" ? payload.attachToProductHandle.trim() : "";
+  const attachToProductTitle = typeof payload.attachToProductTitle === "string" ? payload.attachToProductTitle.trim() : "";
+  const generatedProducts = await loadGeneratedProductCatalog(root);
+  const parent = generatedProducts.find((product) => {
+    const productId = typeof product.id === "string" ? product.id.trim() : "";
+    const productHandle = typeof product.handle === "string" ? product.handle.trim() : "";
+    const productTitle = typeof product.title === "string" ? product.title.trim() : "";
+    return (
+      (attachToProductId && productId === attachToProductId) ||
+      (attachToProductHandle && productHandle === attachToProductHandle) ||
+      (attachToProductTitle && productTitle === attachToProductTitle)
+    );
+  });
+
+  const liveResult = parent?._catalog_apply && typeof parent._catalog_apply === "object"
+    ? (parent._catalog_apply as LooseRecord).live_result as LooseRecord | undefined
+    : undefined;
+  const resolvedProductId = typeof liveResult?.productId === "string" ? liveResult.productId.trim() : "";
+  const resolvedHandle = typeof liveResult?.handle === "string" ? liveResult.handle.trim() : attachToProductHandle;
+  if (!resolvedProductId) {
+    throw new Error("Variant attach target has not been applied live yet. Publish the parent product first so the child variant can resolve a Shopify product ID.");
+  }
+
+  return {
+    ...payload,
+    attachToProductId: resolvedProductId,
+    attachToProductHandle: resolvedHandle || attachToProductHandle
+  };
+}
+
 function isInteractive(flags: Flags): boolean {
   return !flags["no-wizard"] && !flags.json && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function supportsColor(): boolean {
+  return Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+}
+
+function colorize(text: string, code: string): string {
+  return supportsColor() ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
+function bold(text: string): string {
+  return colorize(text, "1");
+}
+
+function dim(text: string): string {
+  return colorize(text, "2");
+}
+
+function green(text: string): string {
+  return colorize(text, "32");
+}
+
+function yellow(text: string): string {
+  return colorize(text, "33");
+}
+
+function red(text: string): string {
+  return colorize(text, "31");
+}
+
+function cyan(text: string): string {
+  return colorize(text, "36");
+}
+
+function section(title: string): string {
+  return `${bold(title)}\n${dim("=".repeat(title.length))}`;
+}
+
+function formatStatus(status: string, needsReview = false): string {
+  const normalized = status.toUpperCase();
+  if (needsReview || normalized === "NEEDS_REVIEW") return yellow(status);
+  if (normalized === "SUCCESS" || normalized === "PASSED") return green(status);
+  if (normalized === "FAIL" || normalized === "FAILED") return red(status);
+  return bold(status);
 }
 
 function formatValue(value: unknown): string {
@@ -81,41 +169,80 @@ function formatValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function getSuggestedCommandsForModule(executed: ExecutedModule): string[] {
+  const { job_id, result } = executed;
+  if (result.needs_review) {
+    return [
+      `catalog review ${job_id}`,
+      "catalog review queue"
+    ];
+  }
+
+  switch (result.module) {
+    case "catalogue-expert":
+      return [
+        "catalog guide show",
+        "catalog workflow run --input <file> [--catalog <file>]"
+      ];
+    case "catalogue-match":
+      return ["catalog enrich --input <file>"];
+    case "product-enricher":
+      return ["catalog image --input <file>", "catalog qa --input <file>"];
+    case "image-optimizer":
+      return ["catalog qa --input <file>"];
+    case "catalogue-qa":
+      return ["catalog sync --input <file>", "catalog workflow run --input <file> [--catalog <file>]"];
+    case "shopify-sync":
+      return ["catalog apply " + job_id, "catalog publish", "catalog apply " + job_id + " --live"];
+    case "feedback-learn":
+      return ["catalog guide show"];
+    default:
+      return [];
+  }
+}
+
 function renderModuleResult(executed: ExecutedModule): string {
   const { job_id, run_dir, result } = executed;
   const lines = [
-    `Job: ${job_id}`,
-    `Module: ${result.module}`,
-    `Status: ${result.status}`,
-    `Needs review: ${result.needs_review ? "yes" : "no"}`,
+    section("Run Summary"),
+    `Job: ${bold(job_id)}`,
+    `Module: ${cyan(result.module)}`,
+    `Status: ${formatStatus(result.status, result.needs_review)}`,
+    `Needs review: ${result.needs_review ? yellow("yes") : green("no")}`,
     `Run dir: ${run_dir}`,
     ""
   ];
 
   if ("decision" in result) {
     const decisionResult = result as unknown as LooseRecord;
-    lines.push(`Decision: ${String(decisionResult.decision)}`);
+    lines.push(`Decision: ${bold(String(decisionResult.decision))}`);
     if ("confidence" in result) lines.push(`Confidence: ${String(decisionResult.confidence)}`);
     lines.push("");
   }
 
-  lines.push("Proposed changes:");
+  lines.push(section("Proposed Changes"));
   const changes = Object.entries(result.proposed_changes ?? {});
   if (changes.length === 0) lines.push("- none");
   else changes.forEach(([key, value]) => lines.push(`- ${key}: ${formatValue(value)}`));
 
   if (result.reasoning.length > 0) {
-    lines.push("", "Reasoning:");
+    lines.push("", section("Reasoning"));
     result.reasoning.forEach((item) => lines.push(`- ${item}`));
   }
 
   if (result.warnings.length > 0) {
-    lines.push("", "Warnings:");
+    lines.push("", section("Warnings"));
     result.warnings.forEach((item) => lines.push(`- ${item}`));
   }
 
+  const suggestedCommands = getSuggestedCommandsForModule(executed);
+  if (suggestedCommands.length > 0) {
+    lines.push("", section("Try Next"));
+    suggestedCommands.forEach((item) => lines.push(`- ${item}`));
+  }
+
   if (result.next_actions.length > 0) {
-    lines.push("", "Next:");
+    lines.push("", section("Workflow Guidance"));
     result.next_actions.forEach((item) => lines.push(`- ${item}`));
   }
 
@@ -123,61 +250,89 @@ function renderModuleResult(executed: ExecutedModule): string {
 }
 
 function renderDoctor(payload: { credentials: Array<{ alias: string; source: string; ready: boolean }>; module_checks: Array<{ module: string; ready: boolean; slots: Array<{ slot: string; provider_alias: string; provider_type: string | null; ready: boolean; source: string; store?: string }> }> }): string {
-  const lines = ["Credentials:"];
+  const lines = [section("Credentials")];
   payload.credentials.forEach((credential) => {
-    lines.push(`- ${credential.alias}: ${credential.ready ? `ready via ${credential.source}` : "missing"}`);
+    lines.push(`- ${credential.alias}: ${credential.ready ? green(`ready via ${credential.source}`) : red("missing")}`);
   });
-  lines.push("", "Module readiness:");
+  lines.push("", section("Module Readiness"));
   payload.module_checks.forEach((moduleCheck) => {
-    lines.push(`- ${moduleCheck.module}: ${moduleCheck.ready ? "ready" : "not ready"}`);
+    lines.push(`- ${moduleCheck.module}: ${moduleCheck.ready ? green("ready") : yellow("not ready")}`);
     moduleCheck.slots.forEach((slot) => {
       const storeSuffix = slot.store ? ` (${slot.store})` : "";
-      lines.push(`  ${slot.slot} -> ${slot.provider_alias} [${slot.provider_type ?? "unknown"}]: ${slot.ready ? `ready via ${slot.source}` : "missing"}${storeSuffix}`);
+      lines.push(`  ${slot.slot} -> ${slot.provider_alias} [${slot.provider_type ?? "unknown"}]: ${slot.ready ? green(`ready via ${slot.source}`) : red("missing")}${storeSuffix}`);
     });
   });
+  lines.push("", section("Try Next"));
+  lines.push("- catalog guide generate --industry <industry> --business-name \"Store\" --business-description \"...\"");
+  lines.push("- catalog workflow run --input <file> [--catalog <file>]");
+  lines.push("- catalog auth test --provider shopify");
   return `${lines.join("\n")}\n`;
 }
 
 function renderDecision(decision: ReviewDecision): string {
-  return [`Review recorded for ${decision.job_id}`, `Action: ${decision.action}`, `Notes: ${decision.notes || "none"}`, `Edits: ${Object.keys(decision.edits ?? {}).length} field(s)`].join("\n") + "\n";
+  return [
+    section("Review Saved"),
+    `Run: ${bold(decision.job_id)}`,
+    `Action: ${bold(decision.action)}`,
+    `Notes: ${decision.notes || "none"}`,
+    `Edits: ${Object.keys(decision.edits ?? {}).length} field(s)`,
+    "",
+    section("Try Next"),
+    `- catalog apply ${decision.job_id}`,
+    `- catalog review queue`
+  ].join("\n") + "\n";
 }
 
 function renderApplyResult(result: ApplyResult): string {
-  const lines = [`Applied job ${result.job_id}`, `Module: ${result.module}`, `Status: ${result.status}`];
+  const lines = [section("Apply Result"), `Run: ${bold(result.job_id)}`, `Module: ${cyan(result.module)}`, `Status: ${formatStatus(result.status)}`];
   if (result.live_result) lines.push(`Live result: ${formatValue(result.live_result)}`);
   else lines.push(`Applied fields: ${Object.keys(result.applied_changes ?? {}).length}`);
+  lines.push("", section("Try Next"));
+  lines.push("- catalog publish");
+  lines.push("- catalog review queue");
   return `${lines.join("\n")}\n`;
 }
 
 function renderReviewQueue(payload: { count: number; items: Array<{ product_key: string; module: string; job_id: string; status: string }> }): string {
-  const lines = [`Review queue: ${payload.count} item(s)`];
+  const lines = [section("Review Queue"), `${payload.count} item(s)`];
   payload.items.forEach((item) => {
-    lines.push(`- ${item.product_key}: ${item.module} -> ${item.job_id} (${item.status})`);
+    lines.push(`- ${item.product_key}: ${item.module} -> ${item.job_id} (${formatStatus(item.status, item.status === "needs_review")})`);
   });
+  if (payload.count > 0) {
+    lines.push("", section("Try Next"));
+    lines.push("- catalog review <job-id>");
+    lines.push("- catalog review bulk --action approve --all");
+  }
   return `${lines.join("\n")}\n`;
 }
 
 function renderBulkReviewResult(payload: { action: string; count: number; jobs: string[] }): string {
-  const lines = [`Bulk review action: ${payload.action}`, `Updated: ${payload.count} run(s)`];
+  const lines = [section("Bulk Review"), `Action: ${bold(payload.action)}`, `Updated: ${payload.count} run(s)`];
   payload.jobs.forEach((jobId) => lines.push(`- ${jobId}`));
+  lines.push("", section("Try Next"));
+  lines.push("- catalog publish");
   return `${lines.join("\n")}\n`;
 }
 
 function renderBatchSummary(summary: { operation: string; input: string; total: number; processed: number; runs: Array<{ index: number; job_id: string; status: string; needs_review: boolean }> }): string {
-  const lines = [`Batch operation: ${summary.operation}`, `Input: ${summary.input}`, `Processed: ${summary.processed}/${summary.total}`, "", "Runs:"];
+  const lines = [section("Batch Summary"), `Operation: ${cyan(summary.operation)}`, `Input: ${summary.input}`, `Processed: ${summary.processed}/${summary.total}`, "", section("Runs")];
   summary.runs.forEach((run) => {
-    lines.push(`- #${run.index + 1}: ${run.job_id} -> ${run.status}${run.needs_review ? " (needs review)" : ""}`);
+    lines.push(`- #${run.index + 1}: ${run.job_id} -> ${formatStatus(run.status, run.needs_review)}${run.needs_review ? " (needs review)" : ""}`);
   });
+  lines.push("", section("Try Next"));
+  lines.push("- catalog review queue");
   return `${lines.join("\n")}\n`;
 }
 
 function renderWorkflowSummary(summary: { input: string; total: number; processed: number; runs: WorkflowRunSummary[]; review_queue_csv?: string; shopify_import_csv?: string; excel_workbook?: string }): string {
+  const reviewCount = summary.runs.flatMap((run) => run.modules).filter((module) => module.needs_review).length;
   const lines = [
-    "Workflow complete",
+    section("Workflow Complete"),
     `Input: ${summary.input}`,
     `Processed: ${summary.processed}/${summary.total}`,
+    `Review items: ${reviewCount}`,
     "",
-    "Products:"
+    section("Products")
   ];
 
   summary.runs.forEach((run) => {
@@ -185,52 +340,69 @@ function renderWorkflowSummary(summary: { input: string; total: number; processe
     lines.push(`  Product output: ${run.generated_product_path}`);
     lines.push(`  Image output: ${run.generated_image_dir}`);
     run.modules.forEach((module) => {
-      lines.push(`  ${module.module} -> ${module.job_id} (${module.status}${module.needs_review ? ", needs review" : ""})`);
+      lines.push(`  ${module.module} -> ${module.job_id} (${formatStatus(module.status, module.needs_review)}${module.needs_review ? ", needs review" : ""})`);
     });
   });
 
-  if (summary.review_queue_csv) lines.push("", `Review queue CSV: ${summary.review_queue_csv}`);
-  if (summary.shopify_import_csv) lines.push(`Shopify import CSV: ${summary.shopify_import_csv}`);
-  if (summary.excel_workbook) lines.push(`Excel workbook: ${summary.excel_workbook}`);
+  if (summary.review_queue_csv || summary.shopify_import_csv || summary.excel_workbook) {
+    lines.push("", section("Generated Files"));
+    if (summary.review_queue_csv) lines.push(`Review queue CSV: ${summary.review_queue_csv}`);
+    if (summary.shopify_import_csv) lines.push(`Shopify import CSV: ${summary.shopify_import_csv}`);
+    if (summary.excel_workbook) lines.push(`Excel workbook: ${summary.excel_workbook}`);
+  }
+
+  lines.push("", section("Try Next"));
+  if (reviewCount > 0) {
+    lines.push("- catalog review queue");
+    lines.push("- catalog review <job-id>");
+  } else {
+    lines.push("- catalog publish");
+    lines.push("- catalog publish --live");
+  }
   return `${lines.join("\n")}\n`;
 }
 
 function renderPublishSummary(payload: { live: boolean; published: number; skipped: Array<{ job_id: string; reason: string }>; jobs: string[] }): string {
   const lines = [
-    `${payload.live ? "Live publish" : "Local publish"} complete`,
+    section(payload.live ? "Live Publish Complete" : "Local Publish Complete"),
     `Published: ${payload.published}`
   ];
   if (payload.jobs.length > 0) {
-    lines.push("", "Published jobs:");
+    lines.push("", section("Published Jobs"));
     payload.jobs.forEach((jobId) => lines.push(`- ${jobId}`));
   }
   if (payload.skipped.length > 0) {
-    lines.push("", "Skipped:");
+    lines.push("", section("Skipped"));
     payload.skipped.forEach((item) => lines.push(`- ${item.job_id}: ${item.reason}`));
   }
+  lines.push("", section("Try Next"));
+  lines.push("- catalog review queue");
+  lines.push("- catalog publish --live");
   return `${lines.join("\n")}\n`;
 }
 
 function renderConfigSet(pathExpression: string, value: unknown): string {
-  return `Updated config: ${pathExpression} = ${formatValue(value)}\n`;
+  return `${section("Config Updated")}\n${pathExpression} = ${formatValue(value)}\n`;
 }
 
 function renderConfigGet(pathExpression: string, value: unknown): string {
-  return `${pathExpression}: ${formatValue(value)}\n`;
+  return `${section("Config Value")}\n${pathExpression}: ${formatValue(value)}\n`;
 }
 
 function renderCredentialList(credentials: Array<{ alias: string; source: string; ready: boolean }>): string {
-  const lines = ["Credentials:"];
+  const lines = [section("Credentials")];
   credentials.forEach((credential) => {
-    lines.push(`- ${credential.alias}: ${credential.ready ? `ready via ${credential.source}` : "missing"}`);
+    lines.push(`- ${credential.alias}: ${credential.ready ? green(`ready via ${credential.source}`) : red("missing")}`);
   });
   return `${lines.join("\n")}\n`;
 }
 
 function renderAuthTest(result: LooseRecord): string {
-  const lines = [`Provider: ${String(result.alias ?? "unknown")}`, `Status: ${result.ok ? "ready" : "not ready"}`];
+  const lines = [section("Auth Test"), `Provider: ${String(result.alias ?? "unknown")}`, `Status: ${result.ok ? green("ready") : red("not ready")}`];
   if (result.message) lines.push(`Message: ${String(result.message)}`);
   if (result.shop) lines.push(`Shop: ${formatValue(result.shop)}`);
+  lines.push("", section("Try Next"));
+  lines.push("- catalog doctor");
   return `${lines.join("\n")}\n`;
 }
 
@@ -442,6 +614,23 @@ function normalizeIdentityValue(value: unknown): string {
 
 function getExportIdentity(record: LooseRecord | null | undefined): string {
   if (!record || typeof record !== "object") return "";
+  const match = record._catalog_match;
+  if (match && typeof match === "object") {
+    const decision = String((match as LooseRecord).decision ?? "").toUpperCase();
+    const action = (match as LooseRecord).proposed_action;
+    if (decision === "NEW_VARIANT" && action && typeof action === "object") {
+      const actionRecord = action as LooseRecord;
+      const productId = String(actionRecord.product_id ?? (match as LooseRecord).matched_product_id ?? "").trim();
+      const optionValues = Array.isArray(actionRecord.option_values)
+        ? actionRecord.option_values
+            .filter((item): item is LooseRecord => Boolean(item) && typeof item === "object")
+            .map((item) => `${String(item.name ?? "").trim().toLowerCase()}:${normalizeIdentityValue(String(item.value ?? ""))}`)
+            .filter(Boolean)
+            .join("|")
+        : "";
+      if (productId && optionValues) return `variant:${productId}:${optionValues}`;
+    }
+  }
   const handle = typeof record.handle === "string" ? normalizeIdentityValue(record.handle) : "";
   if (handle) return `handle:${handle}`;
   const vendor = typeof record.vendor === "string" ? record.vendor : typeof record.brand === "string" ? record.brand : "";
@@ -468,6 +657,12 @@ function getMatchBlockReason(record: LooseRecord | null | undefined): string | n
   if (decision === "DUPLICATE") return "catalogue-match marked this product as DUPLICATE";
   if (getMatchNeedsReview(record)) return "catalogue-match still needs review";
   return null;
+}
+
+export function shouldSkipAfterMatch(record: ProductRecord): boolean {
+  const decision = getMatchDecision(record as LooseRecord);
+  if (decision === "DUPLICATE") return true;
+  return getMatchNeedsReview(record as LooseRecord);
 }
 
 function getRepresentativeRank(record: LooseRecord | null | undefined): number {
@@ -719,10 +914,28 @@ async function runWorkflowSequence(
         needs_review: executed.result.needs_review,
         matched_product_id: matchResult.matched_product_id ?? null,
         matched_variant_id: matchResult.matched_variant_id ?? null,
-        proposed_action: matchResult.proposed_action ?? null
+        proposed_action: matchResult.proposed_action ?? null,
+        matched_product_handle: typeof (matchResult.proposed_action as LooseRecord | undefined)?.product_handle === "string"
+          ? (matchResult.proposed_action as LooseRecord).product_handle
+          : null,
+        matched_product_title: typeof (matchResult.proposed_action as LooseRecord | undefined)?.product_title === "string"
+          ? (matchResult.proposed_action as LooseRecord).product_title
+          : null
       }
     };
     modules.push({ module: executed.result.module, job_id: executed.job_id, status: executed.result.status, needs_review: executed.result.needs_review });
+
+    if (shouldSkipAfterMatch(currentRecord)) {
+      const productPath = (await persistGeneratedOutputs(root, currentRecord, executed.result)).productPath;
+      return {
+        index: 0,
+        product_key: getProductKey(currentRecord, sourceRecordId),
+        source_record_id: sourceRecordId,
+        generated_product_path: productPath,
+        generated_image_dir: imageDirectory,
+        modules
+      };
+    }
   }
 
   const enrichRun = await executeWorkflowModule("product-enricher", async (jobId) => runEnrich({ root, jobId, input: currentRecord, policy }));
@@ -1537,7 +1750,10 @@ async function handleApply(root: string, jobOrPath: string | undefined, flags: F
       throw new Error("Shopify provider is not ready. Configure the store domain and Shopify credential before using --live.");
     }
 
-    const shopifyPayload = appliedChanges.shopify_payload as LooseRecord | undefined;
+    const rawShopifyPayload = appliedChanges.shopify_payload as LooseRecord | undefined;
+    const shopifyPayload = rawShopifyPayload && isVariantAttachPayload(rawShopifyPayload)
+      ? await resolveLiveVariantAttachPayload(root, rawShopifyPayload)
+      : rawShopifyPayload;
     if (!shopifyPayload) {
       throw new Error("No shopify_payload found in the approved changes.");
     }
@@ -1566,7 +1782,8 @@ async function handleApply(root: string, jobOrPath: string | undefined, flags: F
         job_id: run.result.job_id,
         module: run.result.module,
         status: applyResult.status,
-        applied_at: applyResult.applied_at
+        applied_at: applyResult.applied_at,
+        ...(applyResult.live_result ? { live_result: applyResult.live_result } : {})
       }
     };
     await persistGeneratedProduct(root, generatedProduct, run.result.job_id);
@@ -1655,8 +1872,14 @@ async function handlePublish(root: string, flags: Flags, stdout: OutputWriter): 
     return true;
   });
 
+  const orderedPublishable = [...publishable].sort((left, right) => {
+    const leftIsVariantAttach = isVariantAttachPayload((left.run.result?.proposed_changes?.shopify_payload as LooseRecord | undefined) ?? null);
+    const rightIsVariantAttach = isVariantAttachPayload((right.run.result?.proposed_changes?.shopify_payload as LooseRecord | undefined) ?? null);
+    return Number(leftIsVariantAttach) - Number(rightIsVariantAttach);
+  });
+
   const jobs: string[] = [];
-  for (const item of publishable) {
+  for (const item of orderedPublishable) {
     const code = await handleApply(
       root,
       item.run.result?.job_id,
@@ -1703,33 +1926,54 @@ async function handleLearn(root: string, flags: Flags, stdout: OutputWriter): Pr
 }
 
 function printHelp(stdout: OutputWriter): void {
-  stdout.write(`catalog commands:
-  init [--no-wizard] [--json]
-  auth set --provider <name> --value <secret> [--json]
-  auth login --provider shopify --store <shop> --client-id <id> --client-secret <secret> [--json]
-  auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> [--json]
-  auth list [--json]
-  auth test --provider <name> [--json]
-  config set <path> <value> [--json]
-  config get <path> [--json]
-  doctor [--json]
-  expert generate --industry food_and_beverage --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
-  guide generate --industry food_and_beverage --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
-  guide show [--json]
-  ingest --input <file> [--json]
-  match --input <file> [--catalog <file>] [--first 50] [--json]
-  enrich --input <file> [--json]
-  image --input <file> [--json]
-  qa --input <file> [--json]
-  sync --input <file> [--json]
-  batch <enrich|qa|match|image|sync> --input <file> [--catalog <file>] [--limit N] [--json]
-  workflow run --input <file> [--catalog <file>] [--limit N] [--json]
-  review <job-id> [--action approve|approve_with_edits|reject|defer] [--json]
-  review queue [--module <name>] [--product <product-key>] [--all] [--json]
-  review bulk --action approve|approve_with_edits|reject|defer [--module <name>] [--product <product-key>] [--all] [--json]
-  apply <job-id> [--live] [--json]
-  publish [--live] [--json]
-  learn --run <job-id> [--lesson "..."] [--json]
+  stdout.write(`${section("Catalog CLI Help")}
+
+${section("Fast Start")}
+1. catalog init
+2. catalog doctor
+3. catalog guide generate --industry apparel --business-name "Demo Store" --business-description "Everyday essentials"
+4. catalog workflow run --input .\\examples\\apparel\\products-match.json --catalog .\\examples\\apparel\\catalog-match.json
+5. catalog publish
+
+${section("Core Commands")}
+init [--no-wizard] [--json]
+doctor [--json]
+guide generate --industry <industry> --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
+guide show [--json]
+workflow run --input <file> [--catalog <file>] [--limit N] [--json]
+publish [--live] [--json]
+
+${section("Single-Step Commands")}
+ingest --input <file> [--json]
+match --input <file> [--catalog <file>] [--first 50] [--json]
+enrich --input <file> [--json]
+image --input <file> [--json]
+qa --input <file> [--json]
+sync --input <file> [--json]
+batch <enrich|qa|match|image|sync> --input <file> [--catalog <file>] [--limit N] [--json]
+
+${section("Review And Apply")}
+review <job-id> [--action approve|approve_with_edits|reject|defer] [--json]
+review queue [--module <name>] [--product <product-key>] [--all] [--json]
+review bulk --action approve|approve_with_edits|reject|defer [--module <name>] [--product <product-key>] [--all] [--json]
+apply <job-id> [--live] [--json]
+learn --run <job-id> [--lesson "..."] [--json]
+
+${section("Credentials And Config")}
+auth set --provider <name> --value <secret> [--json]
+auth login --provider shopify --store <shop> --client-id <id> --client-secret <secret> [--json]
+auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> [--json]
+auth list [--json]
+auth test --provider <name> [--json]
+config set <path> <value> [--json]
+config get <path> [--json]
+
+${section("Examples")}
+catalog guide generate --industry food_and_beverage --business-name "Blyzr" --business-description "Online grocery store for halal and cultural groceries"
+catalog workflow run --input .\\examples\\grocery\\products-match.json --catalog .\\examples\\grocery\\catalog-match.json
+catalog workflow run --input .\\examples\\alt-structure\\products-grocery.csv --catalog .\\examples\\grocery\\catalog-match.json
+catalog review queue
+catalog publish --live
 `);
 }
 

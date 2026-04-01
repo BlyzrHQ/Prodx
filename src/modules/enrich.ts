@@ -43,21 +43,28 @@ const TRUSTED_RETAILER_HINTS = [
 ];
 
 function buildTitle(product: ProductRecord, pattern: string) {
+  const hasRealVariants = Array.isArray(product.variants)
+    && product.variants.some((variant) => [variant.option1, variant.option2, variant.option3].some((value) => typeof value === "string" && value.trim() && value.trim().toLowerCase() !== "default title"));
+  const sizeToken = hasRealVariants ? "" : product.size ?? "";
+  const primaryVariantToken = hasRealVariants ? "" : product.primary_variant ?? product.color ?? "";
+  const secondaryVariantToken = hasRealVariants ? "" : product.secondary_variant ?? product.size ?? "";
   const resolved = pattern
     .replace("Brand +", product.brand ?? product.vendor ?? "")
     .replace("Product +", product.title ?? "")
     .replace("[Brand]", product.brand ?? product.vendor ?? "")
     .replace("[Product]", product.title ?? "")
-    .replace("[Size]", product.size ?? "")
-    .replace("[Primary Variant]", product.primary_variant ?? product.color ?? "")
-    .replace("[Secondary Variant]", product.secondary_variant ?? product.size ?? "")
+    .replace("[Size]", sizeToken)
+    .replace("[Primary Variant]", primaryVariantToken)
+    .replace("[Secondary Variant]", secondaryVariantToken)
     .replace(/\[[^\]]+\]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
-  if (resolved) return resolved;
+  const looksLikeFormulaText = /product family\/type|core spec|compatibility or variant|primary variant|secondary variant|brand \+|product \+/i.test(resolved);
+  if (resolved && !looksLikeFormulaText) return resolved;
 
   return [product.brand ?? product.vendor, product.title, product.size, product.type]
+    .filter((value, index) => !(hasRealVariants && index >= 2))
     .filter((value) => typeof value === "string" && value.trim().length > 0)
     .join(" ")
     .replace(/\s+/g, " ")
@@ -357,25 +364,63 @@ function validateGeneratedOutput(generated: EnrichmentOutput): void {
   if (generated.confidence < 0 || generated.confidence > 1) throw new Error("Generated confidence was outside 0..1.");
 }
 
-function sanitizeCustomerFacingDescription(generated: EnrichmentOutput): {
-  description: string;
-  description_html: string;
-  placeholderDetected: boolean;
-} {
-  const normalized = normalizeDescriptionPair(generated.description_html || generated.description);
-  const placeholderDetected = hasReviewPlaceholder(normalized.description) || hasReviewPlaceholder(normalized.description_html);
-  if (placeholderDetected) {
-    return {
-      description: "",
-      description_html: "",
-      placeholderDetected: true
-    };
+function isHeadingLikeBlock(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9\s&/,+-]{0,80}$/.test(value.trim()) && !/[.!?]$/.test(value.trim());
+}
+
+function cleanDescriptionTextBlocks(text: string): { text: string; removedPlaceholderContent: boolean } {
+  const blocks = text
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  const kept: string[] = [];
+  let removedPlaceholderContent = false;
+
+  for (let index = 0; index < blocks.length; index += 1) {
+    const current = blocks[index];
+    const next = blocks[index + 1];
+
+    if (hasReviewPlaceholder(current)) {
+      removedPlaceholderContent = true;
+      continue;
+    }
+
+    if (isHeadingLikeBlock(current) && typeof next === "string" && hasReviewPlaceholder(next)) {
+      removedPlaceholderContent = true;
+      index += 1;
+      continue;
+    }
+
+    kept.push(current);
   }
 
   return {
-    description: normalized.description,
-    description_html: normalized.description_html,
-    placeholderDetected: false
+    text: kept.join("\n\n").trim(),
+    removedPlaceholderContent
+  };
+}
+
+function sanitizeVerifiedTextValue(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return hasReviewPlaceholder(trimmed) ? null : trimmed;
+}
+
+export function sanitizeCustomerFacingDescription(generated: EnrichmentOutput): {
+  description: string;
+  description_html: string;
+  removedPlaceholderContent: boolean;
+} {
+  const normalized = normalizeDescriptionPair(generated.description_html || generated.description);
+  const cleaned = cleanDescriptionTextBlocks(normalized.description);
+  const finalNormalized = normalizeDescriptionPair(cleaned.text);
+
+  return {
+    description: finalNormalized.description,
+    description_html: finalNormalized.description_html,
+    removedPlaceholderContent: cleaned.removedPlaceholderContent
   };
 }
 
@@ -419,7 +464,7 @@ async function generateWithProvider(
       instructions: systemPrompt,
       input: prompt,
       schema,
-      maxOutputTokens: 2600,
+      maxOutputTokens: 4200,
       reasoningEffort: "low",
       webSearch: useWebVerification ? {
         enabled: true,
@@ -506,12 +551,16 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
       }
       if (generated.description_html || generated.description) {
         const sanitized = sanitizeCustomerFacingDescription(generated);
-        if (sanitized.placeholderDetected) {
-          warnings.push("Generated description contained review-placeholder text and was not applied.");
-          skippedFields.push({ field: "description_html", reason: "generated_description_contains_review_placeholder" });
-        } else {
+        if (sanitized.description_html) {
           structuredChanges.description = makeFieldChange(sanitized.description, generated.confidence, "derived");
           structuredChanges.description_html = makeFieldChange(sanitized.description_html, generated.confidence, "derived");
+          if (sanitized.removedPlaceholderContent) {
+            warnings.push("Generated description contained review-placeholder text; uncertain sections were omitted.");
+            skippedFields.push({ field: "description_html", reason: "generated_description_sections_omitted_for_placeholder_content" });
+          }
+        } else if (sanitized.removedPlaceholderContent) {
+          warnings.push("Generated description contained only review-placeholder text and was not applied.");
+          skippedFields.push({ field: "description_html", reason: "generated_description_contains_only_review_placeholder_content" });
         }
       }
       if (generated.handle && !input.handle) {
@@ -529,38 +578,47 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
       if (Array.isArray(generated.tags) && generated.tags.length > 0) {
         structuredChanges.tags = makeFieldChange(generated.tags, generated.confidence, "derived");
       }
-      if (typeof generated.ingredients_text === "string" && generated.ingredients_text.trim()) {
-        structuredChanges.ingredients_text = makeFieldChange(generated.ingredients_text.trim(), generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
+      const sanitizedIngredients = sanitizeVerifiedTextValue(generated.ingredients_text);
+      if (sanitizedIngredients) {
+        structuredChanges.ingredients_text = makeFieldChange(sanitizedIngredients, generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
         upsertStructuredMetafieldChange(
           structuredChanges,
           "custom.ingredients_text",
-          generated.ingredients_text.trim(),
+          sanitizedIngredients,
           generated.confidence,
           generatedResult.verificationUsed ? "web_verified" : "derived",
           policy
         );
+      } else if (typeof generated.ingredients_text === "string" && generated.ingredients_text.trim()) {
+        skippedFields.push({ field: "ingredients_text", reason: "generated_fact_contains_review_placeholder" });
       }
-      if (typeof generated.allergen_note === "string" && generated.allergen_note.trim()) {
-        structuredChanges.allergen_note = makeFieldChange(generated.allergen_note.trim(), generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
+      const sanitizedAllergen = sanitizeVerifiedTextValue(generated.allergen_note);
+      if (sanitizedAllergen) {
+        structuredChanges.allergen_note = makeFieldChange(sanitizedAllergen, generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
         upsertStructuredMetafieldChange(
           structuredChanges,
           "custom.allergen_note",
-          generated.allergen_note.trim(),
+          sanitizedAllergen,
           generated.confidence,
           generatedResult.verificationUsed ? "web_verified" : "derived",
           policy
         );
+      } else if (typeof generated.allergen_note === "string" && generated.allergen_note.trim()) {
+        skippedFields.push({ field: "allergen_note", reason: "generated_fact_contains_review_placeholder" });
       }
-      if (typeof generated.nutritional_facts === "string" && generated.nutritional_facts.trim()) {
-        structuredChanges.nutritional_facts = makeFieldChange(generated.nutritional_facts.trim(), generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
+      const sanitizedNutrition = sanitizeVerifiedTextValue(generated.nutritional_facts);
+      if (sanitizedNutrition) {
+        structuredChanges.nutritional_facts = makeFieldChange(sanitizedNutrition, generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
         upsertStructuredMetafieldChange(
           structuredChanges,
           "custom.nutritional_facts",
-          generated.nutritional_facts.trim(),
+          sanitizedNutrition,
           generated.confidence,
           generatedResult.verificationUsed ? "web_verified" : "derived",
           policy
         );
+      } else if (typeof generated.nutritional_facts === "string" && generated.nutritional_facts.trim()) {
+        skippedFields.push({ field: "nutritional_facts", reason: "generated_fact_contains_review_placeholder" });
       }
       const generatedMetafields = normalizeGeneratedMetafields(generated.metafields, policy);
       if (generatedMetafields.length > 0) {
@@ -608,9 +666,10 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
       structuredChanges.title = makeFieldChange(fallbackResult.title, fallbackResult.confidence, "derived");
     }
     const normalized = normalizeDescriptionPair(fallbackResult.description_html || fallbackResult.description);
-    if (normalized.description_html) {
-      structuredChanges.description = makeFieldChange(normalized.description, fallbackResult.confidence, "derived");
-      structuredChanges.description_html = makeFieldChange(normalized.description_html, fallbackResult.confidence, "derived");
+    const sanitizedFallback = sanitizeCustomerFacingDescription(fallbackResult);
+    if (sanitizedFallback.description_html) {
+      structuredChanges.description = makeFieldChange(sanitizedFallback.description, fallbackResult.confidence, "derived");
+      structuredChanges.description_html = makeFieldChange(sanitizedFallback.description_html, fallbackResult.confidence, "derived");
     }
     if (fallbackResult.handle && !input.handle) {
       structuredChanges.handle = makeFieldChange(fallbackResult.handle, fallbackResult.confidence, "derived");

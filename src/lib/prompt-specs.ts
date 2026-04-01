@@ -37,22 +37,27 @@ export function getCatalogGuidePromptSpec(): PromptSpec {
       "Senior Catalog Strategist",
       "Shopify Product Data Architect",
       "Merchandising Director",
-      "Automation Systems Designer"
+      "Automation Systems Designer",
+      "Catalog Governance Lead"
     ],
     permanent_behavior: [
       "Write a machine-consumable Catalog Guide that downstream agents can execute deterministically.",
+      "Write the guide like an expert merchandising and catalog operations playbook that a human team could also use outside the system.",
       "Standardize product data for Shopify-compatible workflows, including taxonomy, variants, metafields, merchandising, SEO, and QA.",
-      "Use the connected Shopify context when available and mark inferred structures with inferred: true."
+      "Use the connected Shopify context when available and mark inferred structures with inferred: true.",
+      "Prefer detailed operational rules, worked examples, edge-case policies, and decision criteria over generic placeholders."
     ],
     safety_rules: [
       "Do not invent metafields unless they are justified by filtering, merchandising, SEO, UX, or the connected Shopify store.",
       "Do not ignore Shopify constraints around products, variants, collections, images, or metafields.",
-      "Use structured sentinel values like requires_review or unknown_requires_review instead of inventing facts."
+      "Use structured sentinel values like requires_review or unknown_requires_review instead of inventing facts.",
+      "Do not emit shallow, generic advice that would be unusable for a catalog team."
     ],
     output_rules: [
       "Return valid JSON only with the exact schema shape.",
       "Keep content operational, deterministic, and enforceable by code or agent logic.",
-      "Prefer lists, mappings, constraints, examples, and validation rules over narrative paragraphs."
+      "Prefer lists, mappings, constraints, examples, and validation rules over narrative paragraphs.",
+      "Include enough detail that the generated Markdown guide can function as a standalone expert playbook."
     ]
   };
 }
@@ -70,10 +75,13 @@ export function getEnrichmentPromptSpec(): PromptSpec {
       "Prefer HTML-first description output.",
       "When web search is enabled for the request, research the product directly and return the verified factual fields in the response JSON.",
       "Extract brand or vendor only when it is explicit and unambiguous in the provided product title, other product data, or verified sources.",
+      "When a product family is modeled with variants, keep the base product title at the family level and place shopper-facing differentiators like size, color, storage, or pack size into options unless the guide explicitly requires those values in title.",
       "When the runtime explicitly enables web verification for unresolved high-risk factual fields, actively search before deciding whether to fill or skip those fields.",
       "Use provider web search only when high-risk factual fields require verification and the runtime explicitly enables it.",
       "For factual grocery or consumer-packaged fields, prefer exact-pack evidence from official brand or manufacturer pages first, then from exact-match trusted retailer listings such as Amazon, Instacart, Carrefour, Tesco, Walmart, or Noon when the brand, variant, and pack size clearly match.",
-      "If one trusted exact-match source clearly identifies the product, fill the factual plain-text field directly. If no trusted exact-match source exists, skip it."
+      "If one trusted exact-match source clearly identifies the product, fill the factual plain-text field directly. If no trusted exact-match source exists, skip it.",
+      "If a description section would only contain uncertainty, verification disclaimers, or internal review language, omit that section instead of describing the uncertainty to the shopper.",
+      "Write descriptions so they are decision-ready for both shoppers and AI-driven commerce systems: clear product identity, strongest attributes, who it is for, and when it is useful."
     ],
     safety_rules: [
       "Do not invent unsupported Shopify fields or custom metafields outside the guide.",
@@ -82,6 +90,7 @@ export function getEnrichmentPromptSpec(): PromptSpec {
       "Do not reuse evidence from a different pack size, flavor, fat level, variant, or product form.",
       "When Shopify metaobject reference IDs are unavailable, you may still fill parallel plain-text factual fields such as ingredients_text, allergen_note, or nutritional_facts if the exact product evidence is verified.",
       "Do not insert review placeholders or internal notes into customer-facing fields such as title, description, alt text, or visible metafields.",
+      "Do not write phrases like 'requires verification', 'pending confirmation', 'check pack', or similar uncertainty language in customer-facing copy.",
       "Use skipped_reasons when data is missing, conflicting, or unsafe to infer."
     ],
     output_rules: [
@@ -166,6 +175,8 @@ export function buildCatalogGuidePromptPayload(
       "Identify product complexity level.",
       "Identify catalog scale.",
       "Identify key buying factors.",
+      "Identify what catalog operators would need to know to use the guide outside the system.",
+      "Add worked examples, edge cases, and decision rules that would prevent ambiguity.",
       "Adapt every rule accordingly."
     ] }
   ];

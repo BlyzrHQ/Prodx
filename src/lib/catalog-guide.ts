@@ -165,3 +165,22 @@ export function getGuideImageRequirementSummary(policy: PolicyDocument): string 
   const avoid = asStringArray(policy.image_media_standards?.avoid, policy.image_requirements?.avoid ?? []);
   return [...styles, ...backgrounds, ...avoid.map((item) => `avoid:${item}`)].join(", ");
 }
+
+export function getGuideAgenticRequiredSignals(policy: PolicyDocument): string[] {
+  return asStringArray(policy.agentic_commerce_readiness?.required_signals, []);
+}
+
+export function getGuideAgenticDescriptionRequirements(policy: PolicyDocument): string[] {
+  return asStringArray(policy.agentic_commerce_readiness?.description_requirements, []);
+}
+
+export function getGuideAgenticRecommendedMetafields(policy: PolicyDocument): Array<{ namespace: string; key: string; type: string; purpose: string; example_values?: string[] }> {
+  const value = policy.agentic_commerce_readiness?.recommended_metafields;
+  return Array.isArray(value) ? value.map((item) => ({
+    namespace: String(item.namespace ?? ""),
+    key: String(item.key ?? ""),
+    type: String(item.type ?? ""),
+    purpose: String(item.purpose ?? ""),
+    example_values: Array.isArray(item.example_values) ? item.example_values.map(String) : []
+  })).filter((item) => item.namespace && item.key) : [];
+}

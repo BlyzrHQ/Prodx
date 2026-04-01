@@ -29,8 +29,25 @@ function stringArraySchema() {
   return { type: "array", items: { type: "string" } };
 }
 
-function flexibleArraySchema() {
-  return { type: "array", items: {} };
+function taxonomyTreeSchema() {
+  return {
+    type: "array",
+    items: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        label: { type: "string" },
+        department: { type: "string" },
+        category: { type: "string" },
+        subcategory: { type: "string" },
+        device_type: { type: "string" },
+        categories: stringArraySchema(),
+        children: stringArraySchema(),
+        notes: { type: "string" }
+      },
+      required: ["label", "department", "category", "subcategory", "device_type", "categories", "children", "notes"]
+    }
+  };
 }
 
 function metafieldDefinitionSchema() {
@@ -68,6 +85,19 @@ function metafieldDefinitionSchema() {
   );
 }
 
+function recommendedMetafieldSchema() {
+  return strictObject(
+    {
+      namespace: { type: "string" },
+      key: { type: "string" },
+      type: { type: "string" },
+      purpose: { type: "string" },
+      example_values: stringArraySchema()
+    },
+    ["namespace", "key", "type", "purpose", "example_values"]
+  );
+}
+
 function buildPolicySchema() {
   return {
     name: "catalog_guide",
@@ -92,7 +122,7 @@ function buildPolicySchema() {
         taxonomy_design: strictObject(
           {
             hierarchy: stringArraySchema(),
-            category_tree: flexibleArraySchema(),
+            category_tree: taxonomyTreeSchema(),
             collection_logic: stringArraySchema(),
             tagging_system: stringArraySchema(),
             product_type_rules: stringArraySchema(),
@@ -199,6 +229,18 @@ function buildPolicySchema() {
             passing_score: { type: "number" }
           },
           ["title_validation", "variant_validation", "metafield_completeness", "image_checks", "seo_checks", "pass_fail_conditions", "auto_fix_rules", "passing_score"]
+        ),
+        agentic_commerce_readiness: strictObject(
+          {
+            principles: stringArraySchema(),
+            required_signals: stringArraySchema(),
+            description_requirements: stringArraySchema(),
+            faq_requirements: stringArraySchema(),
+            catalog_mapping_recommendations: stringArraySchema(),
+            recommended_metafields: { type: "array", items: recommendedMetafieldSchema() },
+            scoring_model: stringArraySchema()
+          },
+          ["principles", "required_signals", "description_requirements", "faq_requirements", "catalog_mapping_recommendations", "recommended_metafields", "scoring_model"]
         )
       },
       [
@@ -213,7 +255,8 @@ function buildPolicySchema() {
         "merchandising_rules",
         "seo_discovery_rules",
         "automation_playbook",
-        "qa_validation_system"
+        "qa_validation_system",
+        "agentic_commerce_readiness"
       ]
     )
   };
@@ -429,7 +472,6 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
   const warnings: string[] = [];
   const shopifyContext = await getShopifyContext(root);
   const starterPolicy = applyShopifyContextToStarterPolicy(buildStarterPolicy(input), shopifyContext);
-  let policy: PolicyDocument = starterPolicy;
   const shouldResearch = Boolean(input.research);
   let researchNotes: Array<{ title: string; link: string; snippet?: string }> = [];
   const existingLearningText = await readText(paths.learningMarkdown, "");
@@ -449,16 +491,52 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
     }
   }
 
-  if (providerReady(llmProvider) && ["openai", "gemini", "anthropic"].includes(llmProvider.provider.type)) {
-    try {
-      policy = await generateWithProvider(llmProvider, input, starterPolicy, shopifyContext, researchNotes, existingLearningText);
-      reasoning.push(`Generated the Catalog Guide with ${llmProvider.providerAlias}.`);
-    } catch (error) {
-      warnings.push(`Catalog Guide generation failed: ${error instanceof Error ? error.message : String(error)}`);
-      reasoning.push("Fell back to the starter Catalog Guide template because provider-based generation was unavailable.");
-    }
-  } else {
-    reasoning.push("No ready LLM provider was configured for catalogue-expert; generated a starter Catalog Guide template.");
+  if (!providerReady(llmProvider) || !["openai", "gemini", "anthropic"].includes(llmProvider.provider.type)) {
+    return createBaseResult({
+      jobId,
+      module: "catalogue-expert",
+      status: "failed",
+      needsReview: true,
+      warnings,
+      errors: ["No ready LLM provider was configured for catalogue-expert."],
+      reasoning: [
+        ...reasoning,
+        "Guide generation was stopped because fallback guide creation is disabled."
+      ],
+      nextActions: [
+        "Configure a supported LLM provider for catalogue-expert.",
+        "Retry `guide generate` after provider configuration is fixed."
+      ]
+    });
+  }
+
+  let policy: PolicyDocument;
+  try {
+    policy = await generateWithProvider(llmProvider, input, starterPolicy, shopifyContext, researchNotes, existingLearningText);
+    reasoning.push(`Generated the Catalog Guide with ${llmProvider.providerAlias}.`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createBaseResult({
+      jobId,
+      module: "catalogue-expert",
+      status: "failed",
+      needsReview: true,
+      warnings,
+      errors: [`Catalog Guide generation failed: ${message}`],
+      reasoning: [
+        ...reasoning,
+        "Guide generation was stopped because fallback guide creation is disabled."
+      ],
+      artifacts: {
+        provider_used: llmProvider.providerAlias,
+        shopify_context_used: Boolean(shopifyContext),
+        research_used: shouldResearch && researchNotes.length > 0
+      },
+      nextActions: [
+        "Fix the provider/schema error and rerun `guide generate`.",
+        "Do not continue with workflow runs that depend on a new guide until this succeeds."
+      ]
+    });
   }
 
   await writeJson(paths.policyJson, policy);

@@ -47,7 +47,15 @@ export function hasReviewPlaceholder(value: string): boolean {
     "unknown_requires_review",
     "to be confirmed",
     "to be verified",
-    "pending verification"
+    "pending verification",
+    "pending confirmation",
+    "pending brand confirmation",
+    "requires verification",
+    "require verification",
+    "verification before publishing",
+    "confirm on-pack",
+    "confirm on pack",
+    "brand confirmation"
   ].some((token) => normalized.includes(token));
 }
 
