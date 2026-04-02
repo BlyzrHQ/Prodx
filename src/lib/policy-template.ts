@@ -364,8 +364,24 @@ export function buildStarterPolicy({
     },
     attributes_metafields_schema: {
       required_fields: ["title", "handle", "description_html", "vendor", "product_type"],
-      optional_fields: ["featured_image", "compare_at_price", "tags", "images"],
-      standard_shopify_fields: ["title", "handle", "body_html", "vendor", "product_type", "tags", "images"],
+      optional_fields: ["featured_image", "compare_at_price", "tags", "images", "seo_title", "seo_description", "barcode", "sku"],
+      standard_shopify_fields: [
+        "title",
+        "handle",
+        "description_html",
+        "vendor",
+        "product_type",
+        "product_category",
+        "tags",
+        "price",
+        "compare_at_price",
+        "sku",
+        "barcode",
+        "images",
+        "image_alt_text",
+        "seo_title",
+        "seo_description"
+      ],
       metafields: template.metafields,
       fill_rules: [
         "Only populate metafields that exist in Shopify or are explicitly approved in the guide.",
@@ -525,50 +541,131 @@ export function buildStarterPolicy({
   return applyCatalogGuideCompatibility(policy);
 }
 
+function isReviewSentinel(value: unknown): boolean {
+  return typeof value === "string" && /requires_review|unknown_requires_review/i.test(value.trim());
+}
+
+function cleanInlineText(value: unknown, fallback = "Not defined"): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (!trimmed || isReviewSentinel(trimmed)) return fallback;
+  return trimmed;
+}
+
 function renderList(items: string[], empty = "- None defined"): string {
-  return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : empty;
+  const cleaned = items.map((item) => item.trim()).filter((item) => item.length > 0 && !isReviewSentinel(item));
+  return cleaned.length > 0 ? cleaned.map((item) => `- ${item}`).join("\n") : empty;
 }
 
 function renderIndentedList(items: string[], empty = "  - None defined"): string {
-  return items.length > 0 ? items.map((item) => `  - ${item}`).join("\n") : empty;
+  const cleaned = items.map((item) => item.trim()).filter((item) => item.length > 0 && !isReviewSentinel(item));
+  return cleaned.length > 0 ? cleaned.map((item) => `  - ${item}`).join("\n") : empty;
+}
+
+function renderCategoryTree(entries: unknown[]): string {
+  if (!Array.isArray(entries) || entries.length === 0) return "- None defined";
+
+  return entries.map((entry) => {
+    if (!entry || typeof entry !== "object") return "- Uncategorized branch";
+    const record = entry as Record<string, unknown>;
+    const heading = cleanInlineText(record.label ?? record.department ?? record.category ?? record.aisle ?? "Category branch", "Category branch");
+    const categories = Array.isArray(record.categories) ? record.categories.map((item) => String(item)).filter(Boolean) : [];
+    const children = Array.isArray(record.children) ? record.children.map((item) => String(item)).filter(Boolean) : [];
+    const details = [
+      record.department ? `Department: ${cleanInlineText(record.department, "")}` : "",
+      record.category ? `Category: ${cleanInlineText(record.category, "")}` : "",
+      record.subcategory ? `Subcategory: ${cleanInlineText(record.subcategory, "")}` : "",
+      record.device_type ? `Device type: ${cleanInlineText(record.device_type, "")}` : ""
+    ].filter(Boolean);
+    const notes = cleanInlineText(record.notes, "");
+    return [
+      `- ${heading}`,
+      ...(details.length > 0 ? [`  - ${details.join(" | ")}`] : []),
+      ...(categories.length > 0 ? [`  - Shopper-facing groups: ${categories.join(", ")}`] : []),
+      ...(children.length > 0 ? [`  - Child nodes: ${children.join(", ")}`] : []),
+      ...(notes ? [`  - Notes: ${notes}`] : [])
+    ].join("\n");
+  }).join("\n");
+}
+
+function renderMetafieldBlocks(metafields: ProductMetafieldValue[]): string {
+  if (metafields.length === 0) return "- No guide-defined metafields yet.";
+
+  return metafields.map((field) => [
+    `### \`${field.namespace}.${field.key}\``,
+    `- Type: ${cleanInlineText(field.type)}`,
+    `- Required: ${field.required ? "Yes" : "No"}`,
+    `- Automation mode: ${cleanInlineText(field.automation_mode, "review_required")}`,
+    `- Source expectation: ${cleanInlineText(field.source, "Guide-defined")}`,
+    `- Source field: ${cleanInlineText(field.source_field, "Not specified")}`,
+    `- Why it exists: ${cleanInlineText(field.description, "No description provided.")}`,
+    `- Validation rules: ${(field.validation_rules ?? []).filter((value) => !isReviewSentinel(value)).join(" | ") || "None defined"}`,
+    `- Example values: ${(field.example_values ?? []).filter((value) => !isReviewSentinel(value)).join(" | ") || "None defined"}`,
+    `- Primary usage: ${(field.usage ?? []).filter((value) => !isReviewSentinel(value)).join(" | ") || "None defined"}`
+  ].join("\n")).join("\n\n");
+}
+
+function renderRecommendedMetafields(fields: RecommendedMetafield[]): string {
+  if (fields.length === 0) return "- No additional recommended metafields defined.";
+  return [
+    "| Metafield | Type | Why it matters | Example values |",
+    "| --- | --- | --- | --- |",
+    ...fields.map((field) => `| \`${field.namespace}.${field.key}\` | ${cleanInlineText(field.type)} | ${cleanInlineText(field.purpose)} | ${(field.example_values ?? []).filter((value) => !isReviewSentinel(value)).join("<br>") || "None defined"} |`)
+  ].join("\n");
 }
 
 export function renderPolicyMarkdown(policy: PolicyDocument) {
-  const taxonomyTree = Array.isArray(policy.taxonomy_design?.category_tree)
-    ? policy.taxonomy_design.category_tree.map((entry) => `- ${JSON.stringify(entry)}`).join("\n")
-    : "- None defined";
   const metafields = getGuideMetafields(policy);
   const descriptionSections = getGuideDescriptionSections(policy);
   const variantDimensions = getGuideVariantDimensions(policy);
-  const titleExamples = Array.isArray(policy.product_title_system?.examples) ? policy.product_title_system.examples : [];
+  const titleExamples = Array.isArray(policy.product_title_system?.examples) ? policy.product_title_system.examples.filter((item) => !isReviewSentinel(item)) : [];
   const titleEdgeCases = Array.isArray(policy.product_title_system?.edge_case_rules) ? policy.product_title_system.edge_case_rules : [];
   const descriptionGuidance = Array.isArray(policy.product_description_system?.guidance) ? policy.product_description_system.guidance : [];
   const imageAvoid = Array.isArray(policy.image_media_standards?.avoid) ? policy.image_media_standards.avoid : [];
   const agentic = policy.agentic_commerce_readiness ?? {};
+  const businessName = cleanInlineText(policy.meta?.business_name, "Store");
+  const summary = cleanInlineText(policy.industry_business_context?.summary, cleanInlineText(policy.meta?.business_description, "No summary provided."));
+  const audience = cleanInlineText(policy.industry_business_context?.audience, "General shoppers in the target market.");
+  const notes = cleanInlineText(policy.industry_business_context?.notes, "");
 
   return `# Catalog Guide
 
-## Industry & Business Context
-- Business: ${policy.meta?.business_name ?? "Not provided"}
-- Business Description: ${policy.meta?.business_description ?? "Not provided"}
-- Industry: ${policy.meta?.industry ?? "Not provided"}
-- Operating Mode: ${policy.meta?.operating_mode ?? "Not provided"}
-- Store URL: ${policy.meta?.store_url || "Not provided"}
-- Summary: ${policy.industry_business_context?.summary ?? "Not provided"}
-- Audience: ${policy.industry_business_context?.audience ?? "Not provided"}
-- Notes: ${policy.industry_business_context?.notes ?? "Not provided"}
+> This guide is the operating playbook for catalog creation, enrichment, QA, merchandising, and Shopify publishing. Teams can use it manually, and agents should treat it as a deterministic contract.
+
+## At a Glance
+- Business: ${businessName}
+- Industry: ${cleanInlineText(policy.meta?.industry)}
+- Operating mode: ${cleanInlineText(policy.meta?.operating_mode)}
+- Store URL: ${cleanInlineText(policy.meta?.store_url, "Not provided")}
+- Primary audience: ${audience}
+- Store summary: ${summary}
+${notes ? `- Notes: ${notes}` : ""}
+
+## Quick Start Playbook
+- Confirm the product is eligible for the store before enrichment begins.
+- Build listings around this title formula: ${cleanInlineText(policy.product_title_system?.formula)}.
+- Use this description structure in order: ${descriptionSections.join(" -> ") || "guide-defined description sections"}.
+- Keep shopper-facing variant dimensions limited to: ${variantDimensions.join(", ") || "guide-defined dimensions"}.
+- Do not publish until required Shopify fields and required metafields are complete or explicitly reviewed.
 
 ## How To Use This Guide
-- Purpose: Use this guide as the source of truth for catalog creation, enrichment, QA, and Shopify publishing.
-- Inside the system: Agents should treat the rules below as deterministic operating constraints wherever they are explicit.
-- Outside the system: Catalog, merchandising, and operations teams can use the same rules for manual listing work, audits, onboarding, and QA review.
+- Inside the system: agents should follow explicit rules here as deterministic operating constraints.
+- Outside the system: catalog, merchandising, and operations teams can use the same rules for onboarding, audits, manual listing work, and approvals.
 
-## Taxonomy Design
+## Business Context
+### Eligibility Rules
+#### Accept when
+${renderList(Array.isArray(policy.eligibility_rules?.accept) ? policy.eligibility_rules.accept : [])}
+
+#### Reject when
+${renderList(Array.isArray(policy.eligibility_rules?.reject) ? policy.eligibility_rules.reject : [])}
+
+## Taxonomy & Categorization
 ### Hierarchy
 ${renderList(Array.isArray(policy.taxonomy_design?.hierarchy) ? policy.taxonomy_design.hierarchy : [])}
 
-### Category Tree
-${taxonomyTree}
+### Category Map
+${renderCategoryTree(Array.isArray(policy.taxonomy_design?.category_tree) ? policy.taxonomy_design.category_tree : [])}
 
 ### Collection Logic
 ${renderList(Array.isArray(policy.taxonomy_design?.collection_logic) ? policy.taxonomy_design.collection_logic : [])}
@@ -588,22 +685,18 @@ ${renderList(Array.isArray(policy.taxonomy_design?.handle_structure_rules) ? pol
 - New variants: Attach to the parent family when the shopper-facing option mapping is clear.
 - Bundles and multipacks: Treat as separate products when the buying intent is materially different from the single unit.
 
-## Product Title System
-- Formula: ${policy.product_title_system?.formula ?? "Not defined"}
-- Examples:
+## Product Title Playbook
+- Formula: ${cleanInlineText(policy.product_title_system?.formula)}
+- Good examples:
 ${renderIndentedList(titleExamples)}
-- Disallowed patterns:
-${renderIndentedList(Array.isArray(policy.product_title_system?.disallowed_patterns) ? policy.product_title_system.disallowed_patterns : [])}
-- SEO rules:
+- Do:
 ${renderIndentedList(Array.isArray(policy.product_title_system?.seo_rules) ? policy.product_title_system.seo_rules : [])}
-- Edge-case rules:
+- Avoid:
+${renderIndentedList(Array.isArray(policy.product_title_system?.disallowed_patterns) ? policy.product_title_system.disallowed_patterns : [])}
+- Edge cases:
 ${renderIndentedList(titleEdgeCases)}
 
-### Good vs Bad Title Guidance
-- Good titles identify the product family cleanly, include only the right decision-driving attributes, and stay stable across the same family.
-- Bad titles repeat the brand, stuff multiple option values unnecessarily, or include attributes that should live in variants/options instead.
-
-## Product Description System
+## Product Description Playbook
 - Structure template:
 ${renderIndentedList(descriptionSections)}
 - Tone rules:
@@ -622,7 +715,7 @@ ${renderIndentedList(descriptionGuidance)}
 ### Description Edge Cases
 - If exact factual data is verified from trusted sources, include it in the appropriate section.
 - If exact factual data is not verified, leave it empty rather than inserting placeholder or internal review text.
-- If the category is specs-heavy, keep the structure scannable and separate decision-critical facts from long-form supporting detail.
+- Keep customer-facing copy clean: no internal notes, no review text, and no “check pack” style language.
 
 ## Variant Architecture
 - Allowed dimensions: ${variantDimensions.join(", ") || "Not defined"}
@@ -641,30 +734,16 @@ ${renderIndentedList(Array.isArray(policy.variant_architecture?.duplicate_rules)
 - Duplicate: skip when the product identity and variant signature already exist.
 - Needs review: use when family similarity is high but the safe attachment path is unclear.
 
-## Attributes & Metafields Schema
-- Required Fields: ${JSON.stringify(policy.attributes_metafields_schema?.required_fields ?? [])}
-- Optional Fields: ${JSON.stringify(policy.attributes_metafields_schema?.optional_fields ?? [])}
-- Standard Shopify Fields: ${JSON.stringify(policy.attributes_metafields_schema?.standard_shopify_fields ?? [])}
-- Fill Rules:
+## Shopify Fields & Metafields
+- Required fields: ${(policy.attributes_metafields_schema?.required_fields ?? []).join(", ") || "None defined"}
+- Optional fields: ${(policy.attributes_metafields_schema?.optional_fields ?? []).join(", ") || "None defined"}
+- Standard Shopify fields in scope: ${(policy.attributes_metafields_schema?.standard_shopify_fields ?? []).join(", ") || "None defined"}
+- Fill rules:
 ${renderIndentedList(Array.isArray(policy.attributes_metafields_schema?.fill_rules) ? policy.attributes_metafields_schema.fill_rules : [])}
-- Guidance:
-${policy.attributes_metafields_schema?.guidance ?? "Not defined"}
-- Metafields:
-${metafields.length > 0
-  ? metafields.map((field) => [
-      `  - ${field.namespace}.${field.key}`,
-      `    - Type: ${field.type}`,
-      `    - Required: ${field.required ? "true" : "false"}`,
-      `    - Source: ${field.source ?? "unknown"}`,
-      `    - Source Field: ${field.source_field ?? ""}`,
-      `    - Automation Mode: ${field.automation_mode ?? "review_required"}`,
-      `    - Description: ${field.description ?? ""}`,
-      `    - Validation Rules: ${(field.validation_rules ?? []).join(" | ") || "None defined"}`,
-      `    - Example Values: ${(field.example_values ?? []).join(" | ") || "None defined"}`,
-      `    - Usage: ${(field.usage ?? []).join(" | ") || "None defined"}`,
-      `    - Inferred: ${field.inferred ? "true" : "false"}`
-    ].join("\n")).join("\n")
-  : "  - []"}
+- Guidance: ${cleanInlineText(policy.attributes_metafields_schema?.guidance, "Use metafields to improve filtering, merchandising, SEO, UX, and internal decision logic.")}
+
+## Metafield Definitions
+${renderMetafieldBlocks(metafields)}
 
 ## Image & Media Standards
 - Image types:
@@ -685,7 +764,7 @@ ${renderIndentedList(imageAvoid)}
 - If exact-pack imagery is unavailable, only use a same-family fallback when there are no conflicting visible markers.
 - Reject logo-only, unrelated, cropped, unreadable, or clearly mismatched product images.
 
-## Merchandising Rules
+## Merchandising Playbook
 ### Collection Sorting Logic
 ${renderList(Array.isArray(policy.merchandising_rules?.collection_sorting_logic) ? policy.merchandising_rules.collection_sorting_logic : [])}
 
@@ -727,28 +806,19 @@ ${renderList(Array.isArray(agentic.faq_requirements) ? agentic.faq_requirements 
 ### Catalog Mapping Recommendations
 ${renderList(Array.isArray(agentic.catalog_mapping_recommendations) ? agentic.catalog_mapping_recommendations : [])}
 
-### Recommended Metafields
-${Array.isArray(agentic.recommended_metafields) && agentic.recommended_metafields.length > 0
-  ? agentic.recommended_metafields.map((field) => [
-      `- ${field.namespace}.${field.key}`,
-      `  - Type: ${field.type}`,
-      `  - Purpose: ${field.purpose}`,
-      `  - Example Values: ${(field.example_values ?? []).join(" | ") || "None defined"}`
-    ].join("\n")).join("\n")
-  : "- None defined"}
+### Recommended Metafields To Add
+${renderRecommendedMetafields(Array.isArray(agentic.recommended_metafields) ? agentic.recommended_metafields : [])}
 
 ### Scoring Model
 ${renderList(Array.isArray(agentic.scoring_model) ? agentic.scoring_model : [])}
 
-## Automation Playbook
-- Fully automated:
+## Automation & Review Boundaries
+- Safe to automate:
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.fully_automated) ? policy.automation_playbook.fully_automated : [])}
 - Validation checkpoints:
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.validation_checkpoints) ? policy.automation_playbook.validation_checkpoints : [])}
 - Human approval required:
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.human_approval_required) ? policy.automation_playbook.human_approval_required : [])}
-- Transformation logic:
-${renderIndentedList(Array.isArray(policy.automation_playbook?.transformation_logic) ? policy.automation_playbook.transformation_logic : [])}
 - Fallback rules:
 ${renderIndentedList(Array.isArray(policy.automation_playbook?.fallback_rules) ? policy.automation_playbook.fallback_rules : [])}
 - Error handling rules:
@@ -771,8 +841,8 @@ ${renderIndentedList(Array.isArray(policy.qa_validation_system?.pass_fail_condit
 - Auto-fix rules:
 ${renderIndentedList(Array.isArray(policy.qa_validation_system?.auto_fix_rules) ? policy.qa_validation_system.auto_fix_rules : [])}
 
-## Worked Examples
-- Good title example: ${titleExamples[0] ?? "Not defined"}
+## Worked Examples & Operator Guidance
+- Good title example: ${cleanInlineText(titleExamples[0], "Use the guide title formula with a stable family identity.")}
 - Good description sections example: ${descriptionSections.join(" -> ") || "Not defined"}
 - Variant example: Parent title stays stable, option values carry the shopper-facing differentiation.
 - Duplicate example: If identity and variant signature already exist, skip instead of re-creating.

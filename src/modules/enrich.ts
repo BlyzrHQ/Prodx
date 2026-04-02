@@ -7,8 +7,9 @@ import { getGuideAllowedFields, getGuideDescriptionGuidance, getGuideDescription
 import { buildEnrichmentPromptPayload, buildSystemPrompt, getEnrichmentPromptSpec } from "../lib/prompt-specs.js";
 import { readText } from "../lib/fs.js";
 import { getCatalogPaths } from "../lib/paths.js";
+import { mergeProviderUsages } from "../lib/provider-usage.js";
 import { hasReviewPlaceholder, normalizeDescriptionPair } from "../lib/product.js";
-import type { EnrichmentOutput, LooseRecord, PolicyDocument, ProductMetafieldValue, ProductRecord, ResolvedProvider } from "../types.js";
+import type { EnrichmentOutput, LooseRecord, PolicyDocument, ProductMetafieldValue, ProductRecord, ProviderUsage, ResolvedProvider } from "../types.js";
 
 const HIGH_RISK_FACTUAL_TOKENS = [
   "ingredient",
@@ -92,6 +93,8 @@ function buildFallbackResult(input: ProductRecord, policy: PolicyDocument): Enri
     handle: typeof input.handle === "string" && input.handle
       ? input.handle
       : "",
+    seo_title: proposedTitle || String(input.title ?? ""),
+    seo_description: normalizedDescription.description || null,
     vendor: typeof input.vendor === "string" && input.vendor.trim() ? input.vendor.trim() : null,
     brand: typeof input.brand === "string" && input.brand.trim() ? input.brand.trim() : null,
     product_type: typeof input.product_type === "string" && input.product_type
@@ -161,6 +164,8 @@ function buildEnrichmentSchema() {
         "description",
         "description_html",
         "handle",
+        "seo_title",
+        "seo_description",
         "vendor",
         "brand",
         "product_type",
@@ -179,6 +184,8 @@ function buildEnrichmentSchema() {
         description: { type: "string" },
         description_html: { type: "string" },
         handle: { type: "string" },
+        seo_title: nullableStringSchema(),
+        seo_description: nullableStringSchema(),
         vendor: nullableStringSchema(),
         brand: nullableStringSchema(),
         product_type: { type: "string" },
@@ -265,12 +272,12 @@ function buildVerificationGuidance(input: ProductRecord, policy: PolicyDocument)
   return [
     `High-risk fields that may need verification: ${signals.join(", ")}`,
     "Web verification is required for these unresolved high-risk factual fields before deciding whether they can be filled safely.",
-    `Search official brand or manufacturer sources first. If unavailable, use trusted retailer or regulated reference sources only when they clearly match the exact product. Acceptable retailer examples include ${TRUSTED_RETAILER_HINTS.join(", ")}.`,
+    `Use exact-match trusted sources. Official brand or manufacturer pages are excellent, but exact-match trusted retailer or regulated reference sources are also acceptable when they clearly match the product. Acceptable retailer examples include ${TRUSTED_RETAILER_HINTS.join(", ")}.`,
     "Use provider web search only for factual fields such as ingredients, nutrition, technical specs, materials, dimensions, compatibility, or certifications.",
     "Match the exact brand, pack size, flavor, fat level, and product form. Do not reuse evidence from a different pack, variant, or format.",
-    "If an official source is close but not pack-specific, continue searching retailer sources for the exact pack instead of copying the near match.",
+    "If one trusted source is close but not exact-pack, continue searching for an exact match instead of copying the near match.",
     "When Shopify metaobject reference IDs are unavailable, still fill the parallel verified text fields such as custom.ingredients_text, custom.allergen_note, or custom.nutritional_facts if exact-pack evidence is available.",
-    "Treat a field as web_verified when supported by one official brand source or one exact-match trusted retailer source.",
+    "Treat a field as web_verified when supported by one exact-match trusted source, whether official or retailer.",
     "If data conflicts or cannot be verified confidently, skip the field and keep it empty."
   ];
 }
@@ -438,7 +445,7 @@ async function generateWithProvider(
   input: ProductRecord,
   policy: PolicyDocument,
   learningText: string
-): Promise<{ output: EnrichmentOutput; verificationUsed: boolean; verificationSources: Array<{ title?: string; url?: string; snippet?: string }> }> {
+): Promise<{ output: EnrichmentOutput; verificationUsed: boolean; verificationSources: Array<{ title?: string; url?: string; snippet?: string }>; usage?: ProviderUsage }> {
   const schema = buildEnrichmentSchema();
   const systemPrompt = buildSystemPrompt(getEnrichmentPromptSpec());
   const useWebVerification = shouldUseWebVerification(input, policy);
@@ -460,7 +467,7 @@ async function generateWithProvider(
   if (provider.provider.type === "openai") {
     const response = await createOpenAIJsonResponse<EnrichmentOutput>({
       apiKey: provider.credential.value,
-      model: provider.provider.model ?? "gpt-5-mini",
+      model: provider.provider.model ?? "gpt-5",
       instructions: systemPrompt,
       input: prompt,
       schema,
@@ -476,7 +483,8 @@ async function generateWithProvider(
     return {
       output: response.json,
       verificationUsed: useWebVerification,
-      verificationSources
+      verificationSources,
+      usage: response.usage
     };
   }
 
@@ -495,7 +503,8 @@ async function generateWithProvider(
     return {
       output: response.json,
       verificationUsed: useWebVerification,
-      verificationSources
+      verificationSources,
+      usage: response.usage
     };
   }
 
@@ -515,7 +524,8 @@ async function generateWithProvider(
     return {
       output: response.json,
       verificationUsed: useWebVerification,
-      verificationSources
+      verificationSources,
+      usage: response.usage
     };
   }
 
@@ -535,6 +545,7 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
   const warnings: string[] = [];
   const reasoning: string[] = [];
   let providerUsed: string | null = null;
+  let providerUsage: ProviderUsage | undefined;
   let verificationUsed = false;
   let verificationSources: Array<{ title?: string; url?: string; snippet?: string }> = [];
 
@@ -565,6 +576,14 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
       }
       if (generated.handle && !input.handle) {
         structuredChanges.handle = makeFieldChange(generated.handle, generated.confidence, "derived");
+      }
+      const sanitizedSeoTitle = sanitizeVerifiedTextValue(generated.seo_title);
+      if (sanitizedSeoTitle) {
+        structuredChanges.seo_title = makeFieldChange(sanitizedSeoTitle, generated.confidence, "derived");
+      }
+      const sanitizedSeoDescription = sanitizeVerifiedTextValue(generated.seo_description);
+      if (sanitizedSeoDescription) {
+        structuredChanges.seo_description = makeFieldChange(sanitizedSeoDescription, generated.confidence, "derived");
       }
       if (typeof generated.vendor === "string" && generated.vendor.trim() && !input.vendor) {
         structuredChanges.vendor = makeFieldChange(generated.vendor.trim(), generated.confidence, generatedResult.verificationUsed ? "web_verified" : "derived");
@@ -655,6 +674,7 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
       verificationUsed = generatedResult.verificationUsed;
       verificationSources = generatedResult.verificationSources;
       providerUsed = candidate.providerAlias;
+      providerUsage = mergeProviderUsages([generatedResult.usage]);
       break;
     } catch (error) {
       warnings.push(`Provider ${candidate.providerAlias} failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -673,6 +693,12 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
     }
     if (fallbackResult.handle && !input.handle) {
       structuredChanges.handle = makeFieldChange(fallbackResult.handle, fallbackResult.confidence, "derived");
+    }
+    if (typeof fallbackResult.seo_title === "string" && fallbackResult.seo_title.trim()) {
+      structuredChanges.seo_title = makeFieldChange(fallbackResult.seo_title.trim(), fallbackResult.confidence, "derived");
+    }
+    if (typeof fallbackResult.seo_description === "string" && fallbackResult.seo_description.trim()) {
+      structuredChanges.seo_description = makeFieldChange(fallbackResult.seo_description.trim(), fallbackResult.confidence, "derived");
     }
     if (fallbackResult.product_type && !input.product_type) {
       structuredChanges.product_type = makeFieldChange(fallbackResult.product_type, fallbackResult.confidence, "derived");
@@ -697,6 +723,9 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
         reasoning.push(`Collected ${verificationSources.length} verification source(s) for factual checks.`);
       }
     }
+    if (providerUsage?.total_tokens) {
+      reasoning.push(`Provider usage: ${providerUsage.input_tokens ?? 0} input tokens, ${providerUsage.output_tokens ?? 0} output tokens.`);
+    }
   }
 
   if (!input.brand && !input.vendor && !structuredChanges.brand && !structuredChanges.vendor) {
@@ -716,6 +745,7 @@ export async function runEnrich({ root, jobId, input, policy }: { root: string; 
     reasoning,
     artifacts: providerUsed ? {
       provider_used: providerUsed,
+      ...(providerUsage ? { provider_usage: providerUsage } : {}),
       web_verification_enabled: verificationUsed,
       verification_targets: getMissingHighRiskFactSignals(input, policy),
       verification_sources: verificationSources

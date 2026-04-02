@@ -4,11 +4,12 @@ import { getGuideImageRequirementSummary } from "../lib/catalog-guide.js";
 import { buildImagePromptPayload, buildSystemPrompt, getImagePromptSpec } from "../lib/prompt-specs.js";
 import { readText } from "../lib/fs.js";
 import { getCatalogPaths } from "../lib/paths.js";
+import { mergeProviderUsages } from "../lib/provider-usage.js";
 import { searchSerperImages } from "../connectors/serper.js";
 import { analyzeImageWithOpenAI } from "../connectors/openai.js";
 import { createGeminiJsonResponse } from "../connectors/gemini.js";
 import { dedupeTitleLikeText } from "../lib/product.js";
-import type { ImageReviewOutput, LooseRecord, PolicyDocument, ProductRecord, ResolvedProvider, RuntimeConfig } from "../types.js";
+import type { ImageReviewOutput, LooseRecord, PolicyDocument, ProductRecord, ProviderUsage, ResolvedProvider, RuntimeConfig } from "../types.js";
 
 type ImageCandidateInput = {
   url: string;
@@ -397,7 +398,7 @@ function imageReviewSchema() {
   };
 }
 
-async function analyzeCandidateWithVision(provider: ResolvedProvider, prompt: string, imageUrls: string[]): Promise<ImageReviewOutput> {
+async function analyzeCandidateWithVision(provider: ResolvedProvider, prompt: string, imageUrls: string[]): Promise<{ review: ImageReviewOutput; usage?: ProviderUsage }> {
   const schema = imageReviewSchema();
   const instructions = buildSystemPrompt(getImagePromptSpec());
 
@@ -411,7 +412,7 @@ async function analyzeCandidateWithVision(provider: ResolvedProvider, prompt: st
       schema,
       maxOutputTokens: 2200
     });
-    return response.json;
+    return { review: response.json, usage: response.usage };
   }
 
   if (provider.provider.type === "gemini") {
@@ -425,7 +426,7 @@ async function analyzeCandidateWithVision(provider: ResolvedProvider, prompt: st
       imageUrls,
       schema
     });
-    return response.json;
+    return { review: response.json, usage: response.usage };
   }
 
   throw new Error(`Unsupported vision provider type: ${provider.provider.type}`);
@@ -437,11 +438,12 @@ async function analyzeCandidatesIndividually(
   product: ProductRecord,
   learningText: string,
   candidateImages: ImageCandidateInput[]
-): Promise<ImageReviewOutput> {
+): Promise<{ review: ImageReviewOutput; usage?: ProviderUsage }> {
   const scoredCandidates: ImageReviewOutput["scored_candidates"] = [];
   const rejected: ImageReviewOutput["rejected"] = [];
   const findings = new Map<string, { type: string; message: string }>();
   const skippedReasons = new Set<string>();
+  const providerUsages: ProviderUsage[] = [];
 
   for (const candidate of candidateImages) {
     try {
@@ -457,7 +459,9 @@ async function analyzeCandidatesIndividually(
         learningText
       });
 
-      const review = await analyzeCandidateWithVision(provider, prompt, [candidate.url]);
+      const candidateResult = await analyzeCandidateWithVision(provider, prompt, [candidate.url]);
+      const review = candidateResult.review;
+      if (candidateResult.usage) providerUsages.push(candidateResult.usage);
       const scored = review.scored_candidates?.[0];
 
       if (scored) {
@@ -526,16 +530,19 @@ async function analyzeCandidatesIndividually(
   }
 
   return {
-    status: hero ? "PASS" : "FAIL",
-    confidence: hero?.confidence ?? Math.max(0, ...approvedCandidates.map((candidate) => candidate.confidence)),
-    selected: {
-      hero,
-      secondary
+    review: {
+      status: hero ? "PASS" : "FAIL",
+      confidence: hero?.confidence ?? Math.max(0, ...approvedCandidates.map((candidate) => candidate.confidence)),
+      selected: {
+        hero,
+        secondary
+      },
+      scored_candidates: scoredCandidates,
+      rejected,
+      findings: [...findings.values()],
+      skipped_reasons: [...skippedReasons]
     },
-    scored_candidates: scoredCandidates,
-    rejected,
-    findings: [...findings.values()],
-    skipped_reasons: [...skippedReasons]
+    usage: mergeProviderUsages(providerUsages)
   };
 }
 
@@ -614,21 +621,24 @@ async function analyzeCandidatesInBatches(
   learningText: string,
   candidateImages: ImageCandidateInput[],
   batchSize = 3
-): Promise<{ review: ImageReviewOutput; processedBatches: number; totalBatches: number }> {
+): Promise<{ review: ImageReviewOutput; processedBatches: number; totalBatches: number; usage?: ProviderUsage }> {
   const reviews: ImageReviewOutput[] = [];
+  const usages: ProviderUsage[] = [];
   const totalBatches = Math.max(1, Math.ceil(candidateImages.length / batchSize));
 
   for (let index = 0; index < candidateImages.length; index += batchSize) {
     const batch = candidateImages.slice(index, index + batchSize);
-    const review = await analyzeCandidatesIndividually(provider, policy, product, learningText, batch);
-    reviews.push(review);
+    const batchResult = await analyzeCandidatesIndividually(provider, policy, product, learningText, batch);
+    reviews.push(batchResult.review);
+    if (batchResult.usage) usages.push(batchResult.usage);
 
-    const approvedHero = review.selected?.hero;
-    if (review.status === "PASS" && approvedHero && approvedHero.confidence >= 0.7) {
+    const approvedHero = batchResult.review.selected?.hero;
+    if (batchResult.review.status === "PASS" && approvedHero && approvedHero.confidence >= 0.7) {
       return {
         review: mergeImageReviews(reviews),
         processedBatches: reviews.length,
-        totalBatches
+        totalBatches,
+        usage: mergeProviderUsages(usages)
       };
     }
   }
@@ -636,7 +646,8 @@ async function analyzeCandidatesInBatches(
   return {
     review: mergeImageReviews(reviews),
     processedBatches: reviews.length,
-    totalBatches
+    totalBatches,
+    usage: mergeProviderUsages(usages)
   };
 }
 
@@ -809,6 +820,7 @@ export async function runImageOptimize({
 
   let needsReview = true;
   let nextActions = ["Review image findings before applying image updates."];
+  let providerUsage: ProviderUsage | undefined;
 
   try {
     const batchResult = await analyzeCandidatesInBatches(
@@ -820,6 +832,7 @@ export async function runImageOptimize({
       3
     );
     const review = batchResult.review;
+    providerUsage = batchResult.usage;
     proposedChanges.image_review = review;
 
     const allowedUrls = filteredCandidates.map((candidate) => candidate.url);
@@ -854,6 +867,9 @@ export async function runImageOptimize({
       warnings.push(`Skipped: ${review.skipped_reasons.join(", ")}`);
     }
     reasoning.push(`Image review status: ${review.status} with confidence ${review.confidence.toFixed(2)}.`);
+    if (providerUsage?.total_tokens) {
+      reasoning.push(`Vision usage: ${providerUsage.input_tokens ?? 0} input tokens, ${providerUsage.output_tokens ?? 0} output tokens.`);
+    }
     const imagePassed = review.status === "PASS" && Boolean(selectedHero) && review.confidence >= 0.7;
     needsReview = !imagePassed;
     nextActions = imagePassed
@@ -872,6 +888,10 @@ export async function runImageOptimize({
     proposedChanges,
     warnings: [...new Set(warnings)],
     reasoning,
+    artifacts: {
+      ...(providerReady(visionProvider) ? { provider_used: visionProvider.providerAlias } : {}),
+      ...(providerUsage ? { provider_usage: providerUsage } : {})
+    },
     nextActions
   });
 }

@@ -9,10 +9,13 @@ import { analyzeImageWithOpenAI } from "../dist/connectors/openai.js";
 import { createOpenAIJsonResponse } from "../dist/connectors/openai.js";
 import { createGeminiJsonResponse } from "../dist/connectors/gemini.js";
 import { buildGeneratedProduct, writeShopifyImportCsv } from "../dist/lib/generated.js";
+import { loadOpenAICodexAuthSession } from "../dist/lib/credentials.js";
 import { buildStarterPolicy, initialLearningMarkdown, renderPolicyMarkdown } from "../dist/lib/policy-template.js";
+import { hasPopulatedProductField } from "../dist/lib/product.js";
+import { sanitizeProviderEvaluationAgainstInput } from "../dist/modules/qa.js";
 import { sanitizeCustomerFacingDescription, shouldUseWebVerification } from "../dist/modules/enrich.js";
 import { buildImageSearchQueries, buildImageSearchQuery, evaluateImageCandidateUrl, rankImageCandidates } from "../dist/modules/image-optimize.js";
-import { loadRecordsFromSource } from "../dist/modules/ingest.js";
+import { loadRecordsFromSource, loadRecordsFromText } from "../dist/modules/ingest.js";
 import { runMatchDecision } from "../dist/modules/match.js";
 
 async function createTempProject() {
@@ -72,11 +75,114 @@ const tests = [
       const markdown = renderPolicyMarkdown(policy);
       assert.match(markdown, /## How To Use This Guide/);
       assert.match(markdown, /### Variant Decision Playbook/);
-      assert.match(markdown, /## Worked Examples/);
+      assert.match(markdown, /## Worked Examples & Operator Guidance/);
       assert.match(markdown, /duplicates/i);
       assert.match(markdown, /new variants/i);
       assert.match(markdown, /## Agentic Commerce Readiness/);
-      assert.match(markdown, /Recommended Metafields/);
+      assert.match(markdown, /Recommended Metafields To Add/);
+      assert.doesNotMatch(markdown, /Audience: requires_review/i);
+    }
+  },
+  {
+    name: "OpenAI connector returns usage metadata when available",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "{\"status\":\"ok\"}"
+                }
+              ]
+            }
+          ],
+          usage: {
+            input_tokens: 1200,
+            output_tokens: 300,
+            total_tokens: 1500,
+            input_tokens_details: {
+              cached_tokens: 100,
+              cache_read_tokens: 50
+            },
+            output_tokens_details: {
+              reasoning_tokens: 25
+            }
+          }
+        })
+      }) as Response;
+
+      try {
+        const response = await createOpenAIJsonResponse<{ status: string }>({
+          apiKey: "test",
+          model: "gpt-5",
+          instructions: "Return JSON",
+          input: "test",
+          schema: {
+            name: "test_schema",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: { status: { type: "string" } },
+              required: ["status"]
+            }
+          }
+        });
+        assert.equal(response.usage?.input_tokens, 1200);
+        assert.equal(response.usage?.output_tokens, 300);
+        assert.equal(response.usage?.total_tokens, 1500);
+        assert.equal(response.usage?.reasoning_tokens, 25);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  },
+  {
+    name: "Gemini connector returns usage metadata when available",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: "{\"status\":\"ok\"}" }
+                ]
+              }
+            }
+          ],
+          usageMetadata: {
+            promptTokenCount: 900,
+            candidatesTokenCount: 200,
+            totalTokenCount: 1100
+          }
+        })
+      }) as Response;
+
+      try {
+        const response = await createGeminiJsonResponse<{ status: string }>({
+          apiKey: "test",
+          model: "gemini-2.5-flash",
+          textPrompt: "Return JSON",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: { status: { type: "string" } },
+            required: ["status"]
+          }
+        });
+        assert.equal(response.usage?.input_tokens, 900);
+        assert.equal(response.usage?.output_tokens, 200);
+        assert.equal(response.usage?.total_tokens, 1100);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     }
   },
   {
@@ -98,6 +204,95 @@ const tests = [
           }
         ]
       }, groceryPolicy), false);
+    }
+  },
+  {
+    name: "product field aliases treat body_html and description_html as the same populated field",
+    run: async () => {
+      assert.equal(hasPopulatedProductField({
+        description_html: "<p>Example</p>"
+      }, "body_html"), true);
+      assert.equal(hasPopulatedProductField({
+        body_html: "<p>Example</p>"
+      }, "description_html"), true);
+    }
+  },
+  {
+    name: "auth set stores provider model in runtime config",
+    run: async () => {
+      const cwd = await createTempProject();
+      const tempHome = await createTempProject();
+      const originalUserProfile = process.env.USERPROFILE;
+      const originalHome = process.env.HOME;
+      process.env.USERPROFILE = tempHome;
+      process.env.HOME = tempHome;
+      const io = writer();
+      try {
+        await runCli(["init"], { cwd, stdout: io, stderr: io });
+        const code = await runCli(["auth", "set", "--provider", "openai", "--value", "sk-test", "--model", "gpt-5-mini"], { cwd, stdout: io, stderr: io });
+        assert.equal(code, 0);
+        const runtime = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "config", "runtime.json"), "utf8"));
+        assert.equal(runtime.providers.openai_default.model, "gpt-5-mini");
+      } finally {
+        process.env.USERPROFILE = originalUserProfile;
+        process.env.HOME = originalHome;
+      }
+    }
+  },
+  {
+    name: "OpenAI auth session import returns null when Codex auth has no reusable API key",
+    run: async () => {
+      const tempHome = await createTempProject();
+      const originalUserProfile = process.env.USERPROFILE;
+      const originalHome = process.env.HOME;
+      process.env.USERPROFILE = tempHome;
+      process.env.HOME = tempHome;
+      await fs.mkdir(path.join(tempHome, ".codex"), { recursive: true });
+      await fs.writeFile(path.join(tempHome, ".codex", "auth.json"), JSON.stringify({
+        auth_mode: "chatgpt",
+        OPENAI_API_KEY: null,
+        last_refresh: "2026-04-02T00:00:00.000Z"
+      }, null, 2));
+
+      try {
+        const session = await loadOpenAICodexAuthSession();
+        assert.equal(session, null);
+      } finally {
+        process.env.USERPROFILE = originalUserProfile;
+        process.env.HOME = originalHome;
+      }
+    }
+  },
+  {
+    name: "auth login openai imports local Codex API key and updates selected model",
+    run: async () => {
+      const cwd = await createTempProject();
+      const tempHome = await createTempProject();
+      const originalUserProfile = process.env.USERPROFILE;
+      const originalHome = process.env.HOME;
+      process.env.USERPROFILE = tempHome;
+      process.env.HOME = tempHome;
+      await fs.mkdir(path.join(tempHome, ".codex"), { recursive: true });
+      await fs.writeFile(path.join(tempHome, ".codex", "auth.json"), JSON.stringify({
+        auth_mode: "chatgpt",
+        OPENAI_API_KEY: "sk-from-codex",
+        last_refresh: "2026-04-02T00:00:00.000Z"
+      }, null, 2));
+
+      const io = writer();
+      try {
+        await runCli(["init"], { cwd, stdout: io, stderr: io });
+        const code = await runCli(["auth", "login", "--provider", "openai", "--model", "gpt-5"], { cwd, stdout: io, stderr: io });
+        assert.equal(code, 0);
+        const runtime = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "config", "runtime.json"), "utf8"));
+        const credentials = JSON.parse(await fs.readFile(path.join(tempHome, ".catalog-toolkit", "credentials.json"), "utf8"));
+        assert.equal(runtime.providers.openai_default.model, "gpt-5");
+        assert.equal(credentials.openai.value, "sk-from-codex");
+        assert.equal(credentials.openai.source, "oauth");
+      } finally {
+        process.env.USERPROFILE = originalUserProfile;
+        process.env.HOME = originalHome;
+      }
     }
   },
   {
@@ -423,6 +618,41 @@ const tests = [
     }
   },
   {
+    name: "ingest parses plain text title-price lines",
+    run: async () => {
+      const records = loadRecordsFromText(`
+Almarai Fresh Milk Low Fat 1L - 8.50
+Baladna Greek Yogurt Plain 500g - 12.50
+      `);
+      assert.equal(records.length, 2);
+      assert.equal(records[0].title, "Almarai Fresh Milk Low Fat 1L");
+      assert.equal(records[0].price, "8.50");
+      assert.equal(records[1].title, "Baladna Greek Yogurt Plain 500g");
+      assert.equal(records[1].price, "12.50");
+    }
+  },
+  {
+    name: "ingest parses plain text key value blocks",
+    run: async () => {
+      const records = loadRecordsFromText(`
+title: Uniqlo Club T-Shirt
+brand: Uniqlo
+price: 29.00
+size: Large
+
+title: JBL Tune 520BT Wireless On-Ear Headphones Black
+brand: JBL
+price: 199
+      `);
+      assert.equal(records.length, 2);
+      assert.equal(records[0].title, "Uniqlo Club T-Shirt");
+      assert.equal(records[0].brand, "Uniqlo");
+      assert.equal(records[0].size, "Large");
+      assert.equal(records[1].title, "JBL Tune 520BT Wireless On-Ear Headphones Black");
+      assert.equal(records[1].price, "199");
+    }
+  },
+  {
     name: "qa fails when customer-facing description contains review placeholder text",
     run: async () => {
       const cwd = await createTempProject();
@@ -482,7 +712,7 @@ const tests = [
       const sanitized = sanitizeCustomerFacingDescription({
         title: "Baladna Greek Yogurt Plain 500g",
         description: "",
-        description_html: "<h3>Overview</h3><p>Thick and creamy yogurt for breakfasts and cooking.</p><h3>Ingredients Or Composition</h3><p>Exact on-pack ingredients require verification before publishing.</p><h3>Storage Or Handling</h3><p>Keep refrigerated.</p>",
+        description_html: "<h3>Overview</h3><p>Thick and creamy yogurt for breakfasts and cooking.</p><h3>Ingredients Or Composition</h3><p>Exact on-pack ingredients are under review before publishing.</p><h3>Storage Or Handling</h3><p>Keep refrigerated.</p>",
         handle: "baladna-greek-yogurt-plain-500g",
         vendor: "Baladna",
         brand: "Baladna",
@@ -586,6 +816,48 @@ const tests = [
       assert.equal(Array.isArray(result.proposed_action.option_values), true);
       assert.equal(result.proposed_action.option_values[0].name, "Color");
       assert.equal(result.proposed_action.option_values[0].value, "Black");
+    }
+  },
+  {
+    name: "match treats equivalent unit wording as duplicate when no real variant value exists",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "food_and_beverage", businessName: "Test Store" });
+      const result = runMatchDecision({
+        jobId: "job-dup-grocery",
+        input: {
+          title: "Baladna Greek Yogurt Plain 500 Gram"
+        },
+        catalog: [
+          {
+            id: "prod-yogurt",
+            title: "Baladna Greek Yogurt Plain 500g"
+          }
+        ],
+        policy
+      });
+      assert.equal(result.decision, "DUPLICATE");
+      assert.equal(result.proposed_action.action, "skip_duplicate");
+    }
+  },
+  {
+    name: "match blocks new variant when family matched but no shopper-facing option value is available",
+    run: async () => {
+      const policy = buildStarterPolicy({ industry: "apparel", businessName: "Test Store" });
+      const result = runMatchDecision({
+        jobId: "job-review-variant",
+        input: {
+          title: "Uniqlo Club T-Shirt"
+        },
+        catalog: [
+          {
+            id: "prod-shirt",
+            title: "Uniqlo Club T-Shirt Blue"
+          }
+        ],
+        policy
+      });
+      assert.equal(result.decision, "NEEDS_REVIEW");
+      assert.equal(result.proposed_action.action, "manual_review");
     }
   },
   {
@@ -934,8 +1206,10 @@ const tests = [
       const reviewQueue = await fs.readFile(path.join(cwd, ".catalog", "generated", "review-queue.csv"), "utf8");
       assert.match(reviewQueue, /product_key,source_record_id/);
       assert.match(reviewQueue, /p1|fresh-milk/);
+      io.text = "";
+      await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
-      assert.match(shopifyImport, /Title,Handle,Body \(HTML\),Vendor/);
+      assert.match(shopifyImport, /Title,URL handle,Description,Vendor/);
       assert.match(shopifyImport, /Country Of Origin \(product\.metafields\.custom\.country_of_origin\)/);
       assert.match(shopifyImport, /Fresh Milk Chocolate 1L/);
       assert.match(shopifyImport, /Saudi Arabia/);
@@ -943,7 +1217,7 @@ const tests = [
       const excelWorkbookPath = path.join(cwd, ".catalog", "generated", "catalog-review.xlsx");
       const excelWorkbookBuffer = await fs.readFile(excelWorkbookPath);
       const workbook = XLSX.read(excelWorkbookBuffer, { type: "buffer" });
-      assert.deepEqual(workbook.SheetNames, ["Runs", "Generated Products", "Images", "Metafields", "Shopify Import"]);
+      assert.deepEqual(workbook.SheetNames, ["Runs", "Generated Products", "Images", "Metafields", "Pending Review", "Shopify Import"]);
       const generatedProductsSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Generated Products"]);
       assert.equal(generatedProductsSheet[0]["Featured Image"], "https://example.com/fresh-milk.jpg");
       assert.match(generatedProductsSheet[0].Metafields, /custom\.country_of_origin=Saudi Arabia/);
@@ -955,6 +1229,35 @@ const tests = [
       assert.equal(originMetafield.Value, "Saudi Arabia");
       const shopifyImportSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Shopify Import"]);
       assert.equal(shopifyImportSheet[0]["Country Of Origin (product.metafields.custom.country_of_origin)"], "Saudi Arabia");
+    }
+  },
+  {
+    name: "workflow run accepts pasted text input",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, {
+        industry: "grocery",
+        businessName: "Text Input Store",
+        businessDescription: "A store testing pasted product text."
+      });
+      const catalogPath = path.join(cwd, "empty-catalog.json");
+      await fs.writeFile(catalogPath, "[]");
+      io.text = "";
+      const code = await runCli([
+        "workflow",
+        "run",
+        "--text",
+        "Almarai Fresh Milk Low Fat 1L - 8.50\nBaladna Greek Yogurt Plain 500g - 12.50",
+        "--catalog",
+        catalogPath,
+        "--json"
+      ], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const workflow = JSON.parse(io.text);
+      assert.equal(workflow.processed, 2);
+      assert.equal(workflow.input, "--text");
     }
   },
   {
@@ -981,16 +1284,18 @@ const tests = [
       io.text = "";
       const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(code, 0);
+      io.text = "";
+      await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const generatedProduct = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "generated", "products", "e1.json"), "utf8"));
       assert.equal(generatedProduct.vendor ?? "", "");
       const workbook = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
       const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Shopify Import"]);
       const row = rows[0];
       assert.equal(row["Vendor"], "");
-      assert.equal(row["Option1 Name"], "Title");
-      assert.equal(row["Option1 Value"], "Default Title");
-      assert.equal(row["Option2 Name"], "");
-      assert.equal(row["Option3 Name"], "");
+      assert.equal(row["Option1 name"], "Title");
+      assert.equal(row["Option1 value"], "Default Title");
+      assert.equal(row["Option2 name"], "");
+      assert.equal(row["Option3 name"], "");
     }
   },
   {
@@ -1022,6 +1327,8 @@ const tests = [
       io.text = "";
       const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(code, 0);
+      io.text = "";
+      await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
       assert.doesNotMatch(shopifyImport, /Almarai Fresh Milk Lowfat 1L/);
     }
@@ -1055,6 +1362,8 @@ const tests = [
       io.text = "";
       const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(code, 0);
+      io.text = "";
+      await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
       const occurrences = (shopifyImport.match(/anker-20w-usb-c-charger/g) ?? []).length;
       assert.equal(occurrences, 1);
@@ -1167,6 +1476,8 @@ const tests = [
       io.text = "";
       const code = await runCli(["workflow", "run", "--input", inputPath, "--catalog", catalogPath, "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(code, 0);
+      io.text = "";
+      await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
       assert.match(shopifyImport, /uniqlo-club-t-shirt/);
       assert.match(shopifyImport, /Medium/);
@@ -1219,9 +1530,93 @@ const tests = [
       const csv = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
       const workbook = XLSX.read(csv, { type: "string" });
       const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]]);
-      const blackRow = rows.find((row) => row["Option1 Value"] === "Black");
+      const blackRow = rows.find((row) => row["Option1 value"] === "Black");
       assert.ok(blackRow);
-      assert.equal(blackRow["Option1 Name"], "color");
+      assert.equal(blackRow["Option1 name"], "color");
+    }
+  },
+  {
+    name: "shopify export normalizes family title by moving shared variant value out of the base title",
+    run: async () => {
+      const cwd = await createTempProject();
+      const policy = buildStarterPolicy({ industry: "food_and_beverage", businessName: "Family Title Store" });
+      await seedGuideFiles(cwd, { industry: "food_and_beverage", businessName: "Family Title Store" });
+      await writeShopifyImportCsv(cwd, [
+        {
+          id: "yogurt-parent",
+          title: "Baladna Greek Yogurt Plain 500g",
+          handle: "baladna-greek-yogurt-plain-500g",
+          vendor: "Baladna",
+          brand: "Baladna",
+          product_type: "Greek Yogurt",
+          price: "12.50"
+        },
+        {
+          id: "yogurt-child",
+          title: "Baladna Greek Yogurt Plain 500g",
+          vendor: "Baladna",
+          brand: "Baladna",
+          product_type: "Greek Yogurt",
+          price: "12.50",
+          _catalog_match: {
+            decision: "NEW_VARIANT",
+            needs_review: false,
+            matched_product_id: "yogurt-parent",
+            proposed_action: {
+              action: "attach_as_variant",
+              product_id: "yogurt-parent",
+              product_title: "Baladna Greek Yogurt Plain 500g",
+              option_values: [
+                {
+                  name: "Type",
+                  value: "Plain"
+                }
+              ]
+            }
+          }
+        }
+      ], policy);
+
+      const csv = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
+      const workbook = XLSX.read(csv, { type: "string" });
+      const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]]);
+      assert.equal(rows[0]["Title"], "Baladna Greek Yogurt 500g");
+      assert.equal(rows[0]["Option1 value"], "Plain");
+    }
+  },
+  {
+    name: "qa does not fail omitted compliance sections when high-risk facts are intentionally skipped",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, {
+        industry: "food_and_beverage",
+        businessName: "Safe Omission Store",
+        businessDescription: "A store validating skipped high-risk facts do not force QA failure."
+      });
+
+      const inputPath = path.join(cwd, "safe-omission-product.json");
+      await fs.writeFile(inputPath, JSON.stringify({
+        id: "safe-omit-1",
+        title: "Baladna Greek Yogurt Plain 500g",
+        handle: "baladna-greek-yogurt-plain-500g",
+        vendor: "Baladna",
+        brand: "Baladna",
+        product_type: "Greek Yogurt",
+        description_html: "<h3>Overview</h3><p>Greek-style plain yogurt.</p><h3>Key Product Details</h3><p>500g refrigerated tub.</p>",
+        featured_image: "https://example.com/yogurt.jpg",
+        images: ["https://example.com/yogurt.jpg"],
+        price: "12.50"
+      }, null, 2));
+
+      io.text = "";
+      const code = await runCli(["qa", "--input", inputPath, "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const output = JSON.parse(io.text);
+      const findings = output.result?.proposed_changes?.qa_findings ?? [];
+      assert.equal(findings.some((finding: { field?: string; expected?: string }) => finding.field === "description_html" && /Ingredients Or Composition/i.test(String(finding.expected ?? ""))), false);
+      assert.equal(findings.some((finding: { field?: string }) => /custom\.(ingredients_text|allergens|nutrition_facts|nutritional_facts)/i.test(String(finding.field ?? ""))), false);
     }
   },
   {
@@ -1242,11 +1637,93 @@ const tests = [
       assert.equal(queueCode, 0);
       const queue = JSON.parse(io.text);
       assert.equal(queue.count > 0, true);
+      const workbookBefore = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
+      const pendingBefore = XLSX.utils.sheet_to_json<Record<string, string>>(workbookBefore.Sheets["Pending Review"]);
+      assert.equal(pendingBefore.length > 0, true);
       io.text = "";
       const bulkCode = await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       assert.equal(bulkCode, 0);
       const bulk = JSON.parse(io.text);
       assert.equal(bulk.count > 0, true);
+      io.text = "";
+      const queueAfterCode = await runCli(["review", "queue", "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(queueAfterCode, 0);
+      const queueAfter = JSON.parse(io.text);
+      assert.equal(queueAfter.count, 0);
+      const workbookAfter = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
+      const pendingAfter = XLSX.utils.sheet_to_json<Record<string, string>>(workbookAfter.Sheets["Pending Review"]);
+      assert.equal(pendingAfter.length, 0);
+      const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
+      assert.match(shopifyImport, /Title,URL handle,Description,Vendor/);
+    }
+  },
+  {
+    name: "qa does not fail required body_html when description_html is present",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, {
+        industry: "apparel",
+        businessName: "QA Alias Store",
+        businessDescription: "A store validating description field aliases."
+      });
+
+      const inputPath = path.join(cwd, "qa-alias-product.json");
+      await fs.writeFile(inputPath, JSON.stringify({
+        id: "qa-alias-1",
+        title: "Uniqlo Club T-Shirt",
+        handle: "uniqlo-club-t-shirt",
+        vendor: "Uniqlo",
+        brand: "Uniqlo",
+        product_type: "T-Shirts",
+        description_html: "<h3>Overview</h3><p>Everyday cotton t-shirt.</p><h3>Key Features</h3><p>Soft and breathable.</p><h3>Material And Fit</h3><p>100% cotton with a regular fit.</p><h3>Care Or Usage</h3><p>Machine wash cold.</p>",
+        featured_image: "https://example.com/shirt.jpg",
+        images: ["https://example.com/shirt.jpg"],
+        price: "29.00"
+      }, null, 2));
+
+      io.text = "";
+      const code = await runCli(["qa", "--input", inputPath, "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const output = JSON.parse(io.text);
+      const findings = output.result?.proposed_changes?.qa_findings ?? [];
+      assert.equal(findings.some((finding: { field?: string; issue_type?: string }) => finding.field === "body_html" && finding.issue_type === "missing"), false);
+    }
+  },
+  {
+    name: "provider QA findings drop body_html missing errors when description_html is already populated",
+    run: async () => {
+      const sanitized = sanitizeProviderEvaluationAgainstInput(
+        {
+          description_html: "<p>Ready</p>"
+        },
+        {
+          score: 75,
+          status: "FAIL",
+          confidence: 0.9,
+          summary: {
+            critical_issues: 1,
+            major_issues: 0,
+            minor_issues: 0
+          },
+          findings: [
+            {
+              field: "body_html",
+              issue_type: "missing_required_field",
+              severity: "critical",
+              message: "Required Shopify field body_html is missing.",
+              expected: "A populated body_html field.",
+              actual: "description_html present instead.",
+              deduction: 25
+            }
+          ],
+          skipped_reasons: []
+        }
+      );
+      assert.equal(sanitized.findings.length, 0);
+      assert.equal(sanitized.score, 100);
+      assert.equal(sanitized.summary.critical_issues, 0);
     }
   },
   {

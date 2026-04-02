@@ -1,4 +1,4 @@
-import type { ProductRecord } from "../types.js";
+import type { LooseRecord, ProductRecord } from "../types.js";
 
 const BRAND_STOP_TOKENS = new Set([
   "with",
@@ -39,12 +39,45 @@ export function inferVendor(product: ProductRecord): string {
   return "";
 }
 
+const FIELD_ALIASES: Record<string, string[]> = {
+  description_html: ["description_html", "body_html"],
+  body_html: ["body_html", "description_html"]
+};
+
+function isFilledValue(value: unknown): boolean {
+  return !(
+    value === undefined
+    || value === null
+    || value === ""
+    || (Array.isArray(value) && value.length === 0)
+  );
+}
+
+export function getProductFieldAliases(fieldName: string): string[] {
+  const normalized = fieldName.trim().toLowerCase();
+  const aliases = FIELD_ALIASES[normalized] ?? [fieldName];
+  return [...new Set(aliases)];
+}
+
+export function getProductFieldValue(product: ProductRecord, fieldName: string): unknown {
+  for (const alias of getProductFieldAliases(fieldName)) {
+    const value = product[alias];
+    if (isFilledValue(value)) return value;
+  }
+  return product[fieldName];
+}
+
+export function hasPopulatedProductField(product: ProductRecord, fieldName: string): boolean {
+  return isFilledValue(getProductFieldValue(product, fieldName));
+}
+
 export function hasReviewPlaceholder(value: string): boolean {
   const normalized = value.toLowerCase();
   return [
     "requires review",
     "requires_review",
     "unknown_requires_review",
+    "under review",
     "to be confirmed",
     "to be verified",
     "pending verification",
@@ -55,7 +88,20 @@ export function hasReviewPlaceholder(value: string): boolean {
     "verification before publishing",
     "confirm on-pack",
     "confirm on pack",
-    "brand confirmation"
+    "brand confirmation",
+    "once verified",
+    "once confirmed",
+    "not verified",
+    "not yet verified",
+    "not shown",
+    "ingredients not shown",
+    "see pack",
+    "check pack",
+    "on delivery",
+    "exact label text",
+    "label ingredients",
+    "exact pack could not be verified",
+    "pack not verified"
   ].some((token) => normalized.includes(token));
 }
 
@@ -136,4 +182,33 @@ export function normalizeDescriptionPair(value: string): { description: string; 
     description: trimmed,
     description_html: textToHtml(trimmed)
   };
+}
+
+function clipText(value: string, maxLength: number): string {
+  const trimmed = value.trim().replace(/\s+/g, " ");
+  if (trimmed.length <= maxLength) return trimmed;
+  const clipped = trimmed.slice(0, maxLength - 1).trim();
+  return `${clipped}…`;
+}
+
+export function deriveSeoTitle(product: LooseRecord): string {
+  const direct = typeof product.seo_title === "string" ? product.seo_title.trim() : "";
+  if (direct) return clipText(direct, 70);
+
+  const title = typeof product.title === "string" ? product.title.trim() : "";
+  if (!title) return "";
+  return clipText(title, 70);
+}
+
+export function deriveSeoDescription(product: LooseRecord): string {
+  const direct = typeof product.seo_description === "string" ? product.seo_description.trim() : "";
+  if (direct) return clipText(htmlToText(direct), 160);
+
+  const source = typeof product.description_html === "string" && product.description_html.trim()
+    ? product.description_html
+    : typeof product.description === "string"
+      ? product.description
+      : "";
+  if (!source) return "";
+  return clipText(htmlToText(source), 160);
 }

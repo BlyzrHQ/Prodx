@@ -8,18 +8,18 @@ import { pathToFileURL } from "node:url";
 import { parseArgs, requireFlag } from "./lib/args.js";
 import { materializeProposedChanges } from "./lib/change-records.js";
 import { initWorkspace, loadRuntimeConfig, saveRuntimeConfig, setRuntimeValue, getRuntimeValue } from "./lib/runtime.js";
-import { setCredential, setOAuthCredential, listCredentials, testCredential } from "./lib/credentials.js";
+import { setCredential, setOAuthCredential, listCredentials, testCredential, loadOpenAICodexAuthSession } from "./lib/credentials.js";
 import { getWorkspaceRoot, getCatalogPaths } from "./lib/paths.js";
 import { readJson, readText, writeJson } from "./lib/fs.js";
 import { createRun, loadRun, writeModuleArtifacts, writeDecision, writeApplyResult } from "./lib/artifacts.js";
-import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writeReviewQueueCsv, writeShopifyImportCsv, writeWorkflowProductsLedger } from "./lib/generated.js";
+import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writePendingReviewQueueCsv, writeReviewQueueCsv, writeShopifyImportCsv, writeWorkflowProductsLedger } from "./lib/generated.js";
 import { resolveProvider } from "./lib/providers.js";
 import { getGuidePassingScore } from "./lib/catalog-guide.js";
 import { INDUSTRY_OPTIONS } from "./lib/policy-template.js";
 import { testShopifyConnection, fetchShopifyCatalogSnapshot, applyShopifyPayload, authenticateShopifyViaOAuth } from "./connectors/shopify.js";
 import { authenticateGeminiViaOAuth } from "./connectors/gemini.js";
 import { runExpertGenerate } from "./modules/expert.js";
-import { loadRecordsFromSource, runIngest } from "./modules/ingest.js";
+import { loadRecordsFromSource, loadRecordsFromText, runIngest } from "./modules/ingest.js";
 import { runMatchDecision, buildCatalogIndex } from "./modules/match.js";
 import { runEnrich } from "./modules/enrich.js";
 import { runImageOptimize } from "./modules/image-optimize.js";
@@ -32,6 +32,24 @@ type Flags = Record<string, string | boolean>;
 type OutputMode = "json" | "text";
 type ModuleRunner = (args: { root: string; jobId: string; input: ProductRecord; policy?: PolicyDocument; runtimeConfig?: RuntimeConfig }) => Promise<ModuleResult> | ModuleResult;
 type ExecutedModule = { job_id: string; run_dir: string; result: ModuleResult };
+
+const LLM_PROVIDER_ALIAS_BY_NAME: Record<string, string> = {
+  openai: "openai_default",
+  gemini: "gemini_flash_default",
+  anthropic: "anthropic_default"
+};
+
+const LLM_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
+  openai: "gpt-5",
+  gemini: "gemini-2.5-flash",
+  anthropic: "claude-sonnet-4-20250514"
+};
+
+const LLM_PROVIDER_MODEL_CHOICES: Record<string, string[]> = {
+  openai: ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4.1-mini", "custom"],
+  gemini: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "custom"],
+  anthropic: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-7-sonnet-latest", "custom"]
+};
 
 function getOutputMode(flags: Flags): OutputMode {
   return flags.json ? "json" : "text";
@@ -414,6 +432,33 @@ async function loadInputFile(filePath: string): Promise<LooseRecord> {
   return JSON.parse(await readText(filePath, "")) as LooseRecord;
 }
 
+async function loadRecordsFromFlags(root: string, flags: Flags, message = "Use --input <file> or --text \"...\"."): Promise<{ records: LooseRecord[]; sourceLabel: string }> {
+  const textValue = typeof flags.text === "string" ? String(flags.text) : "";
+  if (textValue.trim()) {
+    return {
+      records: loadRecordsFromText(textValue),
+      sourceLabel: "--text"
+    };
+  }
+
+  const inputPath = requireFlag(flags, "input", message);
+  return {
+    records: await loadRecordsFromSource(path.resolve(root, inputPath)),
+    sourceLabel: inputPath
+  };
+}
+
+async function loadSingleRecordFromFlags(root: string, flags: Flags, message = "Use --input <file> or --text \"...\"."): Promise<{ record: ProductRecord; sourceLabel: string }> {
+  const { records, sourceLabel } = await loadRecordsFromFlags(root, flags, message);
+  if (records.length === 0) {
+    throw new Error("No product records were found in the provided input.");
+  }
+  if (records.length > 1) {
+    throw new Error("This command accepts a single product. Use `catalog batch ...` or `catalog workflow run ...` for multiple records.");
+  }
+  return { record: records[0] as ProductRecord, sourceLabel };
+}
+
 async function getPolicyOrThrow(root: string): Promise<PolicyDocument> {
   const policy = await readJson<PolicyDocument | null>(getCatalogPaths(root).policyJson, null);
   if (!policy) throw new Error("No Catalog Guide found. Run `catalog guide generate` or `catalog expert generate` first.");
@@ -545,6 +590,30 @@ async function askYesNo(rl: readline.Interface, prompt: string, defaultValue = t
   return ["y", "yes"].includes(answer);
 }
 
+function getLlmProviderAlias(providerName: string): string {
+  return LLM_PROVIDER_ALIAS_BY_NAME[providerName] ?? `${providerName}_default`;
+}
+
+function getDefaultModelForProvider(providerName: string): string {
+  return LLM_PROVIDER_DEFAULT_MODELS[providerName] ?? "";
+}
+
+async function askProviderModel(rl: readline.Interface, providerName: string, currentModel = ""): Promise<string> {
+  const defaultModel = currentModel || getDefaultModelForProvider(providerName);
+  const options = [...new Set([...(LLM_PROVIDER_MODEL_CHOICES[providerName] ?? []), defaultModel, "custom"].filter(Boolean))];
+  const selected = await askChoice(rl, `Model for ${providerName}`, options, options.includes(defaultModel) ? defaultModel : options[0]);
+  if (selected === "custom") {
+    return askText(rl, `Custom model for ${providerName}`, defaultModel);
+  }
+  return selected;
+}
+
+function applyProviderModelToRuntime(runtime: RuntimeConfig, providerName: string, model: string): void {
+  const alias = getLlmProviderAlias(providerName);
+  if (!runtime.providers[alias]) return;
+  runtime.providers[alias].model = model;
+}
+
 async function maybePromptCredential(rl: readline.Interface, alias: string, prompt: string): Promise<boolean> {
   const configureNow = await askYesNo(rl, `Configure ${alias} now?`, false);
   if (!configureNow) return false;
@@ -554,6 +623,20 @@ async function maybePromptCredential(rl: readline.Interface, alias: string, prom
 }
 
 async function configureLlmCredential(rl: readline.Interface, providerName: string, stdout: OutputWriter): Promise<boolean> {
+  if (providerName === "openai") {
+    const connectionMode = await askChoice(rl, "Connection mode for openai", ["api", "auth"], "api");
+    if (connectionMode === "auth") {
+      const session = await loadOpenAICodexAuthSession();
+      if (!session) {
+        stdout.write("No reusable OpenAI API key was found in local Codex auth. Use API key mode or sign in through Codex CLI so an API key is created first.\n");
+        return false;
+      }
+      await setOAuthCredential("openai", session);
+      stdout.write(`Imported OpenAI auth from local Codex session${session.auth_mode ? ` (${session.auth_mode})` : ""}.\n`);
+      return true;
+    }
+  }
+
   if (providerName === "gemini") {
     const connectionMode = await askChoice(rl, "Connection mode for gemini", ["api", "auth"], "api");
     if (connectionMode === "auth") {
@@ -572,6 +655,10 @@ async function configureLlmCredential(rl: readline.Interface, providerName: stri
       }
       return false;
     }
+  }
+
+  if (providerName === "anthropic") {
+    stdout.write("Anthropic currently uses API key authentication in this toolkit.\n");
   }
 
   const value = await askText(rl, `${providerName[0].toUpperCase()}${providerName.slice(1)} API key`, "");
@@ -685,6 +772,15 @@ function getRepresentativeQaScore(record: LooseRecord | null | undefined): numbe
   return Number(record?.qa_score ?? 0);
 }
 
+function getReviewAction(run: RunData): string {
+  const decision = run.decision as LooseRecord | null;
+  return typeof decision?.action === "string" ? decision.action : "";
+}
+
+function isApprovedReviewAction(action: string): boolean {
+  return action === "approve" || action === "approve_with_edits";
+}
+
 function selectRepresentativeProducts(products: LooseRecord[]): { selected: LooseRecord[]; shadowedKeys: Set<string> } {
   const selectedByIdentity = new Map<string, LooseRecord>();
   const shadowedKeys = new Set<string>();
@@ -735,6 +831,7 @@ async function loadReviewableRuns(root: string, flags: Flags): Promise<Array<{ r
       if (!item.run.result) return false;
       if (flags.module && item.run.result.module !== String(flags.module)) return false;
       if (flags.product && item.product_key !== String(flags.product)) return false;
+      if (!flags.all && isApprovedReviewAction(getReviewAction(item.run))) return false;
       if (!flags.all && !item.run.result.needs_review) return false;
       return true;
     });
@@ -788,6 +885,109 @@ async function loadLatestSyncRuns(root: string): Promise<Array<{ run: RunData; p
   }
 
   return [...latestByProduct.values()];
+}
+
+function buildPendingReviewRows(root: string, items: Array<{ run: RunData; product_key: string }>): Array<Record<string, string>> {
+  return items.map((item) => {
+    const result = item.run.result;
+    const generatedProductPath = path.join(getCatalogPaths(root).generatedProductsDir, `${item.product_key}.json`);
+    return {
+      "Product Key": item.product_key,
+      "Module": String(result?.module ?? "unknown"),
+      "Job ID": String(result?.job_id ?? ""),
+      "Status": String(result?.status ?? ""),
+      "Generated Product Path": generatedProductPath,
+      "Suggested Command": result?.job_id ? `catalog review ${result.job_id}` : "",
+      "Notes": result?.needs_review ? "Pending approval" : ""
+    };
+  });
+}
+
+function buildWorkflowSummariesFromSyncRuns(
+  root: string,
+  items: Array<{ run: RunData; product_key: string }>
+): WorkflowRunSummary[] {
+  return items.map((item, index) => {
+    const input = item.run.input as LooseRecord | null;
+    const productKey = item.product_key;
+    const generatedImageDir = path.join(getCatalogPaths(root).generatedImagesDir, productKey);
+    const generatedProductPath = path.join(getCatalogPaths(root).generatedProductsDir, `${productKey}.json`);
+    const featuredImage = typeof input?.featured_image === "string" ? input.featured_image : undefined;
+    const localImagePath = path.join(generatedImageDir, "selected.jpg");
+    return {
+      index,
+      product_key: productKey,
+      source_record_id: typeof input?.id === "string" ? input.id : productKey,
+      generated_product_path: generatedProductPath,
+      generated_image_dir: generatedImageDir,
+      selected_image_url: featuredImage,
+      local_image_path: featuredImage ? localImagePath : undefined,
+      modules: item.run.result ? [{
+        module: item.run.result.module,
+        job_id: item.run.result.job_id,
+        status: item.run.result.status,
+        needs_review: item.run.result.needs_review
+      }] : []
+    };
+  });
+}
+
+function buildApprovedProductProjection(product: LooseRecord, run: RunData): LooseRecord {
+  const decision = run.decision as ReviewDecision | null;
+  if (!decision || !isApprovedReviewAction(decision.action)) return product;
+  return {
+    ...product,
+    ...(decision.edits ?? {})
+  };
+}
+
+async function refreshWorkspaceExportsFromState(root: string, policy: PolicyDocument): Promise<{ reviewQueueCsv: string; shopifyImportCsv: string; excelWorkbook: string; workflowProductsJson: string; workflowProducts: LooseRecord[]; exportableProducts: LooseRecord[] }> {
+  const generatedProducts = await loadGeneratedProductCatalog(root);
+  const pendingReviewRuns = await loadReviewableRuns(root, {});
+  const latestSyncRuns = await loadLatestSyncRuns(root);
+  const latestSyncByProductKey = new Map(latestSyncRuns.map((item) => [item.product_key, item]));
+  const latestSyncByJobId = new Map(
+    latestSyncRuns
+      .filter((item) => item.run.result?.job_id)
+      .map((item) => [String(item.run.result?.job_id), item])
+  );
+  const { selected: representativeProducts } = selectRepresentativeProducts(generatedProducts);
+  const workflowProducts = representativeProducts
+    .filter((product) => !getMatchBlockReason(product))
+    .map((product) => {
+      const lastJobId = typeof (product._catalog as LooseRecord | undefined)?.last_job_id === "string"
+        ? String((product._catalog as LooseRecord).last_job_id)
+        : "";
+      const syncRun = (lastJobId ? latestSyncByJobId.get(lastJobId) : undefined)
+        ?? latestSyncByProductKey.get(getProductKey(product, "product"));
+      return syncRun ? buildApprovedProductProjection(product, syncRun.run) : product;
+    });
+
+  const exportableProducts = workflowProducts
+    .flatMap((product) => {
+      const lastJobId = typeof (product._catalog as LooseRecord | undefined)?.last_job_id === "string"
+        ? String((product._catalog as LooseRecord).last_job_id)
+        : "";
+      const syncRun = (lastJobId ? latestSyncByJobId.get(lastJobId) : undefined)
+        ?? latestSyncByProductKey.get(getProductKey(product, "product"));
+      if (!syncRun?.run.result || syncRun.run.result.module !== "shopify-sync") return [];
+      if (syncRun.run.result.needs_review && !isApprovedReviewAction(getReviewAction(syncRun.run))) return [];
+      return [product];
+    });
+
+  const pendingReviewRows = buildPendingReviewRows(root, pendingReviewRuns);
+  const reviewQueueCsv = await writePendingReviewQueueCsv(root, pendingReviewRows);
+  const workflowProductsJson = await writeWorkflowProductsLedger(root, workflowProducts);
+  const shopifyImportCsv = await writeShopifyImportCsv(root, exportableProducts, policy);
+  const excelWorkbook = await writeExcelWorkbook(
+    root,
+    buildWorkflowSummariesFromSyncRuns(root, latestSyncRuns),
+    generatedProducts,
+    exportableProducts,
+    policy,
+    pendingReviewRows
+  );
+  return { reviewQueueCsv, shopifyImportCsv, excelWorkbook, workflowProductsJson, workflowProducts, exportableProducts };
 }
 
 async function executeModule(root: string, moduleName: string, runInput: LooseRecord, handler: (jobId: string, runInput: LooseRecord, runDir: string) => Promise<ModuleResult> | ModuleResult): Promise<ExecutedModule> {
@@ -975,14 +1175,43 @@ async function refreshWorkflowGeneratedOutputs(
   runs: WorkflowRunSummary[],
   generatedProducts: LooseRecord[],
   policy?: PolicyDocument
-): Promise<{ reviewQueueCsv: string; shopifyImportCsv: string; excelWorkbook: string; workflowProductsJson: string; acceptedProducts: LooseRecord[] }> {
+): Promise<{ reviewQueueCsv: string; shopifyImportCsv: string; excelWorkbook: string; workflowProductsJson: string; workflowProducts: LooseRecord[]; exportableProducts: LooseRecord[] }> {
+  const pendingReviewRuns = await loadReviewableRuns(root, {});
+  const pendingReviewRows = buildPendingReviewRows(root, pendingReviewRuns);
+  const latestSyncRuns = await loadLatestSyncRuns(root);
+  const latestSyncByProductKey = new Map(latestSyncRuns.map((item) => [item.product_key, item]));
+  const latestSyncByJobId = new Map(
+    latestSyncRuns
+      .filter((item) => item.run.result?.job_id)
+      .map((item) => [String(item.run.result?.job_id), item])
+  );
   const { selected: representativeProducts } = selectRepresentativeProducts(generatedProducts);
-  const acceptedProducts = representativeProducts.filter((product) => !getMatchBlockReason(product));
+  const workflowProducts = representativeProducts
+    .filter((product) => !getMatchBlockReason(product))
+    .map((product) => {
+      const lastJobId = typeof (product._catalog as LooseRecord | undefined)?.last_job_id === "string"
+        ? String((product._catalog as LooseRecord).last_job_id)
+        : "";
+      const syncRun = (lastJobId ? latestSyncByJobId.get(lastJobId) : undefined)
+        ?? latestSyncByProductKey.get(getProductKey(product, "product"));
+      return syncRun ? buildApprovedProductProjection(product, syncRun.run) : product;
+    });
+  const exportableProducts = workflowProducts
+    .flatMap((product) => {
+      const lastJobId = typeof (product._catalog as LooseRecord | undefined)?.last_job_id === "string"
+        ? String((product._catalog as LooseRecord).last_job_id)
+        : "";
+      const syncRun = (lastJobId ? latestSyncByJobId.get(lastJobId) : undefined)
+        ?? latestSyncByProductKey.get(getProductKey(product, "product"));
+      if (!syncRun?.run.result || syncRun.run.result.module !== "shopify-sync") return [];
+      if (syncRun.run.result.needs_review && !isApprovedReviewAction(getReviewAction(syncRun.run))) return [];
+      return [product];
+    });
   const reviewQueueCsv = await writeReviewQueueCsv(root, runs);
-  const workflowProductsJson = await writeWorkflowProductsLedger(root, acceptedProducts);
-  const shopifyImportCsv = await writeShopifyImportCsv(root, acceptedProducts, policy);
-  const excelWorkbook = await writeExcelWorkbook(root, runs, generatedProducts, acceptedProducts, policy);
-  return { reviewQueueCsv, shopifyImportCsv, excelWorkbook, workflowProductsJson, acceptedProducts };
+  const workflowProductsJson = await writeWorkflowProductsLedger(root, workflowProducts);
+  const shopifyImportCsv = await writeShopifyImportCsv(root, exportableProducts, policy);
+  const excelWorkbook = await writeExcelWorkbook(root, runs, generatedProducts, exportableProducts, policy, pendingReviewRows);
+  return { reviewQueueCsv, shopifyImportCsv, excelWorkbook, workflowProductsJson, workflowProducts, exportableProducts };
 }
 
 async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> {
@@ -1005,12 +1234,6 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
     let storeUrl = "";
     if (configureProviders) {
       const runtime = await loadRuntimeConfig(root);
-      const providerAliasByName: Record<string, string> = {
-        openai: "openai_default",
-        gemini: "gemini_flash_default",
-        anthropic: "anthropic_default",
-        none: ""
-      };
       const primaryLlm = await askChoice(rl, "Primary LLM provider", ["openai", "gemini", "anthropic", "none"], "openai");
       const fallbackLlm = await askChoice(
         rl,
@@ -1023,6 +1246,13 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
 
       for (const providerName of selectedProviders) {
         readiness[providerName] = await configureLlmCredential(rl, providerName, stdout);
+        const configuredModel = await askProviderModel(
+          rl,
+          providerName,
+          runtime.providers[getLlmProviderAlias(providerName)]?.model ?? getDefaultModelForProvider(providerName)
+        );
+        applyProviderModelToRuntime(runtime, providerName, configuredModel);
+        configured.push(`${providerName}-model:${configuredModel}`);
         if (readiness[providerName]) configured.push(providerName);
       }
 
@@ -1067,7 +1297,7 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
         }
       }
 
-      const readyProviderAlias = (providerName: string): string => readiness[providerName] ? providerAliasByName[providerName] : "";
+      const readyProviderAlias = (providerName: string): string => readiness[providerName] ? getLlmProviderAlias(providerName) : "";
       runtime.modules["catalogue-expert"].llm_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
       runtime.modules["catalogue-qa"].llm_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
       runtime.modules["catalogue-match"].reasoning_provider = readyProviderAlias(primaryLlm) || readyProviderAlias(fallbackLlm);
@@ -1206,7 +1436,18 @@ async function handleAuth(root: string, subcommand: string | undefined, extraPos
       rl.close();
     }
     await setCredential(String(alias), String(value));
-    writeOutput(stdout, mode, { alias, stored: true }, `Stored credential for ${alias}\n`);
+    const runtime = await loadRuntimeConfig(root);
+    const requestedModel = typeof flags.model === "string" ? String(flags.model).trim() : "";
+    if (requestedModel && LLM_PROVIDER_ALIAS_BY_NAME[String(alias)]) {
+      applyProviderModelToRuntime(runtime, String(alias), requestedModel);
+      await saveRuntimeConfig(root, runtime);
+    }
+    writeOutput(
+      stdout,
+      mode,
+      { alias, stored: true, ...(requestedModel ? { model: requestedModel } : {}) },
+      `Stored credential for ${alias}${requestedModel ? ` using model ${requestedModel}` : ""}\n`
+    );
     return 0;
   }
 
@@ -1242,6 +1483,7 @@ async function handleAuth(root: string, subcommand: string | undefined, extraPos
   if (subcommand === "login") {
     const alias = String(flags.provider ?? extraPositional[0] ?? "");
     const runtime = await loadRuntimeConfig(root);
+    const requestedModel = typeof flags.model === "string" ? String(flags.model).trim() : "";
 
     if (alias === "shopify") {
       const store = String(flags.store ?? runtime.providers.shopify_default.store ?? "");
@@ -1265,6 +1507,25 @@ async function handleAuth(root: string, subcommand: string | undefined, extraPos
       return 0;
     }
 
+    if (alias === "openai") {
+      const session = await loadOpenAICodexAuthSession();
+      if (!session) {
+        throw new Error("No reusable OpenAI API key was found in local Codex auth. Use `catalog auth set --provider openai --value <api-key>` or sign in through Codex CLI first so a local API key is available.");
+      }
+      await setOAuthCredential("openai", session);
+      if (requestedModel) {
+        applyProviderModelToRuntime(runtime, "openai", requestedModel);
+        await saveRuntimeConfig(root, runtime);
+      }
+      writeOutput(
+        stdout,
+        mode,
+        { alias, ok: true, source: "oauth", auth_mode: session.auth_mode ?? "codex", ...(requestedModel ? { model: requestedModel } : {}) },
+        `Imported OpenAI auth from local Codex session${requestedModel ? ` using model ${requestedModel}` : ""}\n`
+      );
+      return 0;
+    }
+
     if (alias === "gemini") {
       const clientId = String(flags["client-id"] ?? "");
       const clientSecret = String(flags["client-secret"] ?? "");
@@ -1278,11 +1539,24 @@ async function handleAuth(root: string, subcommand: string | undefined, extraPos
         projectId
       }));
       await setOAuthCredential("gemini", session);
-      writeOutput(stdout, mode, { alias, ok: true, source: "oauth", project_id: projectId }, `Stored Gemini OAuth session for project ${projectId}\n`);
+      if (requestedModel) {
+        applyProviderModelToRuntime(runtime, "gemini", requestedModel);
+        await saveRuntimeConfig(root, runtime);
+      }
+      writeOutput(
+        stdout,
+        mode,
+        { alias, ok: true, source: "oauth", project_id: projectId, ...(requestedModel ? { model: requestedModel } : {}) },
+        `Stored Gemini OAuth session for project ${projectId}${requestedModel ? ` using model ${requestedModel}` : ""}\n`
+      );
       return 0;
     }
 
-    throw new Error("Supported auth login providers: shopify, gemini");
+    if (alias === "anthropic") {
+      throw new Error("Anthropic interactive auth is not supported yet. Use `catalog auth set --provider anthropic --value <api-key> [--model <model>]`.");
+    }
+
+    throw new Error("Supported auth login providers: openai, shopify, gemini");
   }
 
   throw new Error("Supported auth commands: set, list, test, login");
@@ -1392,18 +1666,19 @@ async function handleGuide(root: string, subcommand: string | undefined, flags: 
 }
 
 async function handleIngest(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON or CSV file.");
+  const inputPath = typeof flags.input === "string" ? String(flags.input) : typeof flags.text === "string" ? "--text" : requireFlag(flags, "input", "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const executed = await executeModule(root, "catalogue-ingest", { source_path: inputPath }, async (jobId, runInput) => runIngest({
     jobId,
-    input: { source_path: String(runInput.source_path) }
+    input: typeof flags.text === "string"
+      ? { source_path: "--text", source_text: String(flags.text) }
+      : { source_path: String(runInput.source_path) }
   }));
   writeOutput(stdout, getOutputMode(flags), executed, renderModuleResult(executed));
   return 0;
 }
 
 async function handleInputModule(root: string, moduleName: string, flags: Flags, stdout: OutputWriter, moduleRunner: ModuleRunner): Promise<number> {
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON file.");
-  const inputData = await loadInputFile(path.resolve(root, inputPath)) as ProductRecord;
+  const { record: inputData } = await loadSingleRecordFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const mode = getOutputMode(flags);
   const executed = await withSpinner(`Running ${moduleName}`, mode, () => executeModule(root, moduleName, inputData, async (jobId) => moduleRunner({ root, jobId, input: inputData })));
   await persistGeneratedOutputs(root, inputData, executed.result);
@@ -1412,8 +1687,7 @@ async function handleInputModule(root: string, moduleName: string, flags: Flags,
 }
 
 async function handlePolicyModule(root: string, moduleName: string, flags: Flags, stdout: OutputWriter, moduleRunner: ModuleRunner): Promise<number> {
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON file.");
-  const inputData = await loadInputFile(path.resolve(root, inputPath)) as ProductRecord;
+  const { record: inputData } = await loadSingleRecordFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const policy = await getPolicyOrThrow(root);
   const mode = getOutputMode(flags);
   const executed = await withSpinner(`Running ${moduleName}`, mode, () => executeModule(root, moduleName, inputData, async (jobId) => moduleRunner({ root, jobId, input: inputData, policy })));
@@ -1424,7 +1698,7 @@ async function handlePolicyModule(root: string, moduleName: string, flags: Flags
 
 async function handleMatch(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
   await initWorkspace(root);
-  const inputData = await loadInputFile(path.resolve(root, requireFlag(flags, "input", "Use --input with a JSON file.")));
+  const { record: inputData } = await loadSingleRecordFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const paths = getCatalogPaths(root);
   const policy = await getPolicyOrThrow(root);
   const learningText = await readText(paths.learningMarkdown, "");
@@ -1469,8 +1743,7 @@ async function handleMatch(root: string, flags: Flags, stdout: OutputWriter): Pr
 }
 
 async function handleImage(root: string, flags: Flags, stdout: OutputWriter): Promise<number> {
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON file.");
-  const inputData = await loadInputFile(path.resolve(root, inputPath)) as ProductRecord;
+  const { record: inputData } = await loadSingleRecordFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const runtimeConfig = await loadRuntimeConfig(root);
   const policy = await getPolicyOrThrow(root);
   const mode = getOutputMode(flags);
@@ -1488,14 +1761,13 @@ async function handleImage(root: string, flags: Flags, stdout: OutputWriter): Pr
 
 async function handleBatch(root: string, operation: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
   if (!operation) throw new Error("Use `catalog batch <enrich|qa|match|image|sync> --input <file>`.");
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON or CSV file.");
-  const records = await loadRecordsFromSource(path.resolve(root, inputPath));
+  const { records, sourceLabel } = await loadRecordsFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const limit = flags.limit ? Number(flags.limit) : records.length;
   const selected = records.slice(0, limit) as ProductRecord[];
   const mode = getOutputMode(flags);
   const summary = {
     operation,
-    input: inputPath,
+    input: sourceLabel,
     total: records.length,
     processed: 0,
     runs: [] as Array<{ index: number; job_id: string; status: string; needs_review: boolean }>
@@ -1568,8 +1840,7 @@ async function handleBatch(root: string, operation: string | undefined, flags: F
 
 async function handleWorkflow(root: string, subcommand: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
   if (subcommand !== "run") throw new Error("Use `catalog workflow run --input <file>`.");
-  const inputPath = requireFlag(flags, "input", "Use --input with a JSON or CSV file.");
-  const records = await loadRecordsFromSource(path.resolve(root, inputPath));
+  const { records, sourceLabel } = await loadRecordsFromFlags(root, flags, "Use --input with a JSON, CSV, or TXT file, or use --text.");
   const limit = flags.limit ? Number(flags.limit) : records.length;
   const selected = records.slice(0, limit) as ProductRecord[];
   const mode = getOutputMode(flags);
@@ -1619,7 +1890,7 @@ async function handleWorkflow(root: string, subcommand: string | undefined, flag
       const generatedProduct = await readJson<LooseRecord>(summary.generated_product_path, {});
       generatedProducts.push(generatedProduct);
       refreshedOutputs = await refreshWorkflowGeneratedOutputs(root, items, generatedProducts, policy);
-      workflowCatalog = [...refreshedOutputs.acceptedProducts, ...externalCatalog];
+      workflowCatalog = [...refreshedOutputs.workflowProducts, ...externalCatalog];
       workflowCatalogSource = externalCatalog.length > 0 ? "generated-ledger+external" : "generated-ledger";
     }
     return items;
@@ -1628,7 +1899,7 @@ async function handleWorkflow(root: string, subcommand: string | undefined, flag
     ? await runWork()
     : await withSpinner("Running full workflow", mode, runWork);
   const payload = {
-    input: inputPath,
+    input: sourceLabel,
     total: records.length,
     processed: runs.length,
     runs,
@@ -1693,6 +1964,7 @@ async function handleReview(root: string, jobOrPath: string | undefined, flags: 
       }
       return { action: String(action), count: jobs.length, jobs };
     });
+    await refreshWorkspaceExportsFromState(root, await getPolicyOrThrow(root));
     writeOutput(stdout, mode, payload, renderBulkReviewResult(payload));
     return 0;
   }
@@ -1710,6 +1982,7 @@ async function handleReview(root: string, jobOrPath: string | undefined, flags: 
     decided_at: new Date().toISOString()
   };
   await withSpinner("Saving review decision", mode, () => writeDecision(run.runDir, decision));
+  await refreshWorkspaceExportsFromState(root, await getPolicyOrThrow(root));
   writeOutput(stdout, mode, decision, renderDecision(decision));
   return 0;
 }
@@ -1788,6 +2061,7 @@ async function handleApply(root: string, jobOrPath: string | undefined, flags: F
     };
     await persistGeneratedProduct(root, generatedProduct, run.result.job_id);
   }
+  await refreshWorkspaceExportsFromState(root, await getPolicyOrThrow(root));
   writeOutput(stdout, mode, applyResult, renderApplyResult(applyResult));
   return 0;
 }
@@ -1933,6 +2207,7 @@ ${section("Fast Start")}
 2. catalog doctor
 3. catalog guide generate --industry apparel --business-name "Demo Store" --business-description "Everyday essentials"
 4. catalog workflow run --input .\\examples\\apparel\\products-match.json --catalog .\\examples\\apparel\\catalog-match.json
+   or: catalog workflow run --text "Uniqlo Club T-Shirt - 29.00"
 5. catalog publish
 
 ${section("Core Commands")}
@@ -1941,16 +2216,24 @@ doctor [--json]
 guide generate --industry <industry> --business-name "Store" --business-description "..." [--operating-mode both] [--research true] [--json]
 guide show [--json]
 workflow run --input <file> [--catalog <file>] [--limit N] [--json]
+workflow run --text "<product lines>" [--catalog <file>] [--limit N] [--json]
 publish [--live] [--json]
 
 ${section("Single-Step Commands")}
 ingest --input <file> [--json]
+ingest --text "<product lines>" [--json]
 match --input <file> [--catalog <file>] [--first 50] [--json]
+match --text "<single product>" [--catalog <file>] [--first 50] [--json]
 enrich --input <file> [--json]
+enrich --text "<single product>" [--json]
 image --input <file> [--json]
+image --text "<single product>" [--json]
 qa --input <file> [--json]
+qa --text "<single product>" [--json]
 sync --input <file> [--json]
+sync --text "<single product>" [--json]
 batch <enrich|qa|match|image|sync> --input <file> [--catalog <file>] [--limit N] [--json]
+batch <enrich|qa|match|image|sync> --text "<product lines>" [--catalog <file>] [--limit N] [--json]
 
 ${section("Review And Apply")}
 review <job-id> [--action approve|approve_with_edits|reject|defer] [--json]
@@ -1960,9 +2243,10 @@ apply <job-id> [--live] [--json]
 learn --run <job-id> [--lesson "..."] [--json]
 
 ${section("Credentials And Config")}
-auth set --provider <name> --value <secret> [--json]
+auth set --provider <name> --value <secret> [--model <model>] [--json]
+auth login --provider openai [--model <model>] [--json]
 auth login --provider shopify --store <shop> --client-id <id> --client-secret <secret> [--json]
-auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> [--json]
+auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> [--model <model>] [--json]
 auth list [--json]
 auth test --provider <name> [--json]
 config set <path> <value> [--json]
@@ -1972,6 +2256,9 @@ ${section("Examples")}
 catalog guide generate --industry food_and_beverage --business-name "Blyzr" --business-description "Online grocery store for halal and cultural groceries"
 catalog workflow run --input .\\examples\\grocery\\products-match.json --catalog .\\examples\\grocery\\catalog-match.json
 catalog workflow run --input .\\examples\\alt-structure\\products-grocery.csv --catalog .\\examples\\grocery\\catalog-match.json
+catalog workflow run --text "Almarai Fresh Milk Low Fat 1L - 8.50\nBaladna Greek Yogurt Plain 500g - 12.50" --catalog .\\examples\\grocery\\catalog-match.json
+catalog auth set --provider anthropic --value <api-key> --model claude-sonnet-4-20250514
+catalog auth login --provider openai --model gpt-5
 catalog review queue
 catalog publish --live
 `);

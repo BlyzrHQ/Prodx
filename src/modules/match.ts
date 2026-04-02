@@ -32,8 +32,24 @@ const TITLE_SYNONYMS = new Map([
   ["headphone", "headphones"]
 ]);
 
+const VARIANT_FIELD_ALIASES = {
+  size: ["size", "pack_size", "packsize", "size_uom"],
+  color: ["color"],
+  storage: ["storage"],
+  type: ["type", "flavor", "fat_percent", "fat_strength", "strength"],
+  flavor: ["flavor", "type"],
+  pack_size: ["pack_size", "packsize", "size", "size_uom"],
+  "fat_strength": ["fat_strength", "fat_percent", "type"],
+  "fat_%_/_strength": ["fat_strength", "fat_percent", "type"],
+  "fat_%": ["fat_percent", "type"]
+};
+
 function normalizeRetailTitle(value) {
   return normalizeValue(value)
+    .replace(/\b(\d+(?:[\.,]\d+)?)\s*grams?\b/g, "$1g")
+    .replace(/\b(\d+(?:[\.,]\d+)?)\s*kilograms?\b/g, "$1kg")
+    .replace(/\b(\d+(?:[\.,]\d+)?)\s*millilit(?:er|re)s?\b/g, "$1ml")
+    .replace(/\b(\d+(?:[\.,]\d+)?)\s*lit(?:er|re)s?\b/g, "$1l")
     .split(" ")
     .filter(Boolean)
     .map((token) => TITLE_SYNONYMS.get(token) ?? token)
@@ -85,9 +101,23 @@ function findOptionValueFromTitle(title, key) {
   }
 
   if (key === "type") {
-    const knownTypes = ["low fat", "full fat", "full cream", "nonfat", "plain", "vanilla"];
+    const knownTypes = ["low fat", "lowfat", "full fat", "full cream", "nonfat", "plain", "vanilla", "strawberry", "chocolate"];
     const matchedType = knownTypes.find((candidate) => normalized.includes(candidate));
     return matchedType ? toTitleCase(matchedType) : "";
+  }
+
+  if (key === "flavor") {
+    const knownFlavors = ["plain", "vanilla", "strawberry", "chocolate", "mixed berry"];
+    const matchedFlavor = knownFlavors.find((candidate) => normalized.includes(candidate));
+    return matchedFlavor ? toTitleCase(matchedFlavor) : "";
+  }
+
+  if (key === "fat_strength" || key === "fat_percent") {
+    const percentMatch = text.match(/\b\d+%/i);
+    if (percentMatch) return percentMatch[0].replace(/\s+/g, "");
+    const knownStrengths = ["low fat", "lowfat", "full fat", "full cream", "nonfat"];
+    const matchedStrength = knownStrengths.find((candidate) => normalized.includes(candidate));
+    return matchedStrength ? toTitleCase(matchedStrength) : "";
   }
 
   return "";
@@ -96,7 +126,10 @@ function findOptionValueFromTitle(title, key) {
 function getVariantOptionValues(product, variantEntries) {
   const explicit = variantEntries
     .map(({ fieldKey, optionName }) => {
-      const raw = product?.[fieldKey];
+      const aliasKeys = VARIANT_FIELD_ALIASES[fieldKey] ?? [fieldKey];
+      const raw = aliasKeys
+        .map((key) => product?.[key])
+        .find((value) => typeof value === "string" ? value.trim().length > 0 : value !== undefined && value !== null && String(value).trim().length > 0);
       const value = typeof raw === "string" ? raw.trim() : String(raw ?? "").trim();
       if (!value || value.toLowerCase() === "default title") return null;
       return {
@@ -110,7 +143,10 @@ function getVariantOptionValues(product, variantEntries) {
 
   const inferred = variantEntries
     .map(({ fieldKey, optionName }) => {
-      const value = findOptionValueFromTitle(product?.title, fieldKey);
+      const aliasKeys = VARIANT_FIELD_ALIASES[fieldKey] ?? [fieldKey];
+      const value = aliasKeys
+        .map((key) => findOptionValueFromTitle(product?.title, key))
+        .find(Boolean);
       if (!value) return null;
       return {
         name: optionName,
@@ -206,6 +242,7 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
   });
   const variantKeys = variantEntries.map((entry) => entry.fieldKey);
   const targetVariant = getVariantSignature(input, variantKeys);
+  const targetOptionValues = getVariantOptionValues(input, variantEntries);
 
   const exactSku = targetSku ? candidates.find((item) => normalizeValue(item.sku) === targetSku) : null;
   if (exactSku) {
@@ -294,6 +331,7 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
     .sort((a, b) => b.score - a.score);
   const best = scored[0];
   const bestVariant = best ? getVariantSignature(best.raw, variantKeys) : "";
+  const bestCanonicalTitle = best ? compactValue(normalizeRetailTitle(buildComparableTitle(best.brand, best.title))) : "";
   const learningFlag = /generic values like default or regular/i.test(learningText) || /generic values like default or regular/i.test(JSON.stringify(policy));
 
   if (!best || best.score < 0.35) {
@@ -353,6 +391,24 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
     };
   }
 
+  if (!targetVariant && targetOptionValues.length === 0 && canonicalTargetTitle && bestCanonicalTitle && canonicalTargetTitle === bestCanonicalTitle) {
+    return {
+      ...createBaseResult({
+        jobId,
+        module: "catalogue-match",
+        status: "success",
+        needsReview: false,
+        reasoning: [`Closest product family match: ${best.title}`, "Titles normalize to the same product identity and no meaningful variant option could be extracted."],
+        nextActions: ["Treat as duplicate unless a human review finds a hidden variant difference."]
+      }),
+      decision: "DUPLICATE",
+      confidence: 0.93,
+      matched_product_id: best.id,
+      matched_variant_id: best.id,
+      proposed_action: { action: "skip_duplicate", product_id: best.id }
+    };
+  }
+
   const genericVariant = ["default", "regular", "standard", "classic"].some((token) => targetVariant.includes(token));
   if (genericVariant && learningFlag) {
     return {
@@ -374,7 +430,25 @@ export function runMatchDecision({ jobId, input, catalog, policy, learningText =
   }
 
   if (best.score >= 0.6) {
-    const variantOptionValues = getVariantOptionValues(input, variantEntries);
+    const variantOptionValues = targetOptionValues;
+    if (variantOptionValues.length === 0) {
+      return {
+        ...createBaseResult({
+          jobId,
+          module: "catalogue-match",
+          status: "success",
+          needsReview: true,
+          warnings: ["Product family matched but no real shopper-facing variant value could be extracted safely."],
+          reasoning: [`Closest product family match: ${best.title}`, "Variant attachment was blocked because no actual option value was identified from the input."],
+          nextActions: ["Review whether this is a duplicate or enrich the input with a real variant value before attaching."]
+        }),
+        decision: "NEEDS_REVIEW",
+        confidence: 0.55,
+        matched_product_id: best.id,
+        matched_variant_id: null,
+        proposed_action: { action: "manual_review" }
+      };
+    }
     return {
       ...createBaseResult({
         jobId,

@@ -1,6 +1,26 @@
-import type { ConnectorJsonResponse } from "../types.js";
+import type { ConnectorJsonResponse, ProviderUsage } from "../types.js";
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1/responses";
+
+function extractOpenAIUsage(raw: any, model: string): ProviderUsage | undefined {
+  const usage = raw?.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  const inputDetails = usage.input_tokens_details ?? {};
+  const outputDetails = usage.output_tokens_details ?? {};
+
+  return {
+    provider: "openai",
+    model,
+    input_tokens: Number(usage.input_tokens ?? 0),
+    output_tokens: Number(usage.output_tokens ?? 0),
+    total_tokens: Number(usage.total_tokens ?? 0),
+    cache_creation_input_tokens: Number(inputDetails.cached_tokens ?? 0),
+    cache_read_input_tokens: Number(inputDetails.cache_read_tokens ?? 0),
+    reasoning_tokens: Number(outputDetails.reasoning_tokens ?? 0),
+    raw: usage
+  };
+}
 
 export async function createOpenAIJsonResponse<T>({
   apiKey,
@@ -95,7 +115,8 @@ export async function createOpenAIJsonResponse<T>({
     return {
       raw: retryData,
       text: retryText,
-      json: retryParsed.value
+      json: retryParsed.value,
+      usage: extractOpenAIUsage(retryData, model)
     };
   }
 
@@ -126,14 +147,16 @@ export async function createOpenAIJsonResponse<T>({
     return {
       raw: retryData,
       text,
-      json: parsed.value
+      json: parsed.value,
+      usage: extractOpenAIUsage(retryData, model)
     };
   }
 
   return {
     raw: data,
     text,
-    json: parsed.value
+    json: parsed.value,
+    usage: extractOpenAIUsage(data, model)
   };
 }
 

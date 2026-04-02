@@ -10,7 +10,7 @@ import { createGeminiJsonResponse } from "../connectors/gemini.js";
 import { createAnthropicJsonResponse } from "../connectors/anthropic.js";
 import { searchSerperWeb } from "../connectors/serper.js";
 import { fetchShopifyPolicyContext } from "../connectors/shopify.js";
-import type { LooseRecord, PolicyDocument, ProductMetafieldValue, ResolvedProvider } from "../types.js";
+import type { LooseRecord, PolicyDocument, ProductMetafieldValue, ProviderUsage, ResolvedProvider } from "../types.js";
 
 function providerReady(resolved: ResolvedProvider | null): resolved is ResolvedProvider {
   return Boolean(resolved?.provider && resolved?.credential?.value);
@@ -263,9 +263,34 @@ function buildPolicySchema() {
 }
 
 function normalizeGeneratedPolicy(base: PolicyDocument, generated: LooseRecord, input: LooseRecord, generationMethod: string): PolicyDocument {
+  const rawContext = generated.industry_business_context && typeof generated.industry_business_context === "object"
+    ? generated.industry_business_context as LooseRecord
+    : {};
+  const targetMarket = String(input.targetMarket ?? base.meta?.target_market ?? "").trim();
+  const fallbackAudience = targetMarket || "General shoppers in the store's target category.";
+  const normalizedAudience = typeof rawContext.audience === "string" && rawContext.audience.trim() && !/requires_review|unknown_requires_review/i.test(rawContext.audience)
+    ? rawContext.audience.trim()
+    : fallbackAudience;
+  const normalizedSummary = typeof rawContext.summary === "string" && rawContext.summary.trim() && !/requires_review|unknown_requires_review/i.test(rawContext.summary)
+    ? rawContext.summary.trim()
+    : String(input.businessDescription ?? base.meta?.business_description ?? `${String(input.businessName ?? base.meta?.business_name ?? "The store")} operates in ${String(input.industry ?? base.meta?.industry ?? "general")}.`).trim();
+  const normalizedNotes = typeof rawContext.notes === "string" && rawContext.notes.trim() && !/requires_review|unknown_requires_review/i.test(rawContext.notes)
+    ? rawContext.notes.trim()
+    : String(input.notes ?? base.industry_business_context?.notes ?? "").trim();
+
   const combined: PolicyDocument = {
     ...base,
     ...generated,
+    industry_business_context: {
+      ...(base.industry_business_context ?? {}),
+      ...rawContext,
+      summary: normalizedSummary,
+      audience: normalizedAudience,
+      notes: normalizedNotes,
+      operating_mode: typeof rawContext.operating_mode === "string" && rawContext.operating_mode.trim()
+        ? rawContext.operating_mode
+        : String(input.operatingMode ?? base.meta?.operating_mode ?? "local_files")
+    },
     attributes_metafields_schema: {
       ...base.attributes_metafields_schema,
       ...((generated.attributes_metafields_schema as LooseRecord | undefined) ?? {}),
@@ -401,7 +426,7 @@ async function generateWithProvider(
   shopifyContext: LooseRecord | null,
   researchNotes: Array<{ title: string; link: string; snippet?: string }>,
   learningText: string
-): Promise<PolicyDocument> {
+): Promise<{ policy: PolicyDocument; usage?: ProviderUsage }> {
   const spec = getCatalogGuidePromptSpec();
   const systemPrompt = buildSystemPrompt(spec);
   const requestBody = buildCatalogGuidePromptPayload(
@@ -420,7 +445,6 @@ async function generateWithProvider(
     learningText
   );
   const schema = buildPolicySchema();
-  let generated: LooseRecord;
 
   if (provider.provider.type === "openai") {
     const response = await createOpenAIJsonResponse<LooseRecord>({
@@ -432,7 +456,15 @@ async function generateWithProvider(
       maxOutputTokens: 5200,
       reasoningEffort: "low"
     });
-    generated = response.json;
+    return {
+      policy: normalizeGeneratedPolicy(
+        starterPolicy,
+        response.json,
+        input,
+        shopifyContext ? `${provider.provider.type}-with-shopify-context` : provider.provider.type
+      ),
+      usage: response.usage
+    };
   } else if (provider.provider.type === "gemini") {
     const response = await createGeminiJsonResponse<LooseRecord>({
       apiKey: provider.credential.source === "oauth" ? undefined : provider.credential.value,
@@ -443,7 +475,15 @@ async function generateWithProvider(
       textPrompt: requestBody,
       schema
     });
-    generated = response.json;
+    return {
+      policy: normalizeGeneratedPolicy(
+        starterPolicy,
+        response.json,
+        input,
+        shopifyContext ? `${provider.provider.type}-with-shopify-context` : provider.provider.type
+      ),
+      usage: response.usage
+    };
   } else if (provider.provider.type === "anthropic") {
     const response = await createAnthropicJsonResponse<LooseRecord>({
       apiKey: provider.credential.value,
@@ -452,17 +492,18 @@ async function generateWithProvider(
       textPrompt: `${requestBody}\n\nReturn valid JSON matching this schema exactly: ${JSON.stringify((schema as { schema: unknown }).schema)}`,
       maxTokens: 5200
     });
-    generated = response.json;
+    return {
+      policy: normalizeGeneratedPolicy(
+        starterPolicy,
+        response.json,
+        input,
+        shopifyContext ? `${provider.provider.type}-with-shopify-context` : provider.provider.type
+      ),
+      usage: response.usage
+    };
   } else {
     throw new Error(`Unsupported guide provider type: ${provider.provider.type}`);
   }
-
-  return normalizeGeneratedPolicy(
-    starterPolicy,
-    generated,
-    input,
-    shopifyContext ? `${provider.provider.type}-with-shopify-context` : provider.provider.type
-  );
 }
 
 export async function runExpertGenerate({ root, jobId, input }: { root: string; jobId: string; input: LooseRecord }) {
@@ -511,9 +552,15 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
   }
 
   let policy: PolicyDocument;
+  let providerUsage: ProviderUsage | undefined;
   try {
-    policy = await generateWithProvider(llmProvider, input, starterPolicy, shopifyContext, researchNotes, existingLearningText);
+    const generatedResult = await generateWithProvider(llmProvider, input, starterPolicy, shopifyContext, researchNotes, existingLearningText);
+    policy = generatedResult.policy;
+    providerUsage = generatedResult.usage;
     reasoning.push(`Generated the Catalog Guide with ${llmProvider.providerAlias}.`);
+    if (providerUsage?.total_tokens) {
+      reasoning.push(`Provider usage: ${providerUsage.input_tokens ?? 0} input tokens, ${providerUsage.output_tokens ?? 0} output tokens.`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return createBaseResult({
@@ -570,6 +617,7 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
     ],
     artifacts: {
       provider_used: providerReady(llmProvider) ? llmProvider.providerAlias : null,
+      ...(providerUsage ? { provider_usage: providerUsage } : {}),
       shopify_context_used: Boolean(shopifyContext),
       research_used: shouldResearch && researchNotes.length > 0
     },

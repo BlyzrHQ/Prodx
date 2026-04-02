@@ -51,6 +51,7 @@ export function getCatalogGuidePromptSpec(): PromptSpec {
       "Do not invent metafields unless they are justified by filtering, merchandising, SEO, UX, or the connected Shopify store.",
       "Do not ignore Shopify constraints around products, variants, collections, images, or metafields.",
       "Use structured sentinel values like requires_review or unknown_requires_review instead of inventing facts.",
+      "Do not use placeholder sentinel values in human-facing business-context fields like summary, audience, notes, or worked examples. If those are unknown, write a sensible generic default.",
       "Do not emit shallow, generic advice that would be unusable for a catalog team."
     ],
     output_rules: [
@@ -78,7 +79,7 @@ export function getEnrichmentPromptSpec(): PromptSpec {
       "When a product family is modeled with variants, keep the base product title at the family level and place shopper-facing differentiators like size, color, storage, or pack size into options unless the guide explicitly requires those values in title.",
       "When the runtime explicitly enables web verification for unresolved high-risk factual fields, actively search before deciding whether to fill or skip those fields.",
       "Use provider web search only when high-risk factual fields require verification and the runtime explicitly enables it.",
-      "For factual grocery or consumer-packaged fields, prefer exact-pack evidence from official brand or manufacturer pages first, then from exact-match trusted retailer listings such as Amazon, Instacart, Carrefour, Tesco, Walmart, or Noon when the brand, variant, and pack size clearly match.",
+      "For factual grocery or consumer-packaged fields, use exact-match trusted sources. Official brand or manufacturer pages are excellent, but exact-match trusted retailer listings such as Amazon, Instacart, Carrefour, Tesco, Walmart, or Noon are also acceptable when the brand, variant, and pack size clearly match.",
       "If one trusted exact-match source clearly identifies the product, fill the factual plain-text field directly. If no trusted exact-match source exists, skip it.",
       "If a description section would only contain uncertainty, verification disclaimers, or internal review language, omit that section instead of describing the uncertainty to the shopper.",
       "Write descriptions so they are decision-ready for both shoppers and AI-driven commerce systems: clear product identity, strongest attributes, who it is for, and when it is useful."
@@ -86,7 +87,7 @@ export function getEnrichmentPromptSpec(): PromptSpec {
     safety_rules: [
       "Do not invent unsupported Shopify fields or custom metafields outside the guide.",
       "Do not claim facts that are not in the product input, guide, or store context.",
-      "Do not mark a field as verified unless it is supported by one official source or one exact-match trusted source.",
+      "Do not mark a field as verified unless it is supported by one exact-match trusted source, whether official or retailer.",
       "Do not reuse evidence from a different pack size, flavor, fat level, variant, or product form.",
       "When Shopify metaobject reference IDs are unavailable, you may still fill parallel plain-text factual fields such as ingredients_text, allergen_note, or nutritional_facts if the exact product evidence is verified.",
       "Do not insert review placeholders or internal notes into customer-facing fields such as title, description, alt text, or visible metafields.",
@@ -113,6 +114,7 @@ export function getQaPromptSpec(): PromptSpec {
       "Validate the product listing against the Catalog Guide and produce a strict pass/fail decision.",
       "Apply guide-defined rules deterministically wherever the guide is explicit.",
       "Return structured findings that directly support automation or human review.",
+      "Treat body_html and description_html as the same HTML description field representation; do not mark one missing when the other is already populated.",
       "When upstream image review evidence is provided and it passed with a compliant hero image, treat that as the authoritative visual review result instead of claiming that URLs alone are insufficient."
     ],
     safety_rules: [
@@ -224,7 +226,8 @@ export function buildQaPromptPayload({
   const sections: PromptSection[] = [
     { label: "INPUT PAYLOAD", value: product },
     { label: "CATALOG GUIDE", value: guide },
-    { label: "HARD MISSING FIELDS", value: missingFields }
+    { label: "HARD MISSING FIELDS", value: missingFields },
+    { label: "FIELD ALIASES", value: [{ canonical_field: "description_html", equivalent_fields: ["description_html", "body_html"] }] }
   ];
   if (imageReviewEvidence) sections.push({ label: "UPSTREAM IMAGE REVIEW EVIDENCE", value: imageReviewEvidence });
   if (learningText.trim()) sections.push({ label: "CATALOG LEARNINGS", value: learningText.trim() });

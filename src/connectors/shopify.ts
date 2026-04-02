@@ -129,6 +129,8 @@ export function buildShopifyPayload(product: ProductRecord): ShopifyPayload {
     title: product.title,
     handle: product.handle,
     descriptionHtml: product.description_html ?? product.description ?? "",
+    seoTitle: typeof product.seo_title === "string" ? product.seo_title : "",
+    seoDescription: typeof product.seo_description === "string" ? product.seo_description : "",
     vendor: product.vendor ?? product.brand ?? "",
     productType: product.product_type ?? "",
     tags: product.tags ?? [],
@@ -653,6 +655,10 @@ function buildProductInput(
     title: payload.title ?? "",
     handle: payload.handle ?? undefined,
     descriptionHtml: payload.descriptionHtml ?? "",
+    seo: {
+      title: payload.seoTitle ?? "",
+      description: payload.seoDescription ?? ""
+    },
     vendor: payload.vendor ?? "",
     productType: payload.productType ?? "",
     tags: payload.tags ?? [],

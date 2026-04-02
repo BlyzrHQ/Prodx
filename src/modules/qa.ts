@@ -7,9 +7,10 @@ import { getGuideAgenticDescriptionRequirements, getGuideAgenticRecommendedMetaf
 import { buildQaPromptPayload, buildSystemPrompt, getQaPromptSpec } from "../lib/prompt-specs.js";
 import { readText } from "../lib/fs.js";
 import { getCatalogPaths } from "../lib/paths.js";
-import { hasReviewPlaceholder, htmlToText } from "../lib/product.js";
+import { mergeProviderUsages } from "../lib/provider-usage.js";
+import { getProductFieldValue, hasPopulatedProductField, hasReviewPlaceholder, htmlToText } from "../lib/product.js";
 import { appendLearningLessons, deriveLessonsFromQa } from "./learn.js";
-import type { LooseRecord, PolicyDocument, ProductRecord, QaFinding, QaOutput, ResolvedProvider } from "../types.js";
+import type { LooseRecord, PolicyDocument, ProductRecord, ProviderUsage, QaFinding, QaOutput, ResolvedProvider } from "../types.js";
 
 const CATEGORY_WEIGHTS = {
   title: 15,
@@ -34,8 +35,7 @@ function providerReady(resolved: ResolvedProvider | null): resolved is ResolvedP
 
 function getMissingFields(input: ProductRecord, requiredFields: string[]): string[] {
   return requiredFields.filter((field) => {
-    const value = input[field];
-    return value === undefined || value === null || value === "" || (Array.isArray(value) && value.length === 0);
+    return !hasPopulatedProductField(input, field);
   });
 }
 
@@ -93,6 +93,10 @@ function createFinding(field: string, issueType: string, severity: "critical" | 
     actual,
     deduction: DEDUCTIONS[severity]
   };
+}
+
+function normalizeQaFieldName(field: string): string {
+  return field === "body_html" ? "description_html" : field;
 }
 
 function looksLikeHandle(handle: string): boolean {
@@ -170,6 +174,50 @@ function upstreamImageReviewPassed(input: ProductRecord): boolean {
   return status === "PASS" && confidence >= 0.7 && heroUrl.length > 0;
 }
 
+function sectionCanBeSafelyOmitted(section: string, input: ProductRecord): boolean {
+  const normalized = section.toLowerCase();
+  const metafieldIndex = buildMetafieldIndex(input);
+
+  if (/ingredient|composition/.test(normalized)) {
+    return !hasNonEmptyString(input.ingredients_text)
+      && !hasNonEmptyString(input.allergen_note)
+      && !metafieldIndex.has("custom.ingredients_text")
+      && !metafieldIndex.has("custom.allergens")
+      && !metafieldIndex.has("custom.allergen_note");
+  }
+
+  if (/storage|handling|care/.test(normalized)) {
+    return !hasNonEmptyString(input.storage_instructions);
+  }
+
+  if (/technical|specification|compatib|material|dimension|nutrition/.test(normalized)) {
+    return !hasNonEmptyString(input.nutritional_facts)
+      && !metafieldIndex.has("custom.nutrition_facts")
+      && !metafieldIndex.has("custom.nutritional_facts")
+      && !metafieldIndex.has("custom.technical_specs")
+      && !metafieldIndex.has("custom.compatibility")
+      && !metafieldIndex.has("custom.material")
+      && !metafieldIndex.has("custom.dimensions");
+  }
+
+  return false;
+}
+
+function isOptionalComplianceMetafield(identifier: string, policy: PolicyDocument): boolean {
+  const normalized = identifier.toLowerCase();
+  const guideField = (policy.attributes_metafields_schema?.metafields ?? []).find(
+    (field) => `${field.namespace}.${field.key}`.toLowerCase() === normalized
+  );
+  if (guideField?.required) return false;
+  return [
+    "custom.ingredients_text",
+    "custom.allergens",
+    "custom.allergen_note",
+    "custom.nutrition_facts",
+    "custom.nutritional_facts"
+  ].includes(normalized);
+}
+
 function validateDeterministically(input: ProductRecord, policy: PolicyDocument): QaOutput {
   const findings: QaFinding[] = [];
   const skippedReasons: string[] = [];
@@ -180,8 +228,9 @@ function validateDeterministically(input: ProductRecord, policy: PolicyDocument)
   const descriptionSections = getGuideDescriptionSections(policy);
   const variantDimensions = getGuideVariantDimensions(policy);
   const passingScore = getGuidePassingScore(policy);
-  const descriptionText = typeof input.description_html === "string" && input.description_html.trim()
-    ? htmlToText(input.description_html)
+  const descriptionHtml = getProductFieldValue(input, "description_html");
+  const descriptionText = typeof descriptionHtml === "string" && descriptionHtml.trim()
+    ? htmlToText(descriptionHtml)
     : String(input.description ?? "");
   const hasTrustedImageReview = upstreamImageReviewPassed(input);
 
@@ -198,6 +247,7 @@ function validateDeterministically(input: ProductRecord, policy: PolicyDocument)
   }
 
   for (const section of descriptionSections) {
+    if (sectionCanBeSafelyOmitted(section, input)) continue;
     if (!descriptionText.toLowerCase().includes(section.toLowerCase())) {
       findings.push(createFinding("description_html", "format", "major", "Description is missing a required section.", section, descriptionText || "missing"));
     }
@@ -251,11 +301,12 @@ function validateDeterministically(input: ProductRecord, policy: PolicyDocument)
   findings.push(...hasVariantProblems(input, variantDimensions));
   findings.push(...hasVariantTitleProblems(input));
 
-  if (!input.featured_image && (!Array.isArray(input.images) || input.images.length === 0)) {
+  const upstreamImageReview = getUpstreamImageReview(input);
+  if (!upstreamImageReview && !input.featured_image && (!Array.isArray(input.images) || input.images.length === 0)) {
     findings.push(createFinding("images", "missing", "major", "No primary image is attached.", "At least one compliant product image", "missing"));
   }
 
-  if (!hasTrustedImageReview && getUpstreamImageReview(input)?.status && String(getUpstreamImageReview(input)?.status).toUpperCase() === "FAIL") {
+  if (!hasTrustedImageReview && upstreamImageReview?.status && String(upstreamImageReview.status).toUpperCase() === "FAIL") {
     findings.push(createFinding(
       "images",
       "invalid",
@@ -328,13 +379,40 @@ function mergeQaEvaluations(deterministic: QaOutput, providerEvaluation: QaOutpu
   };
 }
 
+export function sanitizeProviderEvaluationAgainstInput(input: ProductRecord, evaluation: QaOutput): QaOutput {
+  const filteredFindings = (evaluation.findings ?? [])
+    .filter((finding) => {
+      const issueType = String(finding.issue_type ?? "").toLowerCase();
+      if (!issueType.includes("missing")) return true;
+      return !hasPopulatedProductField(input, finding.field);
+    })
+    .map((finding) => ({
+      ...finding,
+      field: normalizeQaFieldName(finding.field)
+    }));
+
+  const summary = {
+    critical_issues: filteredFindings.filter((item) => item.severity === "critical").length,
+    major_issues: filteredFindings.filter((item) => item.severity === "major").length,
+    minor_issues: filteredFindings.filter((item) => item.severity === "minor").length
+  };
+
+  return {
+    ...evaluation,
+    score: Math.max(0, 100 - filteredFindings.reduce((sum, finding) => sum + Number(finding.deduction ?? 0), 0)),
+    status: summary.critical_issues > 0 ? "FAIL" : evaluation.status,
+    summary,
+    findings: filteredFindings
+  };
+}
+
 async function evaluateWithProvider(
   provider: ResolvedProvider,
   input: ProductRecord,
   policy: PolicyDocument,
   deterministicBaseline: QaOutput,
   learningText: string
-): Promise<QaOutput> {
+): Promise<{ evaluation: QaOutput; usage?: ProviderUsage }> {
   const instructions = buildSystemPrompt(getQaPromptSpec());
   const payload = buildQaPromptPayload({
     guide: policy,
@@ -355,7 +433,7 @@ async function evaluateWithProvider(
       maxOutputTokens: 2600,
       reasoningEffort: "low"
     });
-    return response.json;
+    return { evaluation: response.json, usage: response.usage };
   }
 
   if (provider.provider.type === "gemini") {
@@ -368,7 +446,7 @@ async function evaluateWithProvider(
       textPrompt: payload,
       schema
     });
-    return response.json;
+    return { evaluation: response.json, usage: response.usage };
   }
 
   if (provider.provider.type === "anthropic") {
@@ -379,19 +457,41 @@ async function evaluateWithProvider(
       textPrompt: `${payload}\nReturn valid JSON matching this schema exactly: ${JSON.stringify((schema as { schema: unknown }).schema)}`,
       maxTokens: 2600
     });
-    return response.json;
+    return { evaluation: response.json, usage: response.usage };
   }
 
   throw new Error(`Unsupported QA provider type: ${provider.provider.type}`);
 }
 
 function sanitizeQaEvaluationForImageEvidence(input: ProductRecord, evaluation: QaOutput): QaOutput {
-  if (!upstreamImageReviewPassed(input)) return evaluation;
-  const filteredSkippedReasons = (evaluation.skipped_reasons ?? []).filter(
-    (reason) => !/image|watermark|label match|urls alone|upstream image-optimizer/i.test(reason)
-  );
+  const upstreamReview = getUpstreamImageReview(input);
+  const filteredFindings = (evaluation.findings ?? []).filter((finding) => {
+    if (!upstreamReview) return true;
+    const field = String(finding.field ?? "").toLowerCase();
+    const message = String(finding.message ?? "").toLowerCase();
+    if (String(upstreamReview.status ?? "").toUpperCase() === "FAIL" && ["images", "image.hero", "_catalog_image_review"].includes(field)) {
+      return field === "images" && finding.issue_type === "invalid";
+    }
+    if (upstreamImageReviewPassed(input) && (field.includes("image") || /urls alone|watermark|label match/.test(message))) {
+      return false;
+    }
+    return true;
+  });
+  const filteredSkippedReasons = (evaluation.skipped_reasons ?? []).filter((reason) => {
+    if (upstreamImageReviewPassed(input)) {
+      return !/image|watermark|label match|urls alone|upstream image-optimizer/i.test(reason);
+    }
+    return true;
+  });
   return {
     ...evaluation,
+    findings: filteredFindings,
+    score: Math.max(0, 100 - filteredFindings.reduce((sum, finding) => sum + Number(finding.deduction ?? 0), 0)),
+    summary: {
+      critical_issues: filteredFindings.filter((item) => item.severity === "critical").length,
+      major_issues: filteredFindings.filter((item) => item.severity === "major").length,
+      minor_issues: filteredFindings.filter((item) => item.severity === "minor").length
+    },
     skipped_reasons: filteredSkippedReasons
   };
 }
@@ -420,8 +520,9 @@ function computeAgenticReadiness(input: ProductRecord, policy: PolicyDocument): 
   const strengths: string[] = [];
   const recommendations: string[] = [];
   const missingRecommendedMetafields: Array<{ namespace: string; key: string; type: string; purpose: string }> = [];
-  const descriptionText = typeof input.description_html === "string" && input.description_html.trim()
-    ? htmlToText(input.description_html)
+  const descriptionHtml = getProductFieldValue(input, "description_html");
+  const descriptionText = typeof descriptionHtml === "string" && descriptionHtml.trim()
+    ? htmlToText(descriptionHtml)
     : String(input.description ?? "");
   const lowerDescription = descriptionText.toLowerCase();
   const metafieldIndex = buildMetafieldIndex(input);
@@ -532,19 +633,57 @@ export async function runQa({
 
   let finalEvaluation = deterministic;
   let providerUsed: string | null = null;
+  let providerUsage: ProviderUsage | undefined;
 
   const provider = await resolveProvider(root, "catalogue-qa", "llm_provider");
   if (providerReady(provider)) {
     try {
+      const providerEvaluation = await evaluateWithProvider(provider, input, policy, deterministic, learningText);
+      const sanitizedProviderEvaluation = sanitizeProviderEvaluationAgainstInput(input, providerEvaluation.evaluation);
       finalEvaluation = mergeQaEvaluations(
         deterministic,
-        await evaluateWithProvider(provider, input, policy, deterministic, learningText),
+        sanitizedProviderEvaluation,
         passingScore
       );
+      finalEvaluation = {
+        ...finalEvaluation,
+        findings: finalEvaluation.findings.filter((finding) => {
+          const field = String(finding.field ?? "");
+          const issueType = String(finding.issue_type ?? "").toLowerCase();
+          if (issueType.includes("missing") && isOptionalComplianceMetafield(field, policy)) {
+            return false;
+          }
+          if (
+            field === "description_html"
+            && issueType === "format"
+            && sectionCanBeSafelyOmitted(String(finding.expected ?? ""), input)
+          ) {
+            return false;
+          }
+          return true;
+        })
+      };
+      finalEvaluation = {
+        ...finalEvaluation,
+        score: Math.max(0, 100 - finalEvaluation.findings.reduce((sum, finding) => sum + Number(finding.deduction ?? 0), 0)),
+        summary: {
+          critical_issues: finalEvaluation.findings.filter((item) => item.severity === "critical").length,
+          major_issues: finalEvaluation.findings.filter((item) => item.severity === "major").length,
+          minor_issues: finalEvaluation.findings.filter((item) => item.severity === "minor").length
+        }
+      };
+      finalEvaluation = {
+        ...finalEvaluation,
+        status: finalEvaluation.summary.critical_issues > 0 || finalEvaluation.score < passingScore ? "FAIL" : "PASS"
+      };
       finalEvaluation = sanitizeQaEvaluationForImageEvidence(input, finalEvaluation);
       providerUsed = provider.providerAlias;
+      providerUsage = mergeProviderUsages([providerEvaluation.usage]);
       reasoning.push(`Used ${provider.providerAlias} to validate the listing against the Catalog Guide.`);
       reasoning.push(`Provider confidence: ${Number(finalEvaluation.confidence ?? 0).toFixed(2)}`);
+      if (providerUsage?.total_tokens) {
+        reasoning.push(`Provider usage: ${providerUsage.input_tokens ?? 0} input tokens, ${providerUsage.output_tokens ?? 0} output tokens.`);
+      }
     } catch (error) {
       warnings.push(`QA provider failed: ${error instanceof Error ? error.message : String(error)}`);
       reasoning.push("Fell back to deterministic QA because the provider-backed validation step failed.");
@@ -586,6 +725,7 @@ export async function runQa({
     reasoning,
     artifacts: {
       ...(providerUsed ? { provider_used: providerUsed } : {}),
+      ...(providerUsage ? { provider_usage: providerUsage } : {}),
       learning_updates: appendedLessons
     },
     nextActions: passed ? ["Ready for sync proposal."] : ["Fix QA findings before applying or syncing."]

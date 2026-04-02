@@ -4,7 +4,7 @@ import * as XLSX from "xlsx";
 import { materializeProposedChanges } from "./change-records.js";
 import { ensureDir, readJson, writeJson, writeText } from "./fs.js";
 import { getCatalogPaths } from "./paths.js";
-import { dedupeTitleLikeText, normalizeDescriptionPair } from "./product.js";
+import { dedupeTitleLikeText, deriveSeoDescription, deriveSeoTitle, normalizeDescriptionPair } from "./product.js";
 import type { LooseRecord, ModuleResult, PolicyDocument, ProductRecord, ProductVariant, WorkflowRunSummary } from "../types.js";
 
 function slugify(value: string): string {
@@ -162,6 +162,48 @@ function csvEscape(value: unknown): string {
   return text;
 }
 
+const SHOPIFY_IMPORT_HEADER = [
+  "Title",
+  "URL handle",
+  "Description",
+  "Vendor",
+  "Product category",
+  "Type",
+  "Tags",
+  "Published on online store",
+  "Status",
+  "SKU",
+  "Barcode",
+  "Option1 name",
+  "Option1 value",
+  "Option1 LinkedTo",
+  "Option2 name",
+  "Option2 value",
+  "Option2 LinkedTo",
+  "Option3 name",
+  "Option3 value",
+  "Option3 LinkedTo",
+  "Price",
+  "Compare-at price",
+  "Cost per item",
+  "Charge tax",
+  "Inventory tracker",
+  "Inventory quantity",
+  "Continue selling when out of stock",
+  "Weight value (grams)",
+  "Weight unit for display",
+  "Requires shipping",
+  "Fulfillment service",
+  "Product image URL",
+  "Image position",
+  "Image alt text",
+  "Variant image URL",
+  "Gift card",
+  "SEO title",
+  "SEO description",
+  "Google Shopping / Google Product Category"
+] as const;
+
 export async function writeReviewQueueCsv(root: string, runs: WorkflowRunSummary[]): Promise<string> {
   const paths = getCatalogPaths(root);
   const header = [
@@ -203,6 +245,26 @@ export async function writeReviewQueueCsv(root: string, runs: WorkflowRunSummary
   });
 
   await writeText(paths.generatedReviewCsv, `${header.join(",")}\n${rows.join("\n")}\n`);
+  return paths.generatedReviewCsv;
+}
+
+export async function writePendingReviewQueueCsv(
+  root: string,
+  rows: Array<Record<string, string>>
+): Promise<string> {
+  const paths = getCatalogPaths(root);
+  const header = [
+    "Product Key",
+    "Module",
+    "Job ID",
+    "Status",
+    "Generated Product Path",
+    "Suggested Command",
+    "Notes"
+  ];
+
+  const csvRows = rows.map((row) => header.map((column) => csvEscape(row[column] ?? "")).join(","));
+  await writeText(paths.generatedReviewCsv, `${header.join(",")}\n${csvRows.join("\n")}\n`);
   return paths.generatedReviewCsv;
 }
 
@@ -386,20 +448,78 @@ function getAttachedVariantRows(product: LooseRecord, optionNames: string[] = []
   }];
 }
 
-function buildImplicitVariantRows(product: LooseRecord, optionNames: string[]): ProductVariant[] {
+function getLooseString(record: LooseRecord, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function inferOptionValueFromTitle(title: string, candidates: string[]): string {
+  const sorted = [...new Set(candidates.map((item) => item.trim()).filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+  for (const candidate of sorted) {
+    const pattern = new RegExp(`(^|[\\s\\-\\/(])${escapeRegex(candidate)}(?=([\\s\\-\\)/,]|$))`, "i");
+    if (pattern.test(title)) return candidate;
+  }
+  return "";
+}
+
+function normalizeFamilyTitle(title: string, optionValues: string[]): string {
+  let normalized = title;
+  const sorted = [...new Set(optionValues.map((item) => item.trim()).filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+
+  for (const value of sorted) {
+    const escaped = escapeRegex(value);
+    normalized = normalized
+      .replace(new RegExp(`\\s*\\(${escaped}\\)`, "ig"), " ")
+      .replace(new RegExp(`(^|[\\s\\-/,])${escaped}(?=([\\s\\-/,]|$))`, "ig"), "$1");
+  }
+
+  return normalized
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+([,/])/g, "$1")
+    .replace(/[-/,]\s*$/g, "")
+    .trim() || title;
+}
+
+function getOptionValueFromProduct(
+  product: LooseRecord,
+  optionName: string,
+  familyCandidates: string[] = []
+): string {
+  const normalized = optionName.toLowerCase().replace(/\s+/g, "");
   const dimensionMap: Record<string, string> = {
-    size: typeof product.size === "string" ? product.size : "",
-    type: typeof product.type === "string" ? product.type : "",
-    color: typeof product.color === "string" ? product.color : "",
-    storage: typeof product.storage === "string" ? product.storage : "",
-    packsize: typeof product.size === "string" ? product.size : "",
-    "pack size": typeof product.size === "string" ? product.size : ""
+    size: getLooseString(product, "size"),
+    type: getLooseString(product, "type"),
+    color: getLooseString(product, "color"),
+    storage: getLooseString(product, "storage"),
+    packsize: getLooseString(product, "pack_size", "packsize", "size"),
+    "pack size": getLooseString(product, "pack_size", "packsize", "size"),
+    flavor: getLooseString(product, "flavor", "type")
   };
+
+  const explicit = dimensionMap[normalized] ?? getLooseString(product, normalized, optionName);
+  if (explicit) return explicit;
+
+  const title = getLooseString(product, "title");
+  if (!title || familyCandidates.length === 0) return "";
+  return inferOptionValueFromTitle(title, familyCandidates);
+}
+
+function buildImplicitVariantRows(
+  product: LooseRecord,
+  optionNames: string[],
+  familyOptionValues: Map<string, string[]> = new Map()
+): ProductVariant[] {
   const values = optionNames
-    .map((dimension) => {
-      const normalized = dimension.toLowerCase();
-      return dimensionMap[normalized] ?? "";
-    })
+    .map((dimension) => getOptionValueFromProduct(product, dimension, familyOptionValues.get(dimension.toLowerCase()) ?? []))
     .filter((value) => typeof value === "string" && value.trim().length > 0);
 
   if (values.length === 0) return getVariantRows(product);
@@ -485,11 +605,47 @@ function collectFamilyAttachedOptionNames(products: LooseRecord[]): Map<string, 
   return namesByFamily;
 }
 
+function collectFamilyOptionValues(
+  products: LooseRecord[],
+  namesByFamily: Map<string, string[]>
+): Map<string, Map<string, string[]>> {
+  const valuesByFamily = new Map<string, Map<string, string[]>>();
+
+  const upsert = (familyKey: string, optionName: string, optionValue: string) => {
+    const trimmedName = optionName.trim();
+    const trimmedValue = optionValue.trim();
+    if (!trimmedName || !trimmedValue || trimmedValue.toLowerCase() === "default title") return;
+
+    const familyMap = valuesByFamily.get(familyKey) ?? new Map<string, string[]>();
+    const existing = familyMap.get(trimmedName.toLowerCase()) ?? [];
+    if (!existing.some((item) => item.toLowerCase() === trimmedValue.toLowerCase())) {
+      existing.push(trimmedValue);
+    }
+    familyMap.set(trimmedName.toLowerCase(), existing);
+    valuesByFamily.set(familyKey, familyMap);
+  };
+
+  for (const product of products) {
+    const familyKey = getProductFamilyKey(product);
+    const configuredNames = namesByFamily.get(familyKey) ?? [];
+    for (const option of getAttachedVariantOptionValues(product)) {
+      upsert(familyKey, option.name, option.value);
+    }
+    for (const optionName of configuredNames) {
+      const explicit = getOptionValueFromProduct(product, optionName);
+      if (explicit) upsert(familyKey, optionName, explicit);
+    }
+  }
+
+  return valuesByFamily;
+}
+
 function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyCsvMetafieldColumn[], policy?: PolicyDocument): string[][] {
   const rows: string[][] = [];
   const productById = new Map<string, LooseRecord>();
   const familiesWithAttachedVariants = new Set<string>();
   const familyOptionNames = collectFamilyAttachedOptionNames(products);
+  const familyOptionValues = collectFamilyOptionValues(products, familyOptionNames);
   for (const product of products) {
     const candidates = [product.id, product.product_id, product.handle, getProductKey(product, "product")];
     for (const candidate of candidates) {
@@ -509,10 +665,11 @@ function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyC
       : [];
     const familyUsesAttachedVariants = familiesWithAttachedVariants.has(getProductFamilyKey(product));
     const resolvedOptionNames = familyOptionNames.get(getProductFamilyKey(product)) ?? configuredDimensions;
+    const resolvedOptionValues = familyOptionValues.get(getProductFamilyKey(product)) ?? new Map<string, string[]>();
     const variants = isAttachedVariant(product)
       ? getAttachedVariantRows(product, resolvedOptionNames)
       : familyUsesAttachedVariants
-        ? buildImplicitVariantRows(product, resolvedOptionNames)
+        ? buildImplicitVariantRows(product, resolvedOptionNames, resolvedOptionValues)
         : getVariantRows(product, policy);
     const useRealOptionNames = hasMeaningfulVariantOptions(variants);
     const option1Name = useRealOptionNames ? (resolvedOptionNames[0] ?? "Option1") : "Title";
@@ -528,21 +685,33 @@ function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyC
           : ""
     );
     const vendor = getVendor(baseProduct);
+    const normalizedTitle = normalizeFamilyTitle(
+      typeof baseProduct.title === "string" ? baseProduct.title : "",
+      [
+        ...(resolvedOptionValues.get(option1Name.toLowerCase()) ?? []),
+        ...(resolvedOptionValues.get(option2Name.toLowerCase()) ?? []),
+        ...(resolvedOptionValues.get(option3Name.toLowerCase()) ?? [])
+      ]
+    );
     const imageAltText = typeof baseProduct.image_alt_text === "string" && baseProduct.image_alt_text.trim().length > 0
       ? baseProduct.image_alt_text
-      : (typeof baseProduct.title === "string" && baseProduct.title.trim().length > 0
-          ? baseProduct.title.trim()
+      : (normalizedTitle.trim().length > 0
+          ? normalizedTitle.trim()
           : dedupeTitleLikeText(vendor, typeof product.size === "string" ? product.size : "", typeof product.type === "string" ? product.type : ""));
     const handle = typeof baseProduct.handle === "string" && baseProduct.handle ? baseProduct.handle : getProductKey(baseProduct, "product");
     const metafieldMap = buildProductMetafieldMap(product);
+    const seoTitle = deriveSeoTitle({ ...baseProduct, title: normalizedTitle || baseProduct.title });
+    const seoDescription = deriveSeoDescription(baseProduct);
+    const productCategory = getLooseString(baseProduct, "product_category", "category");
+    const googleProductCategory = getLooseString(baseProduct, "google_product_category");
 
     variants.forEach((variant, index) => {
       rows.push([
-        typeof baseProduct.title === "string" ? baseProduct.title : "",
+        normalizedTitle || (typeof baseProduct.title === "string" ? baseProduct.title : ""),
         handle,
         normalizedDescription.description_html,
         vendor,
-        "",
+        productCategory,
         typeof baseProduct.product_type === "string" ? baseProduct.product_type : "",
         normalizeTags(baseProduct.tags),
         toShopifyBoolean(baseProduct["published_on_online_store"], "TRUE"),
@@ -551,20 +720,36 @@ function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyC
         typeof variant.barcode === "string" ? variant.barcode : "",
         option1Name,
         typeof variant.option1 === "string" && variant.option1 ? variant.option1 : "Default Title",
+        "",
         option2Name,
         useRealOptionNames && typeof variant.option2 === "string" ? variant.option2 : "",
+        "",
         option3Name,
         useRealOptionNames && typeof variant.option3 === "string" ? variant.option3 : "",
+        "",
         typeof (variant as LooseRecord).price === "string" ? String((variant as LooseRecord).price) : typeof product.price === "string" ? product.price : "",
         typeof (variant as LooseRecord)["compare_at_price"] === "string"
           ? String((variant as LooseRecord)["compare_at_price"])
           : typeof product["compare_at_price"] === "string"
             ? String(product["compare_at_price"])
             : "",
-        toShopifyBoolean((variant as LooseRecord)["requires_shipping"], "TRUE"),
-        toShopifyBoolean((variant as LooseRecord).taxable, "TRUE"),
+        getLooseString(variant as LooseRecord, "cost_per_item") || getLooseString(product, "cost_per_item"),
+        toShopifyBoolean((variant as LooseRecord).taxable ?? product["taxable"], "TRUE"),
+        getLooseString(product, "inventory_tracker"),
+        getLooseString(variant as LooseRecord, "inventory_quantity") || getLooseString(product, "inventory_quantity"),
+        toShopifyBoolean((variant as LooseRecord)["continue_selling_when_out_of_stock"] ?? product["continue_selling_when_out_of_stock"], "FALSE"),
+        getLooseString(variant as LooseRecord, "weight_value_grams") || getLooseString(product, "weight_value_grams", "grams"),
+        getLooseString(variant as LooseRecord, "weight_unit") || getLooseString(product, "weight_unit"),
+        toShopifyBoolean((variant as LooseRecord)["requires_shipping"] ?? product["requires_shipping"], "TRUE"),
+        getLooseString(product, "fulfillment_service"),
         index === 0 ? featuredImage : "",
+        index === 0 && featuredImage ? "1" : "",
         imageAltText,
+        getLooseString(variant as LooseRecord, "image", "variant_image", "variant_image_url"),
+        toShopifyBoolean(product["gift_card"], "FALSE"),
+        seoTitle,
+        seoDescription,
+        googleProductCategory,
         ...metafieldColumns.map((column) => metafieldMap.get(`${column.namespace}.${column.key}`) ?? "")
       ]);
     });
@@ -576,32 +761,7 @@ function buildShopifyCsvRows(products: LooseRecord[], metafieldColumns: ShopifyC
 export async function writeShopifyImportCsv(root: string, products: LooseRecord[], policy?: PolicyDocument): Promise<string> {
   const paths = getCatalogPaths(root);
   const metafieldColumns = collectShopifyCsvMetafieldColumns(products, policy);
-  const header = [
-    "Title",
-    "Handle",
-    "Body (HTML)",
-    "Vendor",
-    "Category",
-    "Type",
-    "Tags",
-    "Published on online store",
-    "Status",
-    "SKU",
-    "Barcode",
-    "Option1 Name",
-    "Option1 Value",
-    "Option2 Name",
-    "Option2 Value",
-    "Option3 Name",
-    "Option3 Value",
-    "Variant Price",
-    "Variant Compare At Price",
-    "Variant Requires Shipping",
-    "Variant Taxable",
-    "Image Src",
-    "Image Alt Text",
-    ...metafieldColumns.map((column) => column.header)
-  ];
+  const header = [...SHOPIFY_IMPORT_HEADER, ...metafieldColumns.map((column) => column.header)];
 
   const rows = buildShopifyCsvRows(products, metafieldColumns, policy).map((row) => row.map(csvEscape).join(","));
   await writeText(paths.generatedShopifyCsv, `${header.join(",")}\n${rows.join("\n")}\n`);
@@ -613,7 +773,8 @@ export async function writeExcelWorkbook(
   runs: WorkflowRunSummary[],
   generatedProducts: LooseRecord[],
   shopifyProducts: LooseRecord[],
-  policy?: PolicyDocument
+  policy?: PolicyDocument,
+  pendingReviewRows: Array<Record<string, string>> = []
 ): Promise<string> {
   const paths = getCatalogPaths(root);
   const moduleRows: Array<Record<string, string>> = [];
@@ -715,38 +876,14 @@ export async function writeExcelWorkbook(
 
   const shopifyMetafieldColumns = collectShopifyCsvMetafieldColumns(shopifyProducts, policy);
   const shopifyRows = buildShopifyCsvRows(shopifyProducts, shopifyMetafieldColumns, policy);
-  const shopifyHeader = [
-    "Title",
-    "Handle",
-    "Body (HTML)",
-    "Vendor",
-    "Category",
-    "Type",
-    "Tags",
-    "Published on online store",
-    "Status",
-    "SKU",
-    "Barcode",
-    "Option1 Name",
-    "Option1 Value",
-    "Option2 Name",
-    "Option2 Value",
-    "Option3 Name",
-    "Option3 Value",
-    "Variant Price",
-    "Variant Compare At Price",
-    "Variant Requires Shipping",
-    "Variant Taxable",
-    "Image Src",
-    "Image Alt Text",
-    ...shopifyMetafieldColumns.map((column) => column.header)
-  ];
+  const shopifyHeader = [...SHOPIFY_IMPORT_HEADER, ...shopifyMetafieldColumns.map((column) => column.header)];
 
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(moduleRows), "Runs");
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(productRows), "Generated Products");
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(imageRows), "Images");
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(metafieldRows), "Metafields");
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(pendingReviewRows), "Pending Review");
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([shopifyHeader, ...shopifyRows]), "Shopify Import");
   XLSX.writeFile(workbook, paths.generatedExcelWorkbook);
   return paths.generatedExcelWorkbook;

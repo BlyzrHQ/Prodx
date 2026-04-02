@@ -1,6 +1,22 @@
-import type { ConnectorJsonResponse } from "../types.js";
+import type { ConnectorJsonResponse, ProviderUsage } from "../types.js";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+
+function extractAnthropicUsage(raw: any, model: string): ProviderUsage | undefined {
+  const usage = raw?.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  return {
+    provider: "anthropic",
+    model,
+    input_tokens: Number(usage.input_tokens ?? 0),
+    output_tokens: Number(usage.output_tokens ?? 0),
+    total_tokens: Number(usage.input_tokens ?? 0) + Number(usage.output_tokens ?? 0),
+    cache_creation_input_tokens: Number(usage.cache_creation_input_tokens ?? 0),
+    cache_read_input_tokens: Number(usage.cache_read_input_tokens ?? 0),
+    raw: usage
+  };
+}
 
 export async function createAnthropicJsonResponse<T>({
   apiKey,
@@ -66,7 +82,8 @@ export async function createAnthropicJsonResponse<T>({
   return {
     raw: data,
     text,
-    json: JSON.parse(text) as T
+    json: JSON.parse(text) as T,
+    usage: extractAnthropicUsage(data, model)
   };
 }
 

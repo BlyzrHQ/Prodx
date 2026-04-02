@@ -331,6 +331,9 @@ export interface ProductRecord extends LooseRecord {
   title?: string;
   description?: string;
   description_html?: string;
+  body_html?: string;
+  seo_title?: string;
+  seo_description?: string;
   brand?: string;
   vendor?: string;
   handle?: string;
@@ -388,10 +391,23 @@ export interface ShopifyAuthSession extends OAuthCredentialSession {
   token_type?: string;
 }
 
+export interface ProviderUsage {
+  provider?: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  reasoning_tokens?: number;
+  raw?: LooseRecord;
+}
+
 export interface ConnectorJsonResponse<T> {
   raw: unknown;
   text: string;
   json: T;
+  usage?: ProviderUsage;
 }
 
 export interface EnrichmentOutput {
@@ -399,6 +415,8 @@ export interface EnrichmentOutput {
   description: string;
   description_html: string;
   handle: string;
+  seo_title?: string | null;
+  seo_description?: string | null;
   vendor?: string | null;
   brand?: string | null;
   product_type: string;
@@ -484,6 +502,8 @@ export interface ShopifyPayload extends LooseRecord {
   title?: string;
   handle?: string;
   descriptionHtml?: string;
+  seoTitle?: string;
+  seoDescription?: string;
   vendor?: string;
   productType?: string;
   tags?: string[];

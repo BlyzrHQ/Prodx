@@ -100,6 +100,75 @@ function normalizeRow(record: LooseRecord): LooseRecord {
   return normalized;
 }
 
+function parseSimpleTextLine(line: string, fallbackIndex: number): LooseRecord {
+  const cleaned = line
+    .trim()
+    .replace(/^[\-\*\u2022]+\s*/, "");
+
+  const match = cleaned.match(/^(.*?)(?:\s(?:-|\|)\s|\t+)([$€£]?\d+(?:[.,]\d{1,2})?)$/);
+  if (match) {
+    return normalizeRow({
+      id: `text-${fallbackIndex + 1}`,
+      title: match[1].trim(),
+      price: match[2].replace(/^[^\d]+/, "").replace(",", ".")
+    });
+  }
+
+  return normalizeRow({
+    id: `text-${fallbackIndex + 1}`,
+    title: cleaned
+  });
+}
+
+function looksLikeKeyValueLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.includes(":")) return false;
+  const [left] = trimmed.split(":", 1);
+  return normalizeKey(left) in FIELD_ALIASES || Object.values(FIELD_ALIASES).some((aliases) => aliases.some((alias) => normalizeKey(alias) === normalizeKey(left)));
+}
+
+function parseKeyValueBlock(block: string, fallbackIndex: number): LooseRecord {
+  const record: LooseRecord = { id: `text-${fallbackIndex + 1}` };
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (!key) continue;
+    record[key] = value;
+  }
+  return normalizeRow(record);
+}
+
+function parsePlainText(text: string): LooseRecord[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+
+  const blocks = trimmed
+    .split(/\r?\n\s*\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  const allBlocksLookLikeKeyValue = blocks.length > 0 && blocks.every((block) =>
+    block
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .every((line) => looksLikeKeyValueLine(line))
+  );
+
+  if (allBlocksLookLikeKeyValue) {
+    return blocks.map((block, index) => parseKeyValueBlock(block, index));
+  }
+
+  return trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => parseSimpleTextLine(line, index));
+}
+
 function parseCsv(text: string): LooseRecord[] {
   const lines = text.split(/\r?\n/).filter(Boolean);
   if (lines.length === 0) return [];
@@ -126,20 +195,34 @@ function unwrapJsonRecords(input: unknown): LooseRecord[] {
   return [record];
 }
 
+export function loadRecordsFromText(raw: string): LooseRecord[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return unwrapJsonRecords(JSON.parse(trimmed)).map((record) => normalizeRow(record));
+  }
+
+  return parsePlainText(trimmed).map((record) => normalizeRow(record));
+}
+
 export async function loadRecordsFromSource(sourcePath: string): Promise<LooseRecord[]> {
   const raw = await readText(sourcePath, "");
   const extension = sourcePath.toLowerCase().split(".").pop();
   let normalized: unknown;
   if (extension === "json") normalized = JSON.parse(raw);
   else if (extension === "csv") normalized = parseCsv(raw);
+  else if (extension === "txt" || extension === "text" || extension === "md") normalized = loadRecordsFromText(raw);
   else throw new Error(`Unsupported ingest format: ${extension}`);
 
-  return unwrapJsonRecords(normalized).map((record) => normalizeRow(record));
+  return Array.isArray(normalized) ? normalized.map((record) => normalizeRow(record)) : unwrapJsonRecords(normalized).map((record) => normalizeRow(record));
 }
 
-export async function runIngest({ jobId, input }: { jobId: string; input: { source_path: string } }) {
+export async function runIngest({ jobId, input }: { jobId: string; input: { source_path: string; source_text?: string } }) {
   const sourcePath = input.source_path;
-  const records = await loadRecordsFromSource(sourcePath);
+  const records = sourcePath === "--text"
+    ? loadRecordsFromText(String(input.source_text ?? ""))
+    : await loadRecordsFromSource(sourcePath);
 
   return createBaseResult({
     jobId,

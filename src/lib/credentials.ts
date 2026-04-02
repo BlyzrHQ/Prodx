@@ -1,7 +1,7 @@
 import path from "node:path";
 import { readJson, writeJson } from "./fs.js";
 import { getUserConfigDir } from "./paths.js";
-import type { CredentialStatus, CredentialValue, OAuthCredentialSession, RuntimeConfig } from "../types.js";
+import type { CredentialStatus, CredentialValue, LooseRecord, OAuthCredentialSession, RuntimeConfig } from "../types.js";
 
 const ENV_ALIASES = {
   openai: ["OPENAI_API_KEY"],
@@ -41,6 +41,22 @@ export async function setOAuthCredential(alias: string, session: OAuthCredential
   };
   await writeJson(filePath, store);
   return store[alias];
+}
+
+export async function loadOpenAICodexAuthSession(): Promise<(OAuthCredentialSession & { auth_mode?: string }) | null> {
+  const authPath = path.join(path.dirname(getUserConfigDir()), ".codex", "auth.json");
+  const payload = await readJson<LooseRecord | null>(authPath, null);
+  if (!payload || typeof payload !== "object") return null;
+
+  const apiKey = typeof payload.OPENAI_API_KEY === "string" ? payload.OPENAI_API_KEY.trim() : "";
+  if (!apiKey) return null;
+
+  return {
+    access_token: apiKey,
+    method: "oauth",
+    obtained_at: typeof payload.last_refresh === "string" ? payload.last_refresh : new Date().toISOString(),
+    auth_mode: typeof payload.auth_mode === "string" ? payload.auth_mode : undefined
+  };
 }
 
 async function loadStoredCredentials(): Promise<Record<string, StoredCredentialRecord>> {

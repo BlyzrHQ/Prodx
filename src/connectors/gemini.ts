@@ -1,7 +1,21 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import type { ConnectorJsonResponse } from "../types.js";
+import type { ConnectorJsonResponse, ProviderUsage } from "../types.js";
+
+function extractGeminiUsage(raw: any, model: string): ProviderUsage | undefined {
+  const usage = raw?.usageMetadata;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  return {
+    provider: "gemini",
+    model,
+    input_tokens: Number(usage.promptTokenCount ?? 0),
+    output_tokens: Number(usage.candidatesTokenCount ?? 0),
+    total_tokens: Number(usage.totalTokenCount ?? 0),
+    raw: usage
+  };
+}
 
 export async function createGeminiJsonResponse<T>({
   apiKey,
@@ -104,13 +118,15 @@ export async function createGeminiJsonResponse<T>({
     return {
       raw: data,
       text,
-      json: JSON.parse(text) as T
+      json: JSON.parse(text) as T,
+      usage: extractGeminiUsage(data, model)
     };
   }
   return {
     raw: data,
     text,
-    json: JSON.parse(text) as T
+    json: JSON.parse(text) as T,
+    usage: extractGeminiUsage(data, model)
   };
 }
 
