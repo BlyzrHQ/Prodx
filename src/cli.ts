@@ -460,6 +460,7 @@ async function loadSingleRecordFromFlags(root: string, flags: Flags, message = "
 }
 
 async function getPolicyOrThrow(root: string): Promise<PolicyDocument> {
+  await initWorkspace(root);
   const policy = await readJson<PolicyDocument | null>(getCatalogPaths(root).policyJson, null);
   if (!policy) throw new Error("No Catalog Guide found. Run `catalog guide generate` or `catalog expert generate` first.");
   return policy;

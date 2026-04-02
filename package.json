@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Local-first Shopify catalog toolkit built from the PRD in this workspace.",
+  "workspaces": [
+    "apps/web"
+  ],
   "bin": {
     "catalog": "./bin/catalog.js"
   },
@@ -11,7 +14,10 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --disable-warning=ExperimentalWarning --experimental-strip-types ./tests/run-tests.ts",
-    "catalog": "npm run build && node ./dist/cli.js"
+    "catalog": "npm run build && node ./dist/cli.js",
+    "web:dev": "npm --workspace apps/web run dev",
+    "web:build": "npm run build && npm --workspace apps/web run build",
+    "web:check": "npm run build && npm --workspace apps/web run check"
   },
   "engines": {
     "node": ">=22"

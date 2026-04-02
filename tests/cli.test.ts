@@ -28,13 +28,13 @@ test("init creates .catalog structure and runtime config", async () => {
   assert.equal(runtime.providers.openai_default.type, "openai");
 });
 
-test("expert generate creates policy files", async () => {
+test("expert generate creates guide files", async () => {
   const cwd = await createTempProject();
   const io = writer();
   await runCli(["init"], { cwd, stdout: io, stderr: io });
   const code = await runCli(["expert", "generate", "--industry", "grocery", "--business-name", "Test Store"], { cwd, stdout: io, stderr: io });
   assert.equal(code, 0);
-  const policy = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "policy", "catalog-policy.json"), "utf8"));
+  const policy = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "guide", "catalog-guide.json"), "utf8"));
   assert.equal(policy.meta.business_name, "Test Store");
 });
 

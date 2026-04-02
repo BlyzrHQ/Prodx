@@ -71,6 +71,7 @@ export interface CredentialStatus {
 
 export interface CatalogPaths {
   base: string;
+  guideDir: string;
   policyDir: string;
   learningDir: string;
   configDir: string;
@@ -82,9 +83,15 @@ export interface CatalogPaths {
   generatedWorkflowProductsJson: string;
   generatedReviewCsv: string;
   generatedShopifyCsv: string;
+  generatedRejectedCsv: string;
   generatedExcelWorkbook: string;
+  guideMarkdown: string;
+  guideJson: string;
   policyMarkdown: string;
   policyJson: string;
+  legacyPolicyDir: string;
+  legacyPolicyMarkdown: string;
+  legacyPolicyJson: string;
   learningMarkdown: string;
   runtimeJson: string;
   indexJson: string;
@@ -551,4 +558,126 @@ export interface WorkflowRunSummary {
     status: string;
     needs_review: boolean;
   }>;
+}
+
+export interface GuestSession {
+  id: string;
+  created_at: string;
+  expires_at: string;
+  onboarding_completed: boolean;
+  business_name?: string;
+  business_description?: string;
+  industry?: string;
+  store_url?: string;
+  provider_models?: Record<string, string>;
+}
+
+export interface SessionSecret {
+  provider: string;
+  encrypted_value: string;
+  iv: string;
+  tag: string;
+  created_at: string;
+}
+
+export interface WorkflowProductDisposition {
+  status: "passed" | "duplicate" | "variant" | "rejected" | "pending_review";
+  reason?: string;
+}
+
+export interface WorkflowProduct {
+  id: string;
+  session_id: string;
+  workflow_id: string;
+  product_key: string;
+  source_record_id: string;
+  title: string;
+  normalized_record: LooseRecord;
+  generated_product_path?: string;
+  generated_image_dir?: string;
+  selected_image_url?: string;
+  local_image_path?: string;
+  modules: WorkflowRunSummary["modules"];
+  disposition: WorkflowProductDisposition;
+}
+
+export interface ReviewItem {
+  id: string;
+  session_id: string;
+  workflow_id: string;
+  product_id: string;
+  product_key: string;
+  title: string;
+  blocking_module: string;
+  issue_type: string;
+  reason: string;
+  preview_image_url?: string;
+  current_fields: LooseRecord;
+  action_state: "pending" | "approved" | "rejected";
+  edit_payload?: LooseRecord;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GeneratedArtifact {
+  id: string;
+  session_id: string;
+  workflow_id: string;
+  type: "guide_markdown" | "shopify_import" | "rejected_products" | "workflow_summary";
+  storage_key: string;
+  file_name: string;
+  content_type: string;
+  created_at: string;
+}
+
+export interface SyncBatch {
+  id: string;
+  session_id: string;
+  workflow_id: string;
+  status: "idle" | "running" | "complete" | "failed";
+  approved_product_ids: string[];
+  results: Array<{
+    product_id: string;
+    product_key: string;
+    status: "success" | "failed" | "skipped";
+    message: string;
+  }>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkflowStageState {
+  guide: "idle" | "running" | "complete" | "failed";
+  match: "idle" | "running" | "complete" | "failed";
+  enrich: "idle" | "running" | "complete" | "failed";
+  image: "idle" | "running" | "complete" | "failed";
+  qa: "idle" | "running" | "complete" | "failed";
+  sync_prep: "idle" | "running" | "complete" | "failed";
+}
+
+export interface WorkflowSummaryCounts {
+  total_entries: number;
+  passed_products: number;
+  duplicate_products: number;
+  variant_products: number;
+  rejected_products: number;
+  pending_review_products: number;
+  manually_reviewed_products: number;
+}
+
+export interface WorkflowSession {
+  id: string;
+  session_id: string;
+  status: "idle" | "running" | "needs_review" | "ready" | "failed";
+  created_at: string;
+  updated_at: string;
+  input_source: "text" | "file";
+  input_name?: string;
+  parsed_count: number;
+  guide_generated: boolean;
+  guide_version?: string;
+  stage_state: WorkflowStageState;
+  counts: WorkflowSummaryCounts;
+  artifact_ids: string[];
+  sync_batch_id?: string;
 }

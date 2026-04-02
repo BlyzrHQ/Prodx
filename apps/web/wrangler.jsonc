@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "prodx-web",
+  "compatibility_date": "2026-04-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "prodx",
+      "database_id": "TODO_DATABASE_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "prodx-artifacts"
+    }
+  ],
+  "queues": {
+    "consumers": [
+      {
+        "queue": "prodx-workflows"
+      },
+      {
+        "queue": "prodx-sync"
+      }
+    ]
+  }
+}

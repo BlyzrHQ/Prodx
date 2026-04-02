@@ -604,8 +604,8 @@ export async function runExpertGenerate({ root, jobId, input }: { root: string; 
     needsReview: false,
     proposedChanges: {
       policy_files: [
-        ".catalog/policy/catalog-policy.md",
-        ".catalog/policy/catalog-policy.json",
+        ".catalog/guide/catalog-guide.md",
+        ".catalog/guide/catalog-guide.json",
         ".catalog/learning/catalog-learning.md"
       ]
     },

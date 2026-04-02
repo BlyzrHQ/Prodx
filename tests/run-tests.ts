@@ -32,12 +32,12 @@ async function seedGuideFiles(
     businessDescription: input.businessDescription ?? "",
     operatingMode: input.operatingMode ?? "both"
   });
-  const policyDir = path.join(cwd, ".catalog", "policy");
+  const policyDir = path.join(cwd, ".catalog", "guide");
   const learningDir = path.join(cwd, ".catalog", "learning");
   await fs.mkdir(policyDir, { recursive: true });
   await fs.mkdir(learningDir, { recursive: true });
-  await fs.writeFile(path.join(policyDir, "catalog-policy.json"), JSON.stringify(policy, null, 2));
-  await fs.writeFile(path.join(policyDir, "catalog-policy.md"), renderPolicyMarkdown(policy));
+  await fs.writeFile(path.join(policyDir, "catalog-guide.json"), JSON.stringify(policy, null, 2));
+  await fs.writeFile(path.join(policyDir, "catalog-guide.md"), renderPolicyMarkdown(policy));
   try {
     await fs.access(path.join(learningDir, "catalog-learning.md"));
   } catch {
@@ -537,7 +537,7 @@ const tests = [
       assert.equal(output.result.status, "failed");
       assert.equal(Array.isArray(output.result.errors), true);
       assert.equal(output.result.errors.length > 0, true);
-      await assert.rejects(fs.access(path.join(cwd, ".catalog", "policy", "catalog-policy.json")));
+      await assert.rejects(fs.access(path.join(cwd, ".catalog", "guide", "catalog-guide.json")));
     }
   },
   {

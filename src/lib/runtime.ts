@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { ensureDir, readJson, writeJson, writeText, exists } from "./fs.js";
 import { getCatalogPaths } from "./paths.js";
 import { setByPath, getByPath } from "./json-path.js";
@@ -26,7 +27,7 @@ export function defaultRuntimeConfig(): RuntimeConfig {
 
 export async function initWorkspace(root: string) {
   const paths = getCatalogPaths(root);
-  await ensureDir(paths.policyDir);
+  await ensureDir(paths.guideDir);
   await ensureDir(paths.learningDir);
   await ensureDir(paths.configDir);
   await ensureDir(paths.indexDir);
@@ -34,6 +35,12 @@ export async function initWorkspace(root: string) {
   await ensureDir(paths.generatedDir);
   await ensureDir(paths.generatedProductsDir);
   await ensureDir(paths.generatedImagesDir);
+  if (!(await exists(paths.guideJson)) && (await exists(paths.legacyPolicyJson))) {
+    await fs.copyFile(paths.legacyPolicyJson, paths.guideJson);
+  }
+  if (!(await exists(paths.guideMarkdown)) && (await exists(paths.legacyPolicyMarkdown))) {
+    await fs.copyFile(paths.legacyPolicyMarkdown, paths.guideMarkdown);
+  }
   if (!(await exists(paths.runtimeJson))) await writeJson(paths.runtimeJson, defaultRuntimeConfig());
   if (!(await exists(paths.learningMarkdown))) await writeText(paths.learningMarkdown, "# Catalog Learning\n\n- No lessons recorded yet.\n");
   return paths;

@@ -17,6 +17,35 @@ The guide is meant to work both as:
 - the machine-readable contract for the workflow
 - a human-readable operating playbook for catalog, merchandising, and QA teams
 
+## Catalog Pilot Web App
+
+This repo now also includes a hosted frontend scaffold for **Catalog Pilot**:
+
+- Next.js App Router + React
+- guest-first session flow
+- onboarding for providers and Shopify
+- pasted text or uploaded file input
+- workflow polling and progress
+- pending-review approvals in-app
+- final downloads for:
+  - Catalog Guide
+  - Shopify import
+  - rejected products
+
+Current local-dev architecture:
+
+- frontend lives in [`apps/web`](./apps/web)
+- shared app service lives in [`src/app`](./src/app)
+- guest-session data is stored locally in `.catalog-web/`
+
+Cloudflare deployment scaffolding is included for:
+
+- D1
+- R2
+- Queues
+
+The current working implementation is filesystem-backed for local development, with Cloudflare config/migrations scaffolded for the hosted deployment phase.
+
 ## What It Handles
 
 - Catalog Guide generation
@@ -62,9 +91,9 @@ The toolkit writes everything into `.catalog/`.
 
 Important files:
 
-- `.catalog/policy/catalog-policy.md`
+- `.catalog/guide/catalog-guide.md`
   - human-readable Catalog Guide
-- `.catalog/policy/catalog-policy.json`
+- `.catalog/guide/catalog-guide.json`
   - machine-readable Catalog Guide
 - `.catalog/generated/products/`
   - generated product JSON files
@@ -90,6 +119,14 @@ Install and build:
 npm install
 npm run build
 npm test
+npm run web:check
+npm run web:build
+```
+
+Run the web app locally:
+
+```powershell
+npm run web:dev
 ```
 
 Initialize the workspace:

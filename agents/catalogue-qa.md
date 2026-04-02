@@ -1,7 +1,7 @@
 # Catalogue QA Playbook
 
 ## Purpose
-Score product readiness against the active catalog policy.
+Score product readiness against the active catalog guide.
 
 ## Command
 `catalog qa --input <product.json>`

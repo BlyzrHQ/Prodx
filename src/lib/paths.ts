@@ -8,9 +8,16 @@ export function getWorkspaceRoot(cwd = process.cwd()): string {
 
 export function getCatalogPaths(root = process.cwd()): CatalogPaths {
   const base = path.join(root, ".catalog");
+  const guideDir = path.join(base, "guide");
+  const guideMarkdown = path.join(guideDir, "catalog-guide.md");
+  const guideJson = path.join(guideDir, "catalog-guide.json");
+  const legacyPolicyDir = path.join(base, "policy");
+  const legacyPolicyMarkdown = path.join(legacyPolicyDir, "catalog-policy.md");
+  const legacyPolicyJson = path.join(legacyPolicyDir, "catalog-policy.json");
   return {
     base,
-    policyDir: path.join(base, "policy"),
+    guideDir,
+    policyDir: guideDir,
     learningDir: path.join(base, "learning"),
     configDir: path.join(base, "config"),
     indexDir: path.join(base, "index"),
@@ -21,9 +28,15 @@ export function getCatalogPaths(root = process.cwd()): CatalogPaths {
     generatedWorkflowProductsJson: path.join(base, "generated", "workflow-products.json"),
     generatedReviewCsv: path.join(base, "generated", "review-queue.csv"),
     generatedShopifyCsv: path.join(base, "generated", "shopify-import.csv"),
+    generatedRejectedCsv: path.join(base, "generated", "rejected-products.csv"),
     generatedExcelWorkbook: path.join(base, "generated", "catalog-review.xlsx"),
-    policyMarkdown: path.join(base, "policy", "catalog-policy.md"),
-    policyJson: path.join(base, "policy", "catalog-policy.json"),
+    guideMarkdown,
+    guideJson,
+    policyMarkdown: guideMarkdown,
+    policyJson: guideJson,
+    legacyPolicyDir,
+    legacyPolicyMarkdown,
+    legacyPolicyJson,
     learningMarkdown: path.join(base, "learning", "catalog-learning.md"),
     runtimeJson: path.join(base, "config", "runtime.json"),
     indexJson: path.join(base, "index", "catalog-index.json")

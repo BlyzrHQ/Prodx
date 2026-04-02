@@ -1,7 +1,7 @@
 # Product Enricher Playbook
 
 ## Purpose
-Propose title, description, handle, and product-type improvements using the catalog policy.
+Propose title, description, handle, and product-type improvements using the catalog guide.
 
 ## Command
 `catalog enrich --input <product.json>`

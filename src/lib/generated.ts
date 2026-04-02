@@ -768,6 +768,37 @@ export async function writeShopifyImportCsv(root: string, products: LooseRecord[
   return paths.generatedShopifyCsv;
 }
 
+export async function writeRejectedProductsCsv(
+  root: string,
+  products: Array<LooseRecord & { rejection_reason?: string; source_record_id?: string }>
+): Promise<string> {
+  const paths = getCatalogPaths(root);
+  const header = [
+    "Product Key",
+    "Source Record ID",
+    "Title",
+    "Handle",
+    "Vendor",
+    "Product Type",
+    "Reason",
+    "Description"
+  ];
+
+  const rows = products.map((product) => ([
+    getProductKey(product, "product"),
+    String(product.source_record_id ?? ""),
+    String(product.title ?? ""),
+    String(product.handle ?? ""),
+    getVendor(product),
+    String(product.product_type ?? ""),
+    String(product.rejection_reason ?? ""),
+    normalizeDescriptionPair(String(product.description_html ?? product.description ?? "")).description
+  ].map(csvEscape).join(",")));
+
+  await writeText(paths.generatedRejectedCsv, `${header.join(",")}\n${rows.join("\n")}\n`);
+  return paths.generatedRejectedCsv;
+}
+
 export async function writeExcelWorkbook(
   root: string,
   runs: WorkflowRunSummary[],

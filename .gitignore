@@ -1,7 +1,14 @@
 .catalog/
+.catalog-web/
 node_modules/
 dist/
 coverage/
 .DS_Store
 test-results/
 tmp-*.json
+apps/web/.next/
+apps/web/.open-next/
+apps/web/.wrangler/
+apps/web/tsconfig.tsbuildinfo
+
+apps/web/.codex-dev/

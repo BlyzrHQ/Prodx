@@ -15,7 +15,7 @@ export async function resolveProvider(root: string, moduleName: string, slotName
   }
 
   const credentialAlias = provider.credential;
-  const credential = credentialAlias ? await getCredential(credentialAlias) : null;
+  const credential = credentialAlias ? await getCredential(credentialAlias, root) : null;
 
   return {
     alias,
