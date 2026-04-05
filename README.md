@@ -33,6 +33,38 @@ The current web surface is a homepage for the project:
 
 It keeps the same visual system and branding, but the working product surface remains the local CLI.
 
+## Cloudflare Hosting
+
+The fastest hosting path today is to deploy the homepage in [`apps/web`](./apps/web) to Cloudflare Workers and keep the real catalog workflow local in the CLI.
+
+This repo is now prepared for that homepage-only path with:
+
+- `@opennextjs/cloudflare`
+- `wrangler.jsonc`
+- `open-next.config.ts`
+- workspace scripts for Cloudflare build, preview, and deploy
+
+Useful commands:
+
+```powershell
+npm run web:cf:build
+npm run web:preview
+npm run web:deploy
+```
+
+Recommended Cloudflare setup:
+
+- connect the GitHub repo
+- set the project root directory to `apps/web`
+- deploy the generated Worker first to a `workers.dev` URL
+- add your custom domain only after the homepage looks right
+
+Important note:
+
+- the hosted site is currently the Prodx homepage
+- the full agentic catalog workflow still runs locally through the CLI
+- D1, R2, and queue-backed hosted workflow execution are a later phase
+
 ## Project Structure
 
 ```text

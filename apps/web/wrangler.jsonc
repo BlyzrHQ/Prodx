@@ -1,28 +1,17 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  "main": ".open-next/worker.js",
   "name": "prodx-web",
-  "compatibility_date": "2026-04-02",
-  "d1_databases": [
+  "compatibility_date": "2026-04-05",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "services": [
     {
-      "binding": "DB",
-      "database_name": "prodx",
-      "database_id": "TODO_DATABASE_ID"
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "prodx-web"
     }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "ARTIFACTS",
-      "bucket_name": "prodx-artifacts"
-    }
-  ],
-  "queues": {
-    "consumers": [
-      {
-        "queue": "prodx-workflows"
-      },
-      {
-        "queue": "prodx-sync"
-      }
-    ]
-  }
+  ]
 }
