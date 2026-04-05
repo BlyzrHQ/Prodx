@@ -1,4 +1,4 @@
-import type { LooseRecord, ModuleResult } from "../types.js";
+import type { AgentRun, LooseRecord, ModuleResult } from "../types.js";
 
 export function createBaseResult({
   jobId,
@@ -10,7 +10,8 @@ export function createBaseResult({
   errors = [],
   reasoning = [],
   nextActions = [],
-  artifacts = {}
+  artifacts = {},
+  agentRun
 }: {
   jobId: string;
   module: string;
@@ -22,6 +23,7 @@ export function createBaseResult({
   reasoning?: string[];
   nextActions?: string[];
   artifacts?: LooseRecord;
+  agentRun?: AgentRun;
 }): ModuleResult {
   return {
     job_id: jobId,
@@ -33,6 +35,7 @@ export function createBaseResult({
     errors,
     reasoning,
     artifacts,
-    next_actions: nextActions
+    next_actions: nextActions,
+    agent_run: agentRun
   };
 }

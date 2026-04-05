@@ -19,16 +19,22 @@ const exampleCommands = [
 const outputs = [
   {
     title: "Prodx Guide",
-    body: "A markdown guide with catalog rules, field expectations, and merchandising direction."
+    body: "A practical guide for how your catalog should be written, structured, and reviewed."
   },
   {
     title: "Shopify Import",
-    body: "A clean CSV with approved products only, ready for Shopify import or live sync."
+    body: "A clean CSV with approved products only, ready to import into Shopify when you are."
   },
   {
     title: "Workflow Summary",
-    body: "A quick audit of totals, duplicates, variants, passed products, and review outcomes."
+    body: "A clear summary of what passed, what was skipped, what became a variant, and what needs attention."
   }
+];
+
+const tickerMessages = [
+  "Less cleanup",
+  "Fewer mistakes",
+  "Better catalog handoffs"
 ];
 
 export function ProdxHomepage() {
@@ -37,7 +43,7 @@ export function ProdxHomepage() {
       <style dangerouslySetInnerHTML={{__html: `
         .customHero {
           background-color: var(--surface-soft);
-          padding: 80px;
+          padding: 56px 80px 72px;
           gap: 48px;
           border-radius: 0;
           border: none;
@@ -78,16 +84,6 @@ export function ProdxHomepage() {
           background: var(--primary);
           color: #fff;
         }
-        .customSecondaryBtn {
-          font-family: Geist, sans-serif;
-          font-size: 16px;
-          font-weight: 600;
-          padding: 14px 32px;
-          border-radius: 9999px;
-          background: transparent;
-          color: var(--primary);
-          border: 1.5px solid var(--primary);
-        }
         .quickstartSection {
           background-color: var(--ink);
           border-radius: 24px;
@@ -108,7 +104,7 @@ export function ProdxHomepage() {
         @media (max-width: 860px) {
           .step-arrow-icon { display: none !important; }
           .customHero {
-            padding: 40px 20px !important;
+            padding: 28px 20px 40px !important;
             gap: 32px !important;
             display: flex !important;
             flex-direction: column !important;
@@ -167,17 +163,14 @@ export function ProdxHomepage() {
       >
         <div className="homepageHeroCopy customHeroCopy">
           <h1 className="customHeroTitle">
-            Turn messy product data into Shopify-ready catalogs
+            Clean up your product data before it reaches Shopify
           </h1>
           <p className="heroBody customHeroBody">
-            Prodx cleans, enriches, and validates your product data—so every listing is complete, consistent, and ready to sell.
+            Prodx helps you take raw product lists, fill the important gaps, catch risky issues early, and end up with files you can actually use.
           </p>
           <div className="heroActions customHeroActions">
             <a className="button isPrimary customPrimaryBtn" href="#quickstart">
-              Try it now
-            </a>
-            <a className="button isSecondary customSecondaryBtn" href="#commands">
-              See How It Works
+              Download and run it
             </a>
           </div>
         </div>
@@ -222,17 +215,30 @@ export function ProdxHomepage() {
         </div>
       </motion.section>
 
-      <div style={{ width: "100vw", position: "relative", left: "50%", right: "50%", marginLeft: "-50vw", marginRight: "-50vw", overflow: "hidden", background: "transparent", padding: "16px 0", display: "flex", whiteSpace: "nowrap" }}>
+      <div style={{ width: "100vw", position: "relative", left: "50%", right: "50%", marginLeft: "-50vw", marginRight: "-50vw", overflow: "hidden", background: "var(--primary)", padding: "18px 0", display: "flex", whiteSpace: "nowrap" }}>
         <motion.div 
           animate={{ x: [0, -1000] }} 
           transition={{ repeat: Infinity, ease: "linear", duration: 20 }}
           style={{ display: "flex", gap: "40px" }}
         >
-          {Array(10).fill("No spreadsheets. No guesswork. No broken listings.").map((text, i) => (
-            <span key={i} style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "14px", fontWeight: 600, color: "var(--primary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-              {text}
-            </span>
-          ))}
+          {Array.from({ length: 6 }, (_, repeatIndex) =>
+            tickerMessages.map((text, messageIndex) => (
+              <span
+                key={`${repeatIndex}-${messageIndex}`}
+                style={{ display: "inline-flex", alignItems: "center", gap: "18px" }}
+              >
+                <span
+                  style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "18px", fontWeight: 700, color: "rgba(255,255,255,0.92)", textTransform: "uppercase", letterSpacing: "0.05em" }}
+                >
+                  {text}
+                </span>
+                <span
+                  aria-hidden="true"
+                  style={{ width: "9px", height: "9px", borderRadius: "9999px", border: "1.5px solid rgba(255,255,255,0.72)", background: "transparent", display: "inline-block" }}
+                />
+              </span>
+            ))
+          )}
         </motion.div>
       </div>
 
@@ -245,14 +251,14 @@ export function ProdxHomepage() {
         transition={{ duration: 0.6 }}
       >
         <h2 style={{ fontFamily: "Inter, sans-serif", fontSize: "36px", fontWeight: 700, color: "var(--ink)", margin: 0, textAlign: "center" }}>
-          How Catalog Pilot works
+          How Prodx works
         </h2>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", maxWidth: "1200px", gap: "16px", flexWrap: "wrap" }}>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "20px", flex: 1, minWidth: "250px", padding: "0 16px", textAlign: "center" }}>
             <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "48px", fontWeight: 700, color: "var(--primary)" }}>01</div>
-            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Connect & Configure</h3>
+            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Set up your workspace</h3>
             <p style={{ fontFamily: "Geist, sans-serif", fontSize: "14px", lineHeight: 1.6, color: "var(--secondary)", margin: 0 }}>
-              Link your Shopify store, choose your AI models, and set your catalog rules — all in minutes.
+              Generate your guide, choose your providers, and define the rules your catalog should follow.
             </p>
           </div>
           
@@ -260,9 +266,9 @@ export function ProdxHomepage() {
 
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "20px", flex: 1, minWidth: "250px", padding: "0 16px", textAlign: "center" }}>
             <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "48px", fontWeight: 700, color: "var(--primary)" }}>02</div>
-            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Upload & Process</h3>
+            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Run the workflow</h3>
             <p style={{ fontFamily: "Geist, sans-serif", fontSize: "14px", lineHeight: 1.6, color: "var(--secondary)", margin: 0 }}>
-              Paste or drop your products. AI enriches descriptions, fills gaps, and validates every field.
+              Feed in your products and let Prodx match, enrich, validate, and prepare them step by step.
             </p>
           </div>
 
@@ -270,9 +276,9 @@ export function ProdxHomepage() {
 
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "20px", flex: 1, minWidth: "250px", padding: "0 16px", textAlign: "center" }}>
             <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "48px", fontWeight: 700, color: "var(--primary)" }}>03</div>
-            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Review & Publish</h3>
+            <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Review the result</h3>
             <p style={{ fontFamily: "Geist, sans-serif", fontSize: "14px", lineHeight: 1.6, color: "var(--secondary)", margin: 0 }}>
-              Approve flagged items, download clean files, and sync directly to your Shopify store.
+              Check flagged items, keep the good output, and move forward with a cleaner Shopify import.
             </p>
           </div>
         </div>
@@ -294,7 +300,7 @@ export function ProdxHomepage() {
             Download and run locally
           </h2>
           <p style={{ color: "#9CA89C", fontSize: "16px", margin: 0, maxWidth: "600px" }}>
-            These are the main commands you need to get the toolkit ready on your machine.
+            Start with these commands to get Prodx running on your machine and test the workflow end to end.
           </p>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: "24px" }}>
@@ -343,7 +349,7 @@ export function ProdxHomepage() {
             Outputs
           </span>
           <h2 style={{ fontFamily: "Inter, sans-serif", fontSize: "32px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>
-            What the toolkit gives you
+            What you get at the end
           </h2>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 250px), 1fr))", gap: "16px", width: "100%", maxWidth: "1200px" }}>

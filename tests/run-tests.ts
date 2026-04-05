@@ -10,10 +10,14 @@ import { createOpenAIJsonResponse } from "../dist/connectors/openai.js";
 import { createGeminiJsonResponse } from "../dist/connectors/gemini.js";
 import { buildGeneratedProduct, writeShopifyImportCsv } from "../dist/lib/generated.js";
 import { loadOpenAICodexAuthSession } from "../dist/lib/credentials.js";
+import { appendLearningRecords, loadWorkflowMemory, saveWorkflowMemory } from "../dist/lib/learning.js";
+import { defaultRuntimeConfig } from "../dist/lib/runtime.js";
 import { buildStarterPolicy, initialLearningMarkdown, renderPolicyMarkdown } from "../dist/lib/policy-template.js";
 import { hasPopulatedProductField } from "../dist/lib/product.js";
+import { estimateProviderCost } from "../dist/lib/provider-cost.js";
+import { decideSupervisorAction } from "../dist/agents/supervisor-agent.js";
 import { sanitizeProviderEvaluationAgainstInput } from "../dist/modules/qa.js";
-import { sanitizeCustomerFacingDescription, shouldUseWebVerification } from "../dist/modules/enrich.js";
+import { runEnrich, sanitizeCustomerFacingDescription, shouldUseWebVerification } from "../dist/modules/enrich.js";
 import { buildImageSearchQueries, buildImageSearchQuery, evaluateImageCandidateUrl, rankImageCandidates } from "../dist/modules/image-optimize.js";
 import { loadRecordsFromSource, loadRecordsFromText } from "../dist/modules/ingest.js";
 import { runMatchDecision } from "../dist/modules/match.js";
@@ -292,6 +296,192 @@ const tests = [
       } finally {
         process.env.USERPROFILE = originalUserProfile;
         process.env.HOME = originalHome;
+      }
+    }
+  },
+  {
+    name: "default runtime config enables bounded agentic workflow settings",
+    run: async () => {
+      const runtime = defaultRuntimeConfig();
+      assert.equal(runtime.agentic?.enabled, true);
+      assert.equal(runtime.agentic?.max_enrich_retries, 1);
+      assert.equal(runtime.agentic?.max_image_retries, 1);
+      assert.equal(runtime.agentic?.max_iterations_per_product, 4);
+      assert.equal(runtime.agentic?.agents?.["enrich-agent"]?.enabled, true);
+      assert.equal(runtime.agentic?.agents?.["qa-agent"]?.primary_provider, "openai_default");
+    }
+  },
+  {
+    name: "supervisor retries fixable enrich and image issues within the configured cap",
+    run: async () => {
+      const runtime = defaultRuntimeConfig();
+      const decision = decideSupervisorAction({
+        runtimeConfig: runtime,
+        memory: {
+          product_key: "sample",
+          source_record_id: "sample",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          enrich_retries: 0,
+          image_retries: 0,
+          total_iterations: 1,
+          attempts: [],
+          supervisor_decisions: [],
+          learning_records: []
+        },
+        qaPassed: false,
+        qaNeedsReview: true,
+        qaFeedback: {
+          fixable_findings: [
+            { field: "description_html", issue_type: "format", severity: "major", message: "Description needs work", expected: "clean", actual: "rough", deduction: 5 },
+            { field: "featured_image", issue_type: "invalid", severity: "major", message: "Hero image is weak", expected: "exact match", actual: "logo", deduction: 5 }
+          ],
+          hard_blockers: [],
+          review_blockers: [],
+          retry_targets: ["enrich-agent", "image-agent"],
+          retry_instructions: ["retry both"],
+          confidence_delta: -0.1,
+          recommended_next_agent: "enrich-agent"
+        },
+        lastModuleStatus: "needs_review"
+      });
+      assert.equal(decision.action, "retry_both");
+      assert.match(decision.reason, /both retry budgets/i);
+    }
+  },
+  {
+    name: "learning records and workflow memory persist without duplicating lessons",
+    run: async () => {
+      const cwd = await createTempProject();
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Learning Store" });
+      const appended = await appendLearningRecords(cwd, [
+        {
+          id: "lesson-1",
+          created_at: new Date().toISOString(),
+          source: "qa-agent",
+          lesson: "Keep shopper descriptions free of internal review text."
+        },
+        {
+          id: "lesson-2",
+          created_at: new Date().toISOString(),
+          source: "qa-agent",
+          lesson: "Keep shopper descriptions free of internal review text."
+        }
+      ]);
+      assert.equal(appended.length, 1);
+      const memory = await loadWorkflowMemory(cwd, "sample-product", "source-1");
+      memory.total_iterations = 2;
+      memory.last_retry_reason = "Retry image selection.";
+      const savedPath = await saveWorkflowMemory(cwd, memory);
+      const reloaded = await loadWorkflowMemory(cwd, "sample-product", "source-1");
+      assert.equal(reloaded.total_iterations, 2);
+      assert.equal(reloaded.last_retry_reason, "Retry image selection.");
+      assert.match(savedPath, /workflow-memory/);
+    }
+  },
+  {
+    name: "provider cost estimator computes usd totals from tracked tokens",
+    run: async () => {
+      const estimate = estimateProviderCost({
+        provider: "openai",
+        model: "gpt-5",
+        input_tokens: 1000,
+        output_tokens: 500,
+        total_tokens: 1500,
+        cache_read_input_tokens: 200
+      });
+      assert.ok(estimate);
+      assert.equal(estimate.currency, "USD");
+      assert.equal(estimate.total_tokens, 1500);
+      assert.equal(estimate.estimated_total_cost_usd > 0, true);
+      assert.match(String(estimate.pricing_basis), /OpenAI/i);
+    }
+  },
+  {
+    name: "enricher falls back to gemini when the primary openai provider fails",
+    run: async () => {
+      const cwd = await createTempProject();
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Fallback Store" });
+      const originalOpenAi = process.env.OPENAI_API_KEY;
+      const originalGemini = process.env.GEMINI_API_KEY;
+      const originalFetch = globalThis.fetch;
+      process.env.OPENAI_API_KEY = "openai-test";
+      process.env.GEMINI_API_KEY = "gemini-test";
+      globalThis.fetch = async (input) => {
+        const url = String(input);
+        if (url.includes("api.openai.com")) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ error: { message: "upstream openai failure" } })
+          } as Response;
+        }
+        if (url.includes("generativelanguage.googleapis.com")) {
+          return {
+            ok: true,
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          title: "Baladna Greek Yogurt Plain 500g",
+                          description: "Plain Greek yogurt.",
+                          description_html: "<p>Plain Greek yogurt.</p>",
+                          handle: "baladna-greek-yogurt-plain-500g",
+                          seo_title: "Baladna Greek Yogurt Plain 500g",
+                          seo_description: "Plain Greek yogurt.",
+                          vendor: "Baladna",
+                          brand: "Baladna",
+                          product_type: "Yogurt",
+                          tags: ["yogurt"],
+                          metafields: [],
+                          warnings: [],
+                          summary: "Fallback Gemini enrichment succeeded.",
+                          confidence: 0.88,
+                          skipped_reasons: []
+                        })
+                      }
+                    ]
+                  }
+                }
+              ],
+              usageMetadata: {
+                promptTokenCount: 800,
+                candidatesTokenCount: 120,
+                totalTokenCount: 920
+              }
+            })
+          } as Response;
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      };
+
+      try {
+        const policy = buildStarterPolicy({ industry: "grocery", businessName: "Fallback Store" });
+        const result = await runEnrich({
+          root: cwd,
+          jobId: "enrich-fallback-test",
+          input: {
+            id: "p1",
+            title: "Baladna Greek Yogurt Plain 500g",
+            brand: "Baladna",
+            size: "500g"
+          },
+          policy
+        });
+        assert.equal(result.status, "success");
+        assert.equal(result.needs_review, false);
+        assert.equal(result.artifacts.provider_used, "gemini_flash_default");
+        assert.equal((result.artifacts.provider_usage as any)?.provider, "gemini");
+        assert.match(result.warnings.join("\n"), /openai_default/i);
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (originalOpenAi === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = originalOpenAi;
+        if (originalGemini === undefined) delete process.env.GEMINI_API_KEY;
+        else process.env.GEMINI_API_KEY = originalGemini;
       }
     }
   },
@@ -1201,8 +1391,15 @@ price: 199
       const workflow = JSON.parse(io.text);
       assert.equal(workflow.processed, 1);
       assert.equal(workflow.runs[0].modules.length >= 4, true);
+      assert.equal(Number(workflow.runs[0].cost_summary?.estimated_total_cost_usd ?? 0) >= 0, true);
       await fs.access(workflow.runs[0].generated_product_path);
       await fs.access(workflow.runs[0].generated_image_dir);
+      const memoryDir = path.join(cwd, ".catalog", "learning", "workflow-memory");
+      const memoryFiles = await fs.readdir(memoryDir);
+      assert.equal(memoryFiles.length > 0, true);
+      const workflowCosts = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "generated", "workflow-costs.json"), "utf8"));
+      assert.equal(workflowCosts.workflow_count, 1);
+      assert.equal(Array.isArray(workflowCosts.stages), true);
       const reviewQueue = await fs.readFile(path.join(cwd, ".catalog", "generated", "review-queue.csv"), "utf8");
       assert.match(reviewQueue, /product_key,source_record_id/);
       assert.match(reviewQueue, /p1|fresh-milk/);
@@ -1223,6 +1420,8 @@ price: 199
       assert.match(generatedProductsSheet[0].Metafields, /custom\.country_of_origin=Saudi Arabia/);
       const imageSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Images"]);
       assert.equal(imageSheet[0]["Selected Image URL"], "https://example.com/fresh-milk.jpg");
+      const productJson = JSON.parse(await fs.readFile(workflow.runs[0].generated_product_path, "utf8"));
+      assert.ok(productJson._catalog_stage_metrics);
       const metafieldSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Metafields"]);
       const originMetafield = metafieldSheet.find((row) => row.Namespace === "custom" && row.Key === "country_of_origin");
       assert.ok(originMetafield);

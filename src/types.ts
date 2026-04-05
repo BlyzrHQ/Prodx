@@ -51,9 +51,26 @@ export interface ProviderConfig {
   [key: string]: JsonValue | undefined;
 }
 
+export interface AgentRouteConfig extends LooseRecord {
+  enabled?: boolean;
+  primary_provider?: string;
+  fallback_provider?: string;
+}
+
+export interface AgenticRuntimeConfig extends LooseRecord {
+  enabled?: boolean;
+  max_enrich_retries?: number;
+  max_image_retries?: number;
+  max_iterations_per_product?: number;
+  strict_cost_guardrail?: boolean;
+  qa_passing_score_override?: number;
+  agents?: Record<string, AgentRouteConfig>;
+}
+
 export interface RuntimeConfig {
   providers: Record<string, ProviderConfig>;
   modules: Record<string, Record<string, string>>;
+  agentic?: AgenticRuntimeConfig;
 }
 
 export interface CredentialValue {
@@ -81,6 +98,7 @@ export interface CatalogPaths {
   generatedProductsDir: string;
   generatedImagesDir: string;
   generatedWorkflowProductsJson: string;
+  generatedWorkflowCostsJson: string;
   generatedReviewCsv: string;
   generatedShopifyCsv: string;
   generatedRejectedCsv: string;
@@ -108,6 +126,7 @@ export interface ModuleResult {
   reasoning: string[];
   artifacts: LooseRecord;
   next_actions: string[];
+  agent_run?: AgentRun;
 }
 
 export interface RunData {
@@ -410,6 +429,91 @@ export interface ProviderUsage {
   raw?: LooseRecord;
 }
 
+export interface ProviderCostEstimate extends LooseRecord {
+  provider?: string;
+  model?: string;
+  pricing_basis?: string;
+  currency: "USD";
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  total_tokens?: number;
+  estimated_input_cost_usd: number;
+  estimated_output_cost_usd: number;
+  estimated_cache_cost_usd: number;
+  estimated_total_cost_usd: number;
+  estimation_note?: string;
+}
+
+export interface AgentAttempt extends LooseRecord {
+  agent_id: string;
+  module: string;
+  attempt_number: number;
+  started_at: string;
+  completed_at: string;
+  retry_reason?: string;
+  parent_attempt?: number | null;
+  accepted?: boolean;
+  needs_review?: boolean;
+  status?: string;
+  summary?: string;
+  provider_usage?: ProviderUsage | null;
+  input_snapshot?: LooseRecord;
+  output_snapshot?: LooseRecord;
+}
+
+export interface QaRetryFeedback extends LooseRecord {
+  fixable_findings: QaFinding[];
+  hard_blockers: QaFinding[];
+  review_blockers: QaFinding[];
+  retry_targets: string[];
+  retry_instructions: string[];
+  confidence_delta: number;
+  recommended_next_agent: string | null;
+}
+
+export interface SupervisorDecision extends LooseRecord {
+  action: "accept" | "retry_enrich" | "retry_image" | "retry_both" | "review" | "reject";
+  reason: string;
+  next_agent?: string | null;
+  qa_feedback?: QaRetryFeedback;
+}
+
+export interface LearningRecord extends LooseRecord {
+  id: string;
+  created_at: string;
+  source: string;
+  lesson: string;
+  scope?: string;
+  product_key?: string;
+  metadata?: LooseRecord;
+}
+
+export interface WorkflowMemory extends LooseRecord {
+  product_key: string;
+  source_record_id: string;
+  created_at: string;
+  updated_at: string;
+  enrich_retries: number;
+  image_retries: number;
+  total_iterations: number;
+  last_retry_reason?: string;
+  qa_feedback?: QaRetryFeedback;
+  attempts: AgentAttempt[];
+  supervisor_decisions: SupervisorDecision[];
+  learning_records: LearningRecord[];
+}
+
+export interface AgentRun extends LooseRecord {
+  workflow: string;
+  attempts: AgentAttempt[];
+  supervisor_decisions: SupervisorDecision[];
+  memory_path?: string;
+  learning_records?: LearningRecord[];
+  accepted_attempt?: number | null;
+}
+
 export interface ConnectorJsonResponse<T> {
   raw: unknown;
   text: string;
@@ -558,6 +662,19 @@ export interface WorkflowRunSummary {
     status: string;
     needs_review: boolean;
   }>;
+  cost_summary?: {
+    currency: "USD";
+    total_tokens: number;
+    estimated_total_cost_usd: number;
+    stages: Array<{
+      module: string;
+      job_id: string;
+      provider?: string;
+      model?: string;
+      total_tokens?: number;
+      estimated_total_cost_usd: number;
+    }>;
+  };
 }
 
 export interface GuestSession {

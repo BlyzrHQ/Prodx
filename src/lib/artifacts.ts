@@ -2,6 +2,21 @@ import path from "node:path";
 import { ensureDir, readJson, readText, writeJson, writeText } from "./fs.js";
 import { getCatalogPaths } from "./paths.js";
 import { createJobId } from "./ids.js";
+import { estimateProviderCost } from "./provider-cost.js";
+
+export function hydrateResultMetrics(result) {
+  const providerUsage = result?.artifacts?.provider_usage;
+  if (!providerUsage || typeof providerUsage !== "object") return result;
+  const providerCost = estimateProviderCost(providerUsage);
+  if (!providerCost) return result;
+  return {
+    ...result,
+    artifacts: {
+      ...result.artifacts,
+      provider_cost: providerCost
+    }
+  };
+}
 
 export async function createRun(root, moduleName, input, explicitJobId = null) {
   const catalogPaths = getCatalogPaths(root);
@@ -35,21 +50,27 @@ ${warnings.length > 0 ? warnings.map((item) => `- ${item}`).join("\n") : "- None
 }
 
 export async function writeModuleArtifacts(runDir, result) {
+  const enrichedResult = hydrateResultMetrics(result);
   const reviewJson = {
-    job_id: result.job_id,
-    module: result.module,
-    status: result.status,
-    needs_review: result.needs_review,
-    proposed_changes: result.proposed_changes,
-    warnings: result.warnings,
-    errors: result.errors,
-    reasoning: result.reasoning ?? [],
-    next_actions: result.next_actions ?? []
+    job_id: enrichedResult.job_id,
+    module: enrichedResult.module,
+    status: enrichedResult.status,
+    needs_review: enrichedResult.needs_review,
+    proposed_changes: enrichedResult.proposed_changes,
+    warnings: enrichedResult.warnings,
+    errors: enrichedResult.errors,
+    reasoning: enrichedResult.reasoning ?? [],
+    next_actions: enrichedResult.next_actions ?? [],
+    artifacts: enrichedResult.artifacts ?? {}
   };
-  await writeJson(path.join(runDir, "result.json"), result);
-  await writeJson(path.join(runDir, "changes.json"), result.proposed_changes ?? {});
+  await writeJson(path.join(runDir, "result.json"), enrichedResult);
+  await writeJson(path.join(runDir, "changes.json"), enrichedResult.proposed_changes ?? {});
   await writeJson(path.join(runDir, "review.json"), reviewJson);
-  await writeText(path.join(runDir, "review.md"), buildReviewMarkdown(result));
+  await writeJson(path.join(runDir, "usage-cost.json"), {
+    provider_usage: enrichedResult.artifacts?.provider_usage ?? null,
+    provider_cost: enrichedResult.artifacts?.provider_cost ?? null
+  });
+  await writeText(path.join(runDir, "review.md"), buildReviewMarkdown(enrichedResult));
 }
 
 export async function loadRun(root, jobOrPath) {

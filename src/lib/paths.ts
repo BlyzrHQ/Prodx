@@ -26,6 +26,7 @@ export function getCatalogPaths(root = process.cwd()): CatalogPaths {
     generatedProductsDir: path.join(base, "generated", "products"),
     generatedImagesDir: path.join(base, "generated", "images"),
     generatedWorkflowProductsJson: path.join(base, "generated", "workflow-products.json"),
+    generatedWorkflowCostsJson: path.join(base, "generated", "workflow-costs.json"),
     generatedReviewCsv: path.join(base, "generated", "review-queue.csv"),
     generatedShopifyCsv: path.join(base, "generated", "shopify-import.csv"),
     generatedRejectedCsv: path.join(base, "generated", "rejected-products.csv"),

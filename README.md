@@ -1,6 +1,8 @@
-# Shopify Catalog Toolkit
+# Prodx
 
-Local-first toolkit for preparing Shopify products with a guided workflow:
+Local-first Shopify catalog toolkit with an agentic workflow core and a simple Prodx homepage.
+
+Prodx helps you prepare Shopify products with a guided workflow:
 
 1. create a Catalog Guide
 2. ingest products from JSON or CSV
@@ -17,34 +19,58 @@ The guide is meant to work both as:
 - the machine-readable contract for the workflow
 - a human-readable operating playbook for catalog, merchandising, and QA teams
 
-## Catalog Pilot Web App
+## Prodx Web
 
-This repo now also includes a hosted frontend scaffold for **Catalog Pilot**:
+This repo includes a lightweight **Next.js + React** frontend in [`apps/web`](./apps/web).
 
-- Next.js App Router + React
-- guest-first session flow
-- onboarding for providers and Shopify
-- pasted text or uploaded file input
-- workflow polling and progress
-- pending-review approvals in-app
-- final downloads for:
-  - Catalog Guide
-  - Shopify import
-  - rejected products
+The current web surface is a homepage for the project:
 
-Current local-dev architecture:
+- product overview
+- local install steps
+- example workflow commands
+- output summary
 
-- frontend lives in [`apps/web`](./apps/web)
-- shared app service lives in [`src/app`](./src/app)
-- guest-session data is stored locally in `.catalog-web/`
+It keeps the same visual system and branding, but the working product surface remains the local CLI.
 
-Cloudflare deployment scaffolding is included for:
+## Project Structure
 
-- D1
-- R2
-- Queues
+```text
+shopify-catalog-toolkit/
+├── apps/
+│   └── web/                     # Prodx homepage
+├── examples/                    # Grocery, apparel, electronics, variants, and alt-structure fixtures
+├── src/
+│   ├── agents/                  # Guide, enrich, image, QA, and supervisor agent wrappers
+│   ├── connectors/              # OpenAI, Gemini, Anthropic, Shopify, and Serper integrations
+│   ├── lib/                     # Paths, runtime config, exports, pricing, guide helpers, artifacts
+│   ├── modules/                 # Deterministic engines and compatibility modules
+│   └── workflows/               # Shared orchestration, retry loop, and workflow graph
+├── tests/                       # End-to-end and fixture-backed regression tests
+└── .catalog/                    # Local workspace outputs created at runtime
+```
 
-The current working implementation is filesystem-backed for local development, with Cloudflare config/migrations scaffolded for the hosted deployment phase.
+## Architecture
+
+Prodx keeps the CLI and local workspace model stable, while the internal workflow is now more agentic:
+
+- `catalogue-match`
+  - stays deterministic
+  - decides `DUPLICATE`, `NEW_VARIANT`, `NEW_PRODUCT`, or review-needed outcomes
+- `guide-agent`
+  - generates the Catalog Guide
+- `enrich-agent`
+  - drafts product content and structured fields
+- `image-agent`
+  - searches and reviews product images
+- `qa-agent`
+  - produces structured findings, retry targets, and review blockers
+- `supervisor-agent`
+  - decides whether to accept, retry, or escalate
+- `shopify-sync`
+  - stays deterministic
+  - prepares safe export and publish payloads
+
+The user-facing CLI commands are unchanged. `init`, `guide generate`, `workflow run`, `review`, `publish`, and the single-module commands still work the same way.
 
 ## What It Handles
 
@@ -135,6 +161,8 @@ Initialize the workspace:
 node .\dist\cli.js init
 node .\dist\cli.js doctor
 ```
+
+`init` still works the same way after the agentic refactor. The retry loop, learning, and cost tracking are internal workflow changes, not CLI-surface changes.
 
 During `init`, the guided setup can now:
 
@@ -342,6 +370,41 @@ These are useful for:
 - alternate input structure testing
 - cross-industry workflow checks
 
+## Manual Category Tests
+
+You can test the same workflow end to end with the provided fixtures.
+
+Start from a clean local workspace each time:
+
+```powershell
+Remove-Item -Recurse -Force .\.catalog -ErrorAction SilentlyContinue
+node .\dist\cli.js init
+```
+
+Grocery:
+
+```powershell
+node .\dist\cli.js workflow run --input .\examples\grocery\products-match.json --catalog .\examples\grocery\catalog-match.json
+```
+
+Apparel:
+
+```powershell
+node .\dist\cli.js workflow run --input .\examples\apparel\products-match.json --catalog .\examples\apparel\catalog-match.json
+```
+
+Electronics:
+
+```powershell
+node .\dist\cli.js workflow run --input .\examples\electronics\products-match.json --catalog .\examples\electronics\catalog-match.json
+```
+
+You can also test pasted text:
+
+```powershell
+node .\dist\cli.js workflow run --text "Almarai Fresh Milk Low Fat 1L - 8.50`nJBL Tune 520BT Wireless On-Ear Headphones Black - 199" --catalog .\examples\grocery\catalog-match.json
+```
+
 ## Credentials And Config
 
 Common auth commands:
@@ -363,12 +426,93 @@ node .\dist\cli.js config set modules.image-optimizer.search_provider serper_def
 node .\dist\cli.js config set modules.image-optimizer.vision_provider openai_vision_default
 ```
 
+You can also tune the new agentic runtime settings:
+
+```powershell
+node .\dist\cli.js config set agentic.max_enrich_retries 1
+node .\dist\cli.js config set agentic.max_image_retries 1
+node .\dist\cli.js config set agentic.max_iterations_per_product 4
+node .\dist\cli.js config set agentic.strict_cost_guardrail true
+```
+
+## Customization
+
+Prodx is designed to be customized both through config and through code.
+
+Config-driven customization:
+
+- change provider defaults and models in `.catalog/config/runtime.json`
+- change agent retry caps and guardrails in `.catalog/config/runtime.json`
+- change module-to-provider routing with `catalog config set ...`
+- switch Shopify store targets and API credentials without changing code
+
+Code-driven customization:
+
+- add new agent wrappers in [src/agents](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/agents)
+- extend orchestration in [src/workflows](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/workflows)
+- add or refine deterministic logic in [src/modules](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/modules)
+- adjust guide rendering and export behavior in [src/lib](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/lib)
+- extend input normalization in [src/modules/ingest.ts](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/modules/ingest.ts)
+
+Typical extension points:
+
+- cost-estimator agent
+- image-input agent
+- compliance agent
+- SEO agent
+- custom Shopify metafield export rules
+
+## Cost Estimation
+
+Prodx now tracks token usage and estimated USD cost as part of the local workflow artifacts.
+
+What is stored:
+
+| Level | File | What it contains |
+| --- | --- | --- |
+| Per module run | `.catalog/runs/<job-id>/usage-cost.json` | Provider usage and estimated USD cost for that run |
+| Per module run | `.catalog/runs/<job-id>/result.json` | Full result plus `artifacts.provider_usage` and `artifacts.provider_cost` |
+| Per generated product | `.catalog/generated/products/<product-key>.json` | Stage-level metrics under `_catalog_stage_metrics` |
+| Per workflow batch | `.catalog/generated/workflow-costs.json` | Rolled-up token totals and estimated USD cost across workflow runs |
+
+How to think about these numbers:
+
+- they are estimates, not billing statements
+- they are based on model-specific pricing cards in [src/lib/provider-cost.ts](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/lib/provider-cost.ts)
+- provider pricing changes over time, so the numbers should be treated as operational estimates
+- token-tracked model calls are included
+- external services that do not expose token usage may not be fully priced
+
 ## Safety
 
 - live Shopify writes only happen with `--live`
 - QA is the main publish gate
 - duplicate and review-blocked products do not get exported for publish
 - the toolkit prefers skipping uncertain data over guessing
+
+## Known Limitations
+
+- image quality still depends on what trusted exact-match sources exist on the web
+- provider quality and factual source quality still affect the final result
+- cost estimates are helpful operationally but are not exact provider invoices
+- the current web app is a homepage only; the operational workflow still lives in the CLI
+- live Shopify publish still depends on real store credentials and store-side product state
+
+## Contributing
+
+PRs welcome. Please open an issue first to discuss what you'd like to change.
+
+## Credits
+
+Built by BlyzrHQ.
+
+Powered by:
+
+- OpenAI
+- Google Gemini
+- Anthropic
+- Shopify
+- Serper
 
 ## Verification
 

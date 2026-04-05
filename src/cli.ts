@@ -11,14 +11,14 @@ import { initWorkspace, loadRuntimeConfig, saveRuntimeConfig, setRuntimeValue, g
 import { setCredential, setOAuthCredential, listCredentials, testCredential, loadOpenAICodexAuthSession } from "./lib/credentials.js";
 import { getWorkspaceRoot, getCatalogPaths } from "./lib/paths.js";
 import { readJson, readText, writeJson } from "./lib/fs.js";
-import { createRun, loadRun, writeModuleArtifacts, writeDecision, writeApplyResult } from "./lib/artifacts.js";
-import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writePendingReviewQueueCsv, writeReviewQueueCsv, writeShopifyImportCsv, writeWorkflowProductsLedger } from "./lib/generated.js";
+import { createRun, hydrateResultMetrics, loadRun, writeModuleArtifacts, writeDecision, writeApplyResult } from "./lib/artifacts.js";
+import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, persistGeneratedProduct, writeExcelWorkbook, writePendingReviewQueueCsv, writeReviewQueueCsv, writeShopifyImportCsv, writeWorkflowCostReport, writeWorkflowProductsLedger } from "./lib/generated.js";
 import { resolveProvider } from "./lib/providers.js";
+import { summarizeWorkflowCosts } from "./lib/provider-cost.js";
 import { getGuidePassingScore } from "./lib/catalog-guide.js";
 import { INDUSTRY_OPTIONS } from "./lib/policy-template.js";
 import { testShopifyConnection, fetchShopifyCatalogSnapshot, applyShopifyPayload, authenticateShopifyViaOAuth } from "./connectors/shopify.js";
 import { authenticateGeminiViaOAuth } from "./connectors/gemini.js";
-import { runExpertGenerate } from "./modules/expert.js";
 import { loadRecordsFromSource, loadRecordsFromText, runIngest } from "./modules/ingest.js";
 import { runMatchDecision, buildCatalogIndex } from "./modules/match.js";
 import { runEnrich } from "./modules/enrich.js";
@@ -26,6 +26,8 @@ import { runImageOptimize } from "./modules/image-optimize.js";
 import { runQa } from "./modules/qa.js";
 import { runSync } from "./modules/sync.js";
 import { runLearn } from "./modules/learn.js";
+import { runGuideAgent } from "./agents/guide-agent.js";
+import { runAgenticWorkflow } from "./workflows/agentic-workflow.js";
 import type { ApplyResult, CliStreams, LooseRecord, ModuleResult, OutputWriter, PolicyDocument, ProductRecord, ReviewDecision, RunData, RuntimeConfig, ShopifyPayload, WorkflowRunSummary } from "./types.js";
 
 type Flags = Record<string, string | boolean>;
@@ -994,7 +996,8 @@ async function refreshWorkspaceExportsFromState(root: string, policy: PolicyDocu
 async function executeModule(root: string, moduleName: string, runInput: LooseRecord, handler: (jobId: string, runInput: LooseRecord, runDir: string) => Promise<ModuleResult> | ModuleResult): Promise<ExecutedModule> {
   await initWorkspace(root);
   const { jobId, runDir } = await createRun(root, moduleName, runInput);
-  const result = await handler(jobId, runInput, runDir);
+  const rawResult = await handler(jobId, runInput, runDir);
+  const result = hydrateResultMetrics(rawResult);
   await writeModuleArtifacts(runDir, result);
   return { job_id: jobId, run_dir: runDir, result };
 }
@@ -1037,38 +1040,10 @@ async function runWorkflowSequence(
   const paths = getCatalogPaths(root);
   const learningText = await readText(paths.learningMarkdown, "");
   const sourceRecordId = String(record.id ?? record.product_id ?? record.sku ?? record.handle ?? record.title ?? "record");
-  let currentRecord: ProductRecord = {
-    ...record,
-    _catalog_match_basis: {
-      title: record.title ?? "",
-      brand: record.brand ?? record.vendor ?? "",
-      vendor: record.vendor ?? record.brand ?? "",
-      handle: record.handle ?? "",
-      sku: record.sku ?? "",
-      barcode: record.barcode ?? "",
-      size: record.size ?? record.option1 ?? "",
-      type: record.type ?? record.option2 ?? "",
-      option1: record.option1 ?? "",
-      option2: record.option2 ?? "",
-      option3: record.option3 ?? ""
-    }
-  };
-  const modules: WorkflowRunSummary["modules"] = [];
-  let imageDirectory = paths.generatedImagesDir;
-  const productLabel = getProductKey(currentRecord, sourceRecordId);
+  const productLabel = getProductKey(record, sourceRecordId);
 
   if (stdout && sequenceIndex !== undefined && total !== undefined) {
     writeWorkflowProgress(stdout, `[${sequenceIndex + 1}/${total}] ${productLabel}`, mode);
-  }
-
-  async function executeWorkflowModule(moduleName: string, handler: (jobId: string) => Promise<ModuleResult> | ModuleResult): Promise<ExecutedModule> {
-    writeWorkflowProgress(stdout ?? { write() {} }, `  -> ${moduleName} ...`, mode);
-    const executed = await executeModule(root, moduleName, currentRecord, async (jobId) => handler(jobId));
-    writeWorkflowProgress(stdout ?? { write() {} }, `  -> ${moduleName} ... ${executed.result.status}${executed.result.needs_review ? " (needs review)" : ""}`, mode);
-    if (executed.result.warnings.length > 0) {
-      writeWorkflowProgress(stdout ?? { write() {} }, `     warning: ${executed.result.warnings[0]}`, mode);
-    }
-    return executed;
   }
 
   let catalogData: LooseRecord[] | undefined = workflowCatalog;
@@ -1094,80 +1069,63 @@ async function runWorkflowSequence(
 
   if (catalogData) {
     await writeJson(paths.indexJson, buildCatalogIndex(catalogData));
-    const executed = await executeWorkflowModule("catalogue-match", async (jobId) => {
-      const result = runMatchDecision({
-        jobId,
-        input: currentRecord,
-        catalog: catalogData!,
-        policy,
-        learningText
-      });
-      result.reasoning = [`Catalog source: ${catalogSource}`, ...(result.reasoning ?? [])];
-      result.artifacts = { ...(result.artifacts ?? {}), catalog_source: catalogSource };
-      return result;
-    });
-    const matchResult = executed.result as unknown as LooseRecord;
-    currentRecord = {
-      ...currentRecord,
-      _catalog_match: {
-        decision: matchResult.decision ?? null,
-        confidence: matchResult.confidence ?? null,
-        needs_review: executed.result.needs_review,
-        matched_product_id: matchResult.matched_product_id ?? null,
-        matched_variant_id: matchResult.matched_variant_id ?? null,
-        proposed_action: matchResult.proposed_action ?? null,
-        matched_product_handle: typeof (matchResult.proposed_action as LooseRecord | undefined)?.product_handle === "string"
-          ? (matchResult.proposed_action as LooseRecord).product_handle
-          : null,
-        matched_product_title: typeof (matchResult.proposed_action as LooseRecord | undefined)?.product_title === "string"
-          ? (matchResult.proposed_action as LooseRecord).product_title
-          : null
-      }
-    };
-    modules.push({ module: executed.result.module, job_id: executed.job_id, status: executed.result.status, needs_review: executed.result.needs_review });
-
-    if (shouldSkipAfterMatch(currentRecord)) {
-      const productPath = (await persistGeneratedOutputs(root, currentRecord, executed.result)).productPath;
-      return {
-        index: 0,
-        product_key: getProductKey(currentRecord, sourceRecordId),
-        source_record_id: sourceRecordId,
-        generated_product_path: productPath,
-        generated_image_dir: imageDirectory,
-        modules
-      };
-    }
   }
 
-  const enrichRun = await executeWorkflowModule("product-enricher", async (jobId) => runEnrich({ root, jobId, input: currentRecord, policy }));
-  currentRecord = buildGeneratedProduct(currentRecord, enrichRun.result) as ProductRecord;
-  modules.push({ module: enrichRun.result.module, job_id: enrichRun.job_id, status: enrichRun.result.status, needs_review: enrichRun.result.needs_review });
-  await persistGeneratedOutputs(root, currentRecord, enrichRun.result);
+  const workflow = await runAgenticWorkflow({
+    root,
+    record,
+    policy,
+    runtimeConfig,
+    learningText,
+    generatedImagesDir: paths.generatedImagesDir,
+    matchCatalog: catalogData,
+    matchCatalogSource: catalogSource,
+    executeModule: (moduleName, input, handler) => executeModule(root, moduleName, input, async (jobId) => handler(jobId)),
+    persistGeneratedOutputs: (product, result) => persistGeneratedOutputs(root, product, result),
+    onProgress: (message) => writeWorkflowProgress(stdout ?? { write() {} }, message, mode)
+  });
 
-  const imageRun = await executeWorkflowModule("image-optimizer", async (jobId) => runImageOptimize({ root, jobId, input: currentRecord, policy, runtimeConfig }));
-  currentRecord = buildGeneratedProduct(currentRecord, imageRun.result) as ProductRecord;
-  modules.push({ module: imageRun.result.module, job_id: imageRun.job_id, status: imageRun.result.status, needs_review: imageRun.result.needs_review });
-  const imageOutput = await persistGeneratedOutputs(root, currentRecord, imageRun.result);
-  imageDirectory = imageOutput.imageDirectory ?? imageDirectory;
+  if (workflow.skipSync) {
+    const productPath = (await persistGeneratedOutputs(root, workflow.currentRecord, {
+      job_id: workflow.modules.at(-1)?.job_id ?? "workflow",
+      module: workflow.modules.at(-1)?.module ?? "catalogue-match",
+      status: workflow.modules.at(-1)?.status ?? "success",
+      needs_review: workflow.modules.at(-1)?.needs_review ?? false,
+      proposed_changes: {},
+      warnings: [],
+      errors: [],
+      reasoning: [],
+      artifacts: {},
+      next_actions: []
+    })).productPath;
+    return {
+      index: 0,
+      product_key: workflow.productKey,
+      source_record_id: workflow.sourceRecordId,
+      generated_product_path: productPath,
+      generated_image_dir: workflow.imageDirectory,
+      modules: workflow.modules,
+      cost_summary: summarizeWorkflowCosts(workflow.executions.map((item) => ({ module: item.result.module, job_id: item.job_id, artifacts: item.result.artifacts })))
+    };
+  }
 
-  const qaRun = await executeWorkflowModule("catalogue-qa", async (jobId) => runQa({ root, jobId, input: currentRecord, policy }));
-  currentRecord = buildGeneratedProduct(currentRecord, qaRun.result) as ProductRecord;
-  modules.push({ module: qaRun.result.module, job_id: qaRun.job_id, status: qaRun.result.status, needs_review: qaRun.result.needs_review });
-  await persistGeneratedOutputs(root, currentRecord, qaRun.result);
+  writeWorkflowProgress(stdout ?? { write() {} }, "  -> shopify-sync ...", mode);
+  const syncRun = await executeModule(root, "shopify-sync", workflow.currentRecord, async (jobId) => runSync({ root, jobId, input: workflow.currentRecord }));
+  writeWorkflowProgress(stdout ?? { write() {} }, `  -> shopify-sync ... ${syncRun.result.status}${syncRun.result.needs_review ? " (needs review)" : ""}`, mode);
+  const modules = [...workflow.modules, { module: syncRun.result.module, job_id: syncRun.job_id, status: syncRun.result.status, needs_review: syncRun.result.needs_review }];
+  const productPath = (await persistGeneratedOutputs(root, workflow.currentRecord, syncRun.result)).productPath;
 
-  const syncRun = await executeWorkflowModule("shopify-sync", async (jobId) => runSync({ root, jobId, input: currentRecord }));
-  modules.push({ module: syncRun.result.module, job_id: syncRun.job_id, status: syncRun.result.status, needs_review: syncRun.result.needs_review });
-  const productPath = (await persistGeneratedOutputs(root, currentRecord, syncRun.result)).productPath;
-
+  const executions = [...workflow.executions, syncRun];
   return {
     index: 0,
-    product_key: getProductKey(currentRecord, sourceRecordId),
-    source_record_id: sourceRecordId,
+    product_key: workflow.productKey,
+    source_record_id: workflow.sourceRecordId,
     generated_product_path: productPath,
-    generated_image_dir: imageDirectory,
-    selected_image_url: imageOutput.selectedImageUrl,
-    local_image_path: imageOutput.localImagePath,
-    modules
+    generated_image_dir: workflow.imageDirectory,
+    selected_image_url: workflow.selectedImageUrl,
+    local_image_path: workflow.localImagePath,
+    modules,
+    cost_summary: summarizeWorkflowCosts(executions.map((item) => ({ module: item.result.module, job_id: item.job_id, artifacts: item.result.artifacts })))
   };
 }
 
@@ -1210,6 +1168,7 @@ async function refreshWorkflowGeneratedOutputs(
     });
   const reviewQueueCsv = await writeReviewQueueCsv(root, runs);
   const workflowProductsJson = await writeWorkflowProductsLedger(root, workflowProducts);
+  await writeWorkflowCostReport(root, runs);
   const shopifyImportCsv = await writeShopifyImportCsv(root, exportableProducts, policy);
   const excelWorkbook = await writeExcelWorkbook(root, runs, generatedProducts, exportableProducts, policy, pendingReviewRows);
   return { reviewQueueCsv, shopifyImportCsv, excelWorkbook, workflowProductsJson, workflowProducts, exportableProducts };
@@ -1325,18 +1284,21 @@ async function runInitWizard(root: string, stdout: OutputWriter): Promise<void> 
 
     const generateGuide = await askYesNo(rl, "Generate a Catalog Guide now?", true);
     if (generateGuide) {
-      const executed = await executeModule(root, "catalogue-expert", { source: "init-wizard" }, async (jobId) => runExpertGenerate({
-        root,
-        jobId,
-        input: {
-          industry,
-          businessName,
-          businessDescription,
-          operatingMode,
-          storeUrl,
-          notes: "Generated from init wizard"
-        }
-      }));
+      const executed = await executeModule(root, "catalogue-expert", { source: "init-wizard" }, async (jobId) => {
+        const execution = await runGuideAgent({
+          root,
+          jobId,
+          input: {
+            industry,
+            businessName,
+            businessDescription,
+            operatingMode,
+            storeUrl,
+            notes: "Generated from init wizard"
+          }
+        });
+        return execution.result;
+      });
       guideJobId = executed.job_id;
     }
 
@@ -1623,20 +1585,23 @@ async function handleDoctor(root: string, flags: Flags, stdout: OutputWriter): P
 async function handleExpert(root: string, subcommand: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
   if (subcommand !== "generate") throw new Error("Use `catalog expert generate`.");
   const mode = getOutputMode(flags);
-  const executed = await withSpinner("Generating Catalog Guide", mode, () => executeModule(root, "catalogue-expert", {}, async (jobId) => runExpertGenerate({
-    root,
-    jobId,
-    input: {
-      industry: String(flags.industry ?? "food_and_beverage"),
-      businessName: String(flags["business-name"] ?? "Demo Store"),
-      businessDescription: String(flags["business-description"] ?? ""),
-      targetMarket: String(flags["target-market"] ?? ""),
-      operatingMode: String(flags["operating-mode"] ?? "both"),
-      storeUrl: String(flags["store-url"] ?? ""),
-      notes: String(flags.notes ?? ""),
-      research: flags.research === "true" || flags.research === true
-    }
-  })));
+  const executed = await withSpinner("Generating Catalog Guide", mode, () => executeModule(root, "catalogue-expert", {}, async (jobId) => {
+    const execution = await runGuideAgent({
+      root,
+      jobId,
+      input: {
+        industry: String(flags.industry ?? "food_and_beverage"),
+        businessName: String(flags["business-name"] ?? "Demo Store"),
+        businessDescription: String(flags["business-description"] ?? ""),
+        targetMarket: String(flags["target-market"] ?? ""),
+        operatingMode: String(flags["operating-mode"] ?? "both"),
+        storeUrl: String(flags["store-url"] ?? ""),
+        notes: String(flags.notes ?? ""),
+        research: flags.research === "true" || flags.research === true
+      }
+    });
+    return execution.result;
+  }));
   writeOutput(stdout, mode, executed, renderModuleResult(executed));
   return 0;
 }

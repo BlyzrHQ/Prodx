@@ -78,6 +78,20 @@ export function buildGeneratedProduct(input: ProductRecord, result: ModuleResult
     updated_at: new Date().toISOString()
   };
 
+  const stageMetrics = merged._catalog_stage_metrics && typeof merged._catalog_stage_metrics === "object" && !Array.isArray(merged._catalog_stage_metrics)
+    ? merged._catalog_stage_metrics as LooseRecord
+    : {};
+  stageMetrics[result.module] = {
+    job_id: result.job_id,
+    status: result.status,
+    needs_review: result.needs_review,
+    provider_usage: result.artifacts?.provider_usage ?? null,
+    provider_cost: result.artifacts?.provider_cost ?? null,
+    agent_run: result.agent_run ?? null,
+    updated_at: new Date().toISOString()
+  };
+  merged._catalog_stage_metrics = stageMetrics;
+
   return merged;
 }
 
@@ -276,6 +290,32 @@ export async function writeWorkflowProductsLedger(root: string, products: LooseR
     products
   });
   return paths.generatedWorkflowProductsJson;
+}
+
+export async function writeWorkflowCostReport(root: string, runs: WorkflowRunSummary[]): Promise<string> {
+  const paths = getCatalogPaths(root);
+  const stages = runs.flatMap((run) =>
+    (run.cost_summary?.stages ?? []).map((stage) => ({
+      product_key: run.product_key,
+      source_record_id: run.source_record_id,
+      ...stage
+    }))
+  );
+  await writeJson(paths.generatedWorkflowCostsJson, {
+    generated_at: new Date().toISOString(),
+    workflow_count: runs.length,
+    total_tokens: runs.reduce((sum, run) => sum + Number(run.cost_summary?.total_tokens ?? 0), 0),
+    estimated_total_cost_usd: Number(
+      runs.reduce((sum, run) => sum + Number(run.cost_summary?.estimated_total_cost_usd ?? 0), 0).toFixed(6)
+    ),
+    runs: runs.map((run) => ({
+      product_key: run.product_key,
+      source_record_id: run.source_record_id,
+      cost_summary: run.cost_summary ?? null
+    })),
+    stages
+  });
+  return paths.generatedWorkflowCostsJson;
 }
 
 function toShopifyBoolean(value: unknown, fallback = "TRUE"): string {

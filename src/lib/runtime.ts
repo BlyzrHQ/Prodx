@@ -21,6 +21,20 @@ export function defaultRuntimeConfig(): RuntimeConfig {
       "catalogue-qa": { llm_provider: "openai_default" },
       "catalogue-match": { catalog_provider: "shopify_default", reasoning_provider: "openai_default" },
       "shopify-sync": { shopify_provider: "shopify_default" }
+    },
+    agentic: {
+      enabled: true,
+      max_enrich_retries: 1,
+      max_image_retries: 1,
+      max_iterations_per_product: 4,
+      strict_cost_guardrail: true,
+      agents: {
+        "guide-agent": { enabled: true, primary_provider: "openai_default" },
+        "enrich-agent": { enabled: true, primary_provider: "openai_default", fallback_provider: "gemini_flash_default" },
+        "image-agent": { enabled: true, primary_provider: "openai_vision_default" },
+        "qa-agent": { enabled: true, primary_provider: "openai_default" },
+        "supervisor-agent": { enabled: true }
+      }
     }
   };
 }
