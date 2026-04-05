@@ -4,8 +4,8 @@ import { ArrowRight, Download, FileText, PackageCheck, TerminalSquare, Package, 
 import { motion } from "framer-motion";
 
 const quickStart = [
-  'git clone https://github.com/BlyzrHQ/catalogue-Manager.git',
-  'cd shopify-catalog-toolkit',
+  'git clone https://github.com/BlyzrHQ/prodx.git',
+  'cd prodx',
   "npm install",
   "npm run build"
 ];
@@ -13,6 +13,7 @@ const quickStart = [
 const exampleCommands = [
   'node .\\dist\\cli.js init',
   'node .\\dist\\cli.js workflow run --input .\\examples\\grocery\\products-match.json --catalog .\\examples\\grocery\\catalog-match.json',
+  'node .\\dist\\cli.js collections propose --min-products 5',
   'node .\\dist\\cli.js review queue'
 ];
 
@@ -28,6 +29,10 @@ const outputs = [
   {
     title: "Workflow Summary",
     body: "A clear summary of what passed, what was skipped, what became a variant, and what needs attention."
+  },
+  {
+    title: "Smart Collections",
+    body: "A local collection registry with imported store collections, approved proposals, and apply-ready smart collection records."
   }
 ];
 
@@ -142,8 +147,16 @@ export function ProdxHomepage() {
           .outputsSection {
             padding: 40px 20px !important;
           }
+          .outputsGrid {
+            grid-template-columns: 1fr !important;
+          }
           .howItWorksSection {
             padding: 40px 20px !important;
+          }
+        }
+        @media (max-width: 1200px) {
+          .outputsGrid {
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
           }
         }
       `}} />
@@ -163,10 +176,10 @@ export function ProdxHomepage() {
       >
         <div className="homepageHeroCopy customHeroCopy">
           <h1 className="customHeroTitle">
-            Clean up your product data before it reaches Shopify
+            Clean Shopify catalogs in minutes, not hours
           </h1>
           <p className="heroBody customHeroBody">
-            Prodx helps you take raw product lists, fill the important gaps, catch risky issues early, and end up with files you can actually use.
+            Stop spending hours collecting, fixing, and formatting product data just to get it live. Prodx turns raw inputs into structured, QA-ready products you can publish with confidence.
           </p>
           <div className="heroActions customHeroActions">
             <a className="button isPrimary customPrimaryBtn" href="#quickstart">
@@ -278,7 +291,7 @@ export function ProdxHomepage() {
             <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "48px", fontWeight: 700, color: "var(--primary)" }}>03</div>
             <h3 style={{ fontFamily: "Inter, sans-serif", fontSize: "18px", fontWeight: 600, color: "var(--ink)", margin: 0 }}>Review the result</h3>
             <p style={{ fontFamily: "Geist, sans-serif", fontSize: "14px", lineHeight: 1.6, color: "var(--secondary)", margin: 0 }}>
-              Check flagged items, keep the good output, and move forward with a cleaner Shopify import.
+              Check flagged items, keep the good output, and build smart collections from product types or approved metafields when your catalog is ready.
             </p>
           </div>
         </div>
@@ -300,7 +313,7 @@ export function ProdxHomepage() {
             Download and run locally
           </h2>
           <p style={{ color: "#9CA89C", fontSize: "16px", margin: 0, maxWidth: "600px" }}>
-            Start with these commands to get Prodx running on your machine and test the workflow end to end.
+            Start with these commands to get Prodx running on your machine, test the workflow end to end, and generate smart collections locally.
           </p>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: "24px" }}>
@@ -352,7 +365,7 @@ export function ProdxHomepage() {
             What you get at the end
           </h2>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 250px), 1fr))", gap: "16px", width: "100%", maxWidth: "1200px" }}>
+        <div className="outputsGrid" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "16px", width: "100%", maxWidth: "1200px" }}>
           {outputs.map((item) => (
             <article key={item.title} style={{ backgroundColor: "#fff", padding: "32px", borderRadius: "16px", border: "1px solid var(--line)", display: "flex", flexDirection: "column", gap: "16px" }}>
               <div style={{ width: "48px", height: "48px", borderRadius: "999px", backgroundColor: "var(--primary-soft)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--primary)" }}>

@@ -67,10 +67,19 @@ export interface AgenticRuntimeConfig extends LooseRecord {
   agents?: Record<string, AgentRouteConfig>;
 }
 
+export interface CollectionsRuntimeConfig extends LooseRecord {
+  enabled?: boolean;
+  min_products_per_collection?: number;
+  max_iterations_per_candidate?: number;
+  allowed_rule_sources?: string[];
+  auto_apply?: boolean;
+}
+
 export interface RuntimeConfig {
   providers: Record<string, ProviderConfig>;
   modules: Record<string, Record<string, string>>;
   agentic?: AgenticRuntimeConfig;
+  collections?: CollectionsRuntimeConfig;
 }
 
 export interface CredentialValue {
@@ -97,12 +106,18 @@ export interface CatalogPaths {
   generatedDir: string;
   generatedProductsDir: string;
   generatedImagesDir: string;
+  generatedCollectionsDir: string;
   generatedWorkflowProductsJson: string;
   generatedWorkflowCostsJson: string;
   generatedReviewCsv: string;
   generatedShopifyCsv: string;
   generatedRejectedCsv: string;
   generatedExcelWorkbook: string;
+  generatedCollectionsRegistryCsv: string;
+  generatedCollectionsRegistryJson: string;
+  generatedCollectionsSummaryJson: string;
+  generatedCollectionsProposalsJson: string;
+  generatedCollectionsApplyJson: string;
   guideMarkdown: string;
   guideJson: string;
   policyMarkdown: string;
@@ -675,6 +690,113 @@ export interface WorkflowRunSummary {
       estimated_total_cost_usd: number;
     }>;
   };
+}
+
+export interface CollectionRule extends LooseRecord {
+  applied_disjunctively: boolean;
+  rules: Array<{
+    column: "TYPE" | "PRODUCT_METAFIELD_DEFINITION";
+    relation: "EQUALS";
+    condition: string;
+    condition_object_id?: string;
+  }>;
+}
+
+export interface CollectionSummaryEntry extends LooseRecord {
+  id: string;
+  source_type: "product_type" | "metafield";
+  source_key: string;
+  source_label: string;
+  namespace?: string;
+  key?: string;
+  metafield_type?: string;
+  source_value: string;
+  normalized_value: string;
+  product_count: number;
+  product_ids: string[];
+  product_keys: string[];
+}
+
+export interface CollectionSourceSummary extends LooseRecord {
+  generated_at: string;
+  total_products_analyzed: number;
+  min_products_per_collection: number;
+  allowed_rule_sources: string[];
+  candidates: CollectionSummaryEntry[];
+  skipped: Array<CollectionSummaryEntry & { skipped_reason: string }>;
+}
+
+export interface CollectionRegistryEntry extends LooseRecord {
+  id: string;
+  title: string;
+  handle: string;
+  source_type: "product_type" | "metafield";
+  source_key: string;
+  source_label: string;
+  namespace?: string;
+  key?: string;
+  source_value: string;
+  normalized_value: string;
+  product_count: number;
+  status: "imported" | "proposed" | "created" | "skipped_duplicate" | "rejected";
+  rule: CollectionRule;
+  rationale?: string;
+  duplicate_of?: string;
+  shopify_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CollectionCandidate extends CollectionSummaryEntry {
+  min_products_per_collection: number;
+}
+
+export interface CollectionEvaluation extends LooseRecord {
+  decision: "APPROVE" | "FEEDBACK" | "ESCALATE" | "REJECT";
+  summary: string;
+  reasons: string[];
+  retry_instructions: string[];
+}
+
+export interface CollectionProposal extends LooseRecord {
+  id: string;
+  candidate_id: string;
+  title: string;
+  handle: string;
+  description_html: string;
+  rationale: string;
+  source_type: "product_type" | "metafield";
+  source_key: string;
+  source_label: string;
+  namespace?: string;
+  key?: string;
+  source_value: string;
+  normalized_value: string;
+  product_count: number;
+  product_ids: string[];
+  product_keys: string[];
+  rule: CollectionRule;
+  evaluator_decision: CollectionEvaluation["decision"];
+  evaluation: CollectionEvaluation;
+  status: "approved" | "feedback" | "escalated" | "rejected" | "skipped_duplicate";
+  duplicate_of?: string;
+  attempts: {
+    builder: AgentAttempt[];
+    evaluator: AgentAttempt[];
+  };
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CollectionApplyResult extends LooseRecord {
+  proposal_id: string;
+  title: string;
+  handle: string;
+  status: "created" | "skipped_duplicate" | "error";
+  shopify_id?: string;
+  duplicate_of?: string;
+  message: string;
+  applied_at: string;
 }
 
 export interface GuestSession {

@@ -11,10 +11,19 @@ import { createGeminiJsonResponse } from "../dist/connectors/gemini.js";
 import { buildGeneratedProduct, writeShopifyImportCsv } from "../dist/lib/generated.js";
 import { loadOpenAICodexAuthSession } from "../dist/lib/credentials.js";
 import { appendLearningRecords, loadWorkflowMemory, saveWorkflowMemory } from "../dist/lib/learning.js";
+import {
+  buildCollectionSourceSummary,
+  loadCollectionProposals,
+  loadCollectionRegistry,
+  mergeCollectionRegistryEntries,
+  saveCollectionProposals,
+  saveCollectionRegistry
+} from "../dist/lib/collections.js";
 import { defaultRuntimeConfig } from "../dist/lib/runtime.js";
 import { buildStarterPolicy, initialLearningMarkdown, renderPolicyMarkdown } from "../dist/lib/policy-template.js";
 import { hasPopulatedProductField } from "../dist/lib/product.js";
 import { estimateProviderCost } from "../dist/lib/provider-cost.js";
+import { importShopifyCollectionsToRegistry } from "../dist/connectors/shopify.js";
 import { decideSupervisorAction } from "../dist/agents/supervisor-agent.js";
 import { sanitizeProviderEvaluationAgainstInput } from "../dist/modules/qa.js";
 import { runEnrich, sanitizeCustomerFacingDescription, shouldUseWebVerification } from "../dist/modules/enrich.js";
@@ -47,6 +56,16 @@ async function seedGuideFiles(
   } catch {
     await fs.writeFile(path.join(learningDir, "catalog-learning.md"), initialLearningMarkdown(policy));
   }
+}
+
+async function seedWorkflowLedger(cwd: string, products: Array<Record<string, unknown>>) {
+  const generatedDir = path.join(cwd, ".catalog", "generated");
+  await fs.mkdir(generatedDir, { recursive: true });
+  await fs.writeFile(path.join(generatedDir, "workflow-products.json"), JSON.stringify({
+    generated_at: new Date().toISOString(),
+    count: products.length,
+    products
+  }, null, 2));
 }
 
 function writer() {
@@ -309,6 +328,345 @@ const tests = [
       assert.equal(runtime.agentic?.max_iterations_per_product, 4);
       assert.equal(runtime.agentic?.agents?.["enrich-agent"]?.enabled, true);
       assert.equal(runtime.agentic?.agents?.["qa-agent"]?.primary_provider, "openai_default");
+    }
+  },
+  {
+    name: "default runtime config enables smart collections with local-first defaults",
+    run: async () => {
+      const runtime = defaultRuntimeConfig();
+      assert.equal(runtime.collections?.enabled, true);
+      assert.equal(runtime.collections?.min_products_per_collection, 5);
+      assert.equal(runtime.collections?.max_iterations_per_candidate, 2);
+      assert.deepEqual(runtime.collections?.allowed_rule_sources, ["product_type", "guide_metafields"]);
+      assert.equal(runtime.modules["collection-builder"].llm_provider, "openai_default");
+      assert.equal(runtime.modules["collection-evaluator"].fallback_llm_provider, "gemini_flash_default");
+    }
+  },
+  {
+    name: "collection source summary groups product types and allowed metafield values from the generated ledger",
+    run: async () => {
+      const cwd = await createTempProject();
+      const runtime = defaultRuntimeConfig();
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Collections Store" });
+
+      const guidePath = path.join(cwd, ".catalog", "guide", "catalog-guide.json");
+      const guide = JSON.parse(await fs.readFile(guidePath, "utf8"));
+      guide.agentic_commerce_readiness = {
+        ...(guide.agentic_commerce_readiness ?? {}),
+        recommended_metafields: [
+          {
+            namespace: "custom",
+            key: "dietary_preferences",
+            type: "single_line_text_field",
+            purpose: "Dietary merchandising"
+          }
+        ]
+      };
+      await fs.writeFile(guidePath, JSON.stringify(guide, null, 2));
+
+      await seedWorkflowLedger(cwd, [
+        ...Array.from({ length: 6 }, (_, index) => ({
+          id: `milk-${index + 1}`,
+          title: `Milk ${index + 1}`,
+          product_type: "Milk",
+          metafields: [
+            {
+              namespace: "custom",
+              key: "dietary_preferences",
+              type: "single_line_text_field",
+              value: "Halal"
+            }
+          ]
+        })),
+        {
+          id: "sparse-1",
+          title: "Sparse",
+          product_type: "Seasonal",
+          metafields: [
+            {
+              namespace: "custom",
+              key: "dietary_preferences",
+              type: "single_line_text_field",
+              value: "Limited"
+            }
+          ]
+        }
+      ]);
+
+      const summary = await buildCollectionSourceSummary({
+        root: cwd,
+        policy: guide,
+        runtimeConfig: runtime
+      });
+      assert.equal(summary.total_products_analyzed, 7);
+      assert.equal(summary.candidates.some((entry) => entry.source_type === "product_type" && entry.source_value === "Milk" && entry.product_count === 6), true);
+      assert.equal(summary.candidates.some((entry) => entry.source_type === "metafield" && entry.source_key === "custom.dietary_preferences" && entry.source_value === "Halal" && entry.product_count === 6), true);
+      assert.equal(summary.skipped.some((entry) => entry.source_value === "Seasonal" && /below_minimum_5/.test(entry.skipped_reason)), true);
+    }
+  },
+  {
+    name: "collection registry merge avoids duplicate imported rows",
+    run: async () => {
+      const first = {
+        id: "gid://shopify/Collection/1",
+        title: "Milk",
+        handle: "milk",
+        source_type: "product_type",
+        source_key: "product_type",
+        source_label: "Product type",
+        source_value: "Milk",
+        normalized_value: "milk",
+        product_count: 0,
+        status: "imported",
+        rule: {
+          applied_disjunctively: false,
+          rules: [{ column: "TYPE", relation: "EQUALS", condition: "Milk" }]
+        },
+        shopify_id: "gid://shopify/Collection/1",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      const merged = mergeCollectionRegistryEntries([first], [first]);
+      assert.equal(merged.length, 1);
+      assert.equal(merged[0].title, "Milk");
+    }
+  },
+  {
+    name: "collections propose saves approved proposals and skips duplicates from the local registry",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+      await seedGuideFiles(cwd, { industry: "grocery", businessName: "Collection CLI Store" });
+
+      const guidePath = path.join(cwd, ".catalog", "guide", "catalog-guide.json");
+      const guide = JSON.parse(await fs.readFile(guidePath, "utf8"));
+      guide.agentic_commerce_readiness = {
+        ...(guide.agentic_commerce_readiness ?? {}),
+        recommended_metafields: [
+          {
+            namespace: "custom",
+            key: "dietary_preferences",
+            type: "single_line_text_field",
+            purpose: "Dietary merchandising"
+          }
+        ]
+      };
+      await fs.writeFile(guidePath, JSON.stringify(guide, null, 2));
+
+      await seedWorkflowLedger(cwd, Array.from({ length: 6 }, (_, index) => ({
+        id: `item-${index + 1}`,
+        title: `Item ${index + 1}`,
+        product_type: "Greek Yogurt",
+        metafields: [
+          {
+            namespace: "custom",
+            key: "dietary_preferences",
+            type: "single_line_text_field",
+            value: "Halal"
+          }
+        ]
+      })));
+
+      await saveCollectionRegistry(cwd, [{
+        id: "existing-type-yogurt",
+        title: "Greek Yogurt",
+        handle: "type-greek-yogurt",
+        source_type: "product_type",
+        source_key: "product_type",
+        source_label: "Product type",
+        source_value: "Greek Yogurt",
+        normalized_value: "greek yogurt",
+        product_count: 6,
+        status: "created",
+        rule: {
+          applied_disjunctively: false,
+          rules: [{ column: "TYPE", relation: "EQUALS", condition: "Greek Yogurt" }]
+        },
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }]);
+
+      io.text = "";
+      const code = await runCli(["collections", "propose", "--json"], { cwd, stdout: io, stderr: io });
+      assert.equal(code, 0);
+      const output = JSON.parse(io.text);
+      assert.equal(output.proposals.length >= 2, true);
+
+      const proposals = await loadCollectionProposals(cwd);
+      const skippedType = proposals.find((proposal) => proposal.source_type === "product_type");
+      const approvedMetafield = proposals.find((proposal) => proposal.source_type === "metafield");
+      assert.equal(skippedType?.status, "skipped_duplicate");
+      assert.equal(approvedMetafield?.status, "approved");
+      assert.equal((approvedMetafield?.attempts.builder.length ?? 0) >= 2, true);
+      assert.equal((approvedMetafield?.title ?? "").includes("Dietary Preferences"), true);
+    }
+  },
+  {
+    name: "collections import normalizes existing Shopify smart collections into the local registry format",
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          data: {
+            collections: {
+              edges: [
+                {
+                  node: {
+                    id: "gid://shopify/Collection/10",
+                    title: "Milk",
+                    handle: "milk",
+                    ruleSet: {
+                      appliedDisjunctively: false,
+                      rules: [
+                        {
+                          column: "TYPE",
+                          relation: "EQUALS",
+                          condition: "Milk"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  node: {
+                    id: "gid://shopify/Collection/11",
+                    title: "Dietary Preferences: Halal",
+                    handle: "dietary-preferences-halal",
+                    ruleSet: {
+                      appliedDisjunctively: false,
+                      rules: [
+                        {
+                          column: "PRODUCT_METAFIELD_DEFINITION",
+                          relation: "EQUALS",
+                          condition: "Halal",
+                          conditionObject: {
+                            metafieldDefinition: {
+                              id: "gid://shopify/MetafieldDefinition/1",
+                              namespace: "custom",
+                              key: "dietary_preferences"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              pageInfo: {
+                hasNextPage: false,
+                endCursor: null
+              }
+            }
+          }
+        })
+      }) as Response;
+
+      try {
+        const imported = await importShopifyCollectionsToRegistry({
+          store: "demo.myshopify.com",
+          accessToken: "shpat_test"
+        });
+        assert.equal(imported.length, 2);
+        assert.equal(imported.some((entry) => entry.source_type === "product_type" && entry.source_value === "Milk"), true);
+        assert.equal(imported.some((entry) => entry.source_type === "metafield" && entry.source_key === "custom.dietary_preferences" && entry.source_value === "Halal"), true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  },
+  {
+    name: "collections apply creates approved smart collections and writes created state back to the registry",
+    run: async () => {
+      const cwd = await createTempProject();
+      const io = writer();
+      await runCli(["init", "--json", "--no-wizard"], { cwd, stdout: io, stderr: io });
+
+      const runtimePath = path.join(cwd, ".catalog", "config", "runtime.json");
+      const runtime = JSON.parse(await fs.readFile(runtimePath, "utf8"));
+      runtime.providers.shopify_default.store = "demo.myshopify.com";
+      await fs.writeFile(runtimePath, JSON.stringify(runtime, null, 2));
+
+      const tempHome = await createTempProject();
+      const originalUserProfile = process.env.USERPROFILE;
+      const originalHome = process.env.HOME;
+      process.env.USERPROFILE = tempHome;
+      process.env.HOME = tempHome;
+      await fs.mkdir(path.join(tempHome, ".catalog-toolkit"), { recursive: true });
+      await fs.writeFile(path.join(tempHome, ".catalog-toolkit", "credentials.json"), JSON.stringify({
+        shopify: {
+          alias: "shopify",
+          value: "shpat_test",
+          source: "file"
+        }
+      }, null, 2));
+
+      await saveCollectionProposals(cwd, [{
+        id: "proposal-milk",
+        candidate_id: "candidate-milk",
+        title: "Milk",
+        handle: "type-milk",
+        description_html: "<p>Milk collection</p>",
+        rationale: "Useful store collection",
+        source_type: "product_type",
+        source_key: "product_type",
+        source_label: "Product type",
+        source_value: "Milk",
+        normalized_value: "milk",
+        product_count: 8,
+        product_ids: ["1", "2"],
+        product_keys: ["milk-1", "milk-2"],
+        rule: {
+          applied_disjunctively: false,
+          rules: [{ column: "TYPE", relation: "EQUALS", condition: "Milk" }]
+        },
+        evaluator_decision: "APPROVE",
+        evaluation: {
+          decision: "APPROVE",
+          summary: "Looks good",
+          reasons: [],
+          retry_instructions: []
+        },
+        status: "approved",
+        attempts: { builder: [], evaluator: [] },
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }]);
+      await saveCollectionRegistry(cwd, []);
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          data: {
+            collectionCreate: {
+              collection: {
+                id: "gid://shopify/Collection/99",
+                title: "Milk",
+                handle: "type-milk"
+              },
+              userErrors: []
+            }
+          }
+        })
+      }) as Response;
+
+      try {
+        io.text = "";
+        const code = await runCli(["collections", "apply", "--json"], { cwd, stdout: io, stderr: io });
+        assert.equal(code, 0);
+        const output = JSON.parse(io.text);
+        assert.equal(output.applied.length, 1);
+        assert.equal(output.applied[0].status, "created");
+
+        const registry = await loadCollectionRegistry(cwd);
+        assert.equal(registry.some((entry) => entry.status === "created" && entry.shopify_id === "gid://shopify/Collection/99"), true);
+      } finally {
+        globalThis.fetch = originalFetch;
+        process.env.USERPROFILE = originalUserProfile;
+        process.env.HOME = originalHome;
+      }
     }
   },
   {

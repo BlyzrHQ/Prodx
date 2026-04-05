@@ -11,6 +11,7 @@ export function getCatalogPaths(root = process.cwd()): CatalogPaths {
   const guideDir = path.join(base, "guide");
   const guideMarkdown = path.join(guideDir, "catalog-guide.md");
   const guideJson = path.join(guideDir, "catalog-guide.json");
+  const generatedCollectionsDir = path.join(base, "generated", "collections");
   const legacyPolicyDir = path.join(base, "policy");
   const legacyPolicyMarkdown = path.join(legacyPolicyDir, "catalog-policy.md");
   const legacyPolicyJson = path.join(legacyPolicyDir, "catalog-policy.json");
@@ -25,12 +26,18 @@ export function getCatalogPaths(root = process.cwd()): CatalogPaths {
     generatedDir: path.join(base, "generated"),
     generatedProductsDir: path.join(base, "generated", "products"),
     generatedImagesDir: path.join(base, "generated", "images"),
+    generatedCollectionsDir,
     generatedWorkflowProductsJson: path.join(base, "generated", "workflow-products.json"),
     generatedWorkflowCostsJson: path.join(base, "generated", "workflow-costs.json"),
     generatedReviewCsv: path.join(base, "generated", "review-queue.csv"),
     generatedShopifyCsv: path.join(base, "generated", "shopify-import.csv"),
     generatedRejectedCsv: path.join(base, "generated", "rejected-products.csv"),
     generatedExcelWorkbook: path.join(base, "generated", "catalog-review.xlsx"),
+    generatedCollectionsRegistryCsv: path.join(generatedCollectionsDir, "collections.csv"),
+    generatedCollectionsRegistryJson: path.join(generatedCollectionsDir, "collections.json"),
+    generatedCollectionsSummaryJson: path.join(generatedCollectionsDir, "summary.json"),
+    generatedCollectionsProposalsJson: path.join(generatedCollectionsDir, "proposals.json"),
+    generatedCollectionsApplyJson: path.join(generatedCollectionsDir, "apply-results.json"),
     guideMarkdown,
     guideJson,
     policyMarkdown: guideMarkdown,

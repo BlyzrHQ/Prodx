@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import type { LooseRecord, ProductRecord, ProductVariant, ShopifyPayload } from "../types.js";
+import type { CollectionProposal, CollectionRegistryEntry, LooseRecord, ProductRecord, ProductVariant, ShopifyPayload } from "../types.js";
 
 interface CreateMediaInput {
   originalSource: string;
@@ -17,6 +17,7 @@ interface MetafieldInput {
 }
 
 type ShopifyMetafieldDefinitionMap = Map<string, { type: string }>;
+type ShopifyMetafieldDefinitionWithIdMap = Map<string, { id: string; type: string }>;
 
 interface ShopifyGraphqlRequest {
   store: string;
@@ -351,6 +352,60 @@ async function fetchProductMetafieldDefinitionsMap({
     const type = edge.node.type?.name ?? "";
     if (!namespace || !key || !type) continue;
     definitions.set(`${namespace}.${key}`, { type });
+  }
+  return definitions;
+}
+
+async function fetchProductMetafieldDefinitionsWithIdsMap({
+  store,
+  apiVersion = "2025-04",
+  accessToken
+}: {
+  store: string;
+  apiVersion?: string;
+  accessToken: string;
+}): Promise<ShopifyMetafieldDefinitionWithIdMap> {
+  const data = await shopifyGraphql<{
+    metafieldDefinitions?: {
+      edges?: Array<{
+        node: {
+          id?: string;
+          namespace?: string;
+          key?: string;
+          type?: { name?: string };
+        };
+      }>;
+    };
+  }>({
+    store,
+    apiVersion,
+    accessToken,
+    query: `
+      query CatalogToolkitCollectionMetafieldDefinitions {
+        metafieldDefinitions(first: 100, ownerType: PRODUCT) {
+          edges {
+            node {
+              id
+              namespace
+              key
+              type {
+                name
+              }
+            }
+          }
+        }
+      }
+    `
+  });
+
+  const definitions: ShopifyMetafieldDefinitionWithIdMap = new Map();
+  for (const edge of data.metafieldDefinitions?.edges ?? []) {
+    const id = edge.node.id ?? "";
+    const namespace = edge.node.namespace ?? "";
+    const key = edge.node.key ?? "";
+    const type = edge.node.type?.name ?? "";
+    if (!id || !namespace || !key || !type) continue;
+    definitions.set(`${namespace}.${key}`, { id, type });
   }
   return definitions;
 }
@@ -825,6 +880,271 @@ async function attachVariantToExistingProduct({
     productId: data.productVariantsBulkCreate.product?.id ?? productId,
     handle: data.productVariantsBulkCreate.product?.handle,
     variantSupport: "attached_variant"
+  };
+}
+
+function humanizeKey(value: string): string {
+  return value
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function normalizeCollectionSourceValue(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export async function importShopifyCollectionsToRegistry({
+  store,
+  apiVersion = "2025-04",
+  accessToken
+}: {
+  store: string;
+  apiVersion?: string;
+  accessToken: string;
+}): Promise<CollectionRegistryEntry[]> {
+  const imported: CollectionRegistryEntry[] = [];
+  let cursor: string | null = null;
+
+  while (true) {
+    const data = await shopifyGraphql<{
+      collections?: {
+        edges?: Array<{
+          cursor?: string;
+          node: {
+            id: string;
+            title?: string;
+            handle?: string;
+            ruleSet?: {
+              appliedDisjunctively?: boolean;
+              rules?: Array<{
+                column?: string;
+                relation?: string;
+                condition?: string;
+                conditionObject?: {
+                  metafieldDefinition?: {
+                    id?: string;
+                    namespace?: string;
+                    key?: string;
+                  };
+                };
+              }>;
+            };
+          };
+        }>;
+        pageInfo?: {
+          hasNextPage?: boolean;
+          endCursor?: string | null;
+        };
+      };
+    }>({
+      store,
+      apiVersion,
+      accessToken,
+      query: `
+        query CatalogToolkitCollections($first: Int!, $after: String) {
+          collections(first: $first, after: $after) {
+            edges {
+              cursor
+              node {
+                id
+                title
+                handle
+                ruleSet {
+                  appliedDisjunctively
+                  rules {
+                    column
+                    relation
+                    condition
+                    conditionObject {
+                      ... on CollectionRuleMetafieldCondition {
+                        metafieldDefinition {
+                          id
+                          namespace
+                          key
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      `,
+      variables: {
+        first: 100,
+        after: cursor
+      }
+    });
+
+    for (const edge of data.collections?.edges ?? []) {
+      const rules = edge.node.ruleSet?.rules ?? [];
+      if (rules.length !== 1) continue;
+      const rule = rules[0];
+      const column = String(rule.column ?? "").toUpperCase();
+      const relation = String(rule.relation ?? "").toUpperCase();
+      const condition = typeof rule.condition === "string" ? rule.condition.trim() : "";
+      if (!condition || relation !== "EQUALS") continue;
+
+      if (column === "TYPE") {
+        imported.push({
+          id: edge.node.id,
+          title: edge.node.title ?? condition,
+          handle: edge.node.handle ?? "",
+          source_type: "product_type",
+          source_key: "product_type",
+          source_label: "Product type",
+          source_value: condition,
+          normalized_value: normalizeCollectionSourceValue(condition),
+          product_count: 0,
+          status: "imported",
+          rule: {
+            applied_disjunctively: Boolean(edge.node.ruleSet?.appliedDisjunctively),
+            rules: [{
+              column: "TYPE",
+              relation: "EQUALS",
+              condition
+            }]
+          },
+          shopify_id: edge.node.id,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+        continue;
+      }
+
+      if (column === "PRODUCT_METAFIELD_DEFINITION") {
+        const metafieldDefinition = rule.conditionObject?.metafieldDefinition;
+        const namespace = typeof metafieldDefinition?.namespace === "string" ? metafieldDefinition.namespace.trim() : "";
+        const key = typeof metafieldDefinition?.key === "string" ? metafieldDefinition.key.trim() : "";
+        const definitionId = typeof metafieldDefinition?.id === "string" ? metafieldDefinition.id.trim() : "";
+        if (!namespace || !key || !definitionId) continue;
+
+        imported.push({
+          id: edge.node.id,
+          title: edge.node.title ?? `${humanizeKey(key)}: ${condition}`,
+          handle: edge.node.handle ?? "",
+          source_type: "metafield",
+          source_key: `${namespace}.${key}`,
+          source_label: `${humanizeKey(namespace)} / ${humanizeKey(key)}`,
+          namespace,
+          key,
+          source_value: condition,
+          normalized_value: normalizeCollectionSourceValue(condition),
+          product_count: 0,
+          status: "imported",
+          rule: {
+            applied_disjunctively: Boolean(edge.node.ruleSet?.appliedDisjunctively),
+            rules: [{
+              column: "PRODUCT_METAFIELD_DEFINITION",
+              relation: "EQUALS",
+              condition,
+              condition_object_id: definitionId
+            }]
+          },
+          shopify_id: edge.node.id,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+      }
+    }
+
+    if (!data.collections?.pageInfo?.hasNextPage) break;
+    cursor = data.collections.pageInfo.endCursor ?? null;
+    if (!cursor) break;
+  }
+
+  return imported;
+}
+
+export async function applyShopifySmartCollection({
+  store,
+  apiVersion = "2025-04",
+  accessToken,
+  proposal
+}: {
+  store: string;
+  apiVersion?: string;
+  accessToken: string;
+  proposal: CollectionProposal;
+}): Promise<{ id: string; title: string; handle: string }> {
+  const definitionIds = proposal.source_type === "metafield"
+    ? await fetchProductMetafieldDefinitionsWithIdsMap({ store, apiVersion, accessToken })
+    : new Map();
+  const ruleInputs = await Promise.all(proposal.rule.rules.map(async (rule) => {
+    if (rule.column === "TYPE") {
+      return {
+        column: "TYPE",
+        relation: "EQUALS",
+        condition: rule.condition
+      };
+    }
+
+    const definitionKey = `${proposal.namespace ?? ""}.${proposal.key ?? ""}`;
+    const definition = definitionIds.get(definitionKey);
+    if (!definition?.id) {
+      throw new Error(`Shopify product metafield definition ${definitionKey} was not found for collection apply.`);
+    }
+    return {
+      column: "PRODUCT_METAFIELD_DEFINITION",
+      relation: "EQUALS",
+      condition: rule.condition,
+      conditionObjectId: definition.id
+    };
+  }));
+
+  const data = await shopifyGraphql<{
+    collectionCreate: {
+      collection?: { id: string; title?: string; handle?: string };
+      userErrors?: Array<{ field?: string[]; message: string }>;
+    };
+  }>({
+    store,
+    apiVersion,
+    accessToken,
+    query: `
+      mutation CatalogToolkitCollectionCreate($input: CollectionInput!) {
+        collectionCreate(input: $input) {
+          collection {
+            id
+            title
+            handle
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    variables: {
+      input: {
+        title: proposal.title,
+        handle: proposal.handle,
+        descriptionHtml: proposal.description_html,
+        ruleSet: {
+          appliedDisjunctively: Boolean(proposal.rule.applied_disjunctively),
+          rules: ruleInputs
+        }
+      }
+    }
+  });
+
+  const errors = data.collectionCreate.userErrors ?? [];
+  if (errors.length > 0) {
+    throw new Error(`Shopify collectionCreate failed: ${errors.map((item) => item.message).join("; ")}`);
+  }
+
+  return {
+    id: data.collectionCreate.collection?.id ?? "",
+    title: data.collectionCreate.collection?.title ?? proposal.title,
+    handle: data.collectionCreate.collection?.handle ?? proposal.handle
   };
 }
 

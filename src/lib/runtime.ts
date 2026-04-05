@@ -20,7 +20,9 @@ export function defaultRuntimeConfig(): RuntimeConfig {
       "image-optimizer": { search_provider: "serper_default", vision_provider: "openai_vision_default" },
       "catalogue-qa": { llm_provider: "openai_default" },
       "catalogue-match": { catalog_provider: "shopify_default", reasoning_provider: "openai_default" },
-      "shopify-sync": { shopify_provider: "shopify_default" }
+      "shopify-sync": { shopify_provider: "shopify_default" },
+      "collection-builder": { llm_provider: "openai_default", fallback_llm_provider: "gemini_flash_default" },
+      "collection-evaluator": { llm_provider: "openai_default", fallback_llm_provider: "gemini_flash_default" }
     },
     agentic: {
       enabled: true,
@@ -33,8 +35,17 @@ export function defaultRuntimeConfig(): RuntimeConfig {
         "enrich-agent": { enabled: true, primary_provider: "openai_default", fallback_provider: "gemini_flash_default" },
         "image-agent": { enabled: true, primary_provider: "openai_vision_default" },
         "qa-agent": { enabled: true, primary_provider: "openai_default" },
-        "supervisor-agent": { enabled: true }
+        "supervisor-agent": { enabled: true },
+        "collection-builder-agent": { enabled: true, primary_provider: "openai_default", fallback_provider: "gemini_flash_default" },
+        "collection-evaluator-agent": { enabled: true, primary_provider: "openai_default", fallback_provider: "gemini_flash_default" }
       }
+    },
+    collections: {
+      enabled: true,
+      min_products_per_collection: 5,
+      max_iterations_per_candidate: 2,
+      allowed_rule_sources: ["product_type", "guide_metafields"],
+      auto_apply: false
     }
   };
 }
@@ -49,6 +60,7 @@ export async function initWorkspace(root: string) {
   await ensureDir(paths.generatedDir);
   await ensureDir(paths.generatedProductsDir);
   await ensureDir(paths.generatedImagesDir);
+  await ensureDir(paths.generatedCollectionsDir);
   if (!(await exists(paths.guideJson)) && (await exists(paths.legacyPolicyJson))) {
     await fs.copyFile(paths.legacyPolicyJson, paths.guideJson);
   }

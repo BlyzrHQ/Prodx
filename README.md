@@ -11,7 +11,8 @@ Prodx helps you prepare Shopify products with a guided workflow:
 5. find and review product images
 6. run QA
 7. generate a Shopify import file
-8. publish only safe products
+8. propose smart collections from accepted product types and approved metafields
+9. publish only safe products
 
 Everything is written locally into `.catalog/`, so every run is inspectable and repeatable.
 The guide is meant to work both as:
@@ -35,16 +36,16 @@ It keeps the same visual system and branding, but the working product surface re
 ## Project Structure
 
 ```text
-shopify-catalog-toolkit/
+prodx/
 ├── apps/
 │   └── web/                     # Prodx homepage
 ├── examples/                    # Grocery, apparel, electronics, variants, and alt-structure fixtures
 ├── src/
-│   ├── agents/                  # Guide, enrich, image, QA, and supervisor agent wrappers
+│   ├── agents/                  # Guide, enrich, image, QA, supervisor, and collection agent wrappers
 │   ├── connectors/              # OpenAI, Gemini, Anthropic, Shopify, and Serper integrations
-│   ├── lib/                     # Paths, runtime config, exports, pricing, guide helpers, artifacts
+│   ├── lib/                     # Paths, runtime config, collections, exports, pricing, guide helpers, artifacts
 │   ├── modules/                 # Deterministic engines and compatibility modules
-│   └── workflows/               # Shared orchestration, retry loop, and workflow graph
+│   └── workflows/               # Shared orchestration, retry loops, collection workflow, and workflow graph
 ├── tests/                       # End-to-end and fixture-backed regression tests
 └── .catalog/                    # Local workspace outputs created at runtime
 ```
@@ -66,11 +67,15 @@ Prodx keeps the CLI and local workspace model stable, while the internal workflo
   - produces structured findings, retry targets, and review blockers
 - `supervisor-agent`
   - decides whether to accept, retry, or escalate
+- `collection-builder-agent`
+  - drafts smart collection proposals from accepted product types and approved metafield values
+- `collection-evaluator-agent`
+  - approves, retries, or rejects collection proposals before apply
 - `shopify-sync`
   - stays deterministic
   - prepares safe export and publish payloads
 
-The user-facing CLI commands are unchanged. `init`, `guide generate`, `workflow run`, `review`, `publish`, and the single-module commands still work the same way.
+The user-facing CLI commands stay consistent. `init`, `guide generate`, `workflow run`, `review`, `publish`, the single-module commands, and the new `collections` command family all work locally from the same workspace.
 
 ## What It Handles
 
@@ -80,6 +85,8 @@ The user-facing CLI commands are unchanged. `init`, `guide generate`, `workflow 
 - Product enrichment with LLMs
 - Image search and image review
 - QA scoring and review queueing
+- Smart collection proposals from `product_type` and approved metafields
+- Local collection registry with duplicate protection
 - Shopify CSV export
 - Safe local publish and optional live publish
 - Provider usage logging in run artifacts
@@ -111,6 +118,47 @@ The workflow is:
    - prepares a Shopify-ready payload
    - supports safe variant attach mode for `NEW_VARIANT`
 
+6. `collections propose`
+   - summarizes accepted/generated products by `product_type` and guide-approved metafield values
+   - only considers values that meet the minimum product threshold
+   - checks duplicates against the local collection registry
+   - runs a builder/evaluator loop before saving proposals
+
+7. `collections apply`
+   - creates evaluator-approved smart collections in Shopify
+   - writes created or skipped results back into the local collection registry
+
+## Smart Collections
+
+Prodx now includes a local-first smart collection workflow.
+
+It is designed to stay aligned with the rest of the toolkit:
+
+- source of truth is the accepted/generated product ledger
+- duplicate checking is local-registry-first
+- Shopify is only used for one-time collection import and explicit apply
+- collections are proposed before they are ever created live
+
+The default flow is:
+
+1. `collections import`
+   - imports existing Shopify smart collections into the local registry
+2. `collections propose`
+   - groups accepted products by `product_type` and guide-approved metafield values
+   - only keeps values with `5` or more matching products by default
+   - runs the collection builder/evaluator loop
+3. `collections show`
+   - shows the saved summary, registry, and latest proposal results
+4. `collections apply`
+   - creates only evaluator-approved smart collections in Shopify
+
+The first version intentionally keeps scope narrow:
+
+- smart collections only
+- automatic rules from `product_type` and guide-approved metafields only
+- no manual/editorial collections
+- no seasonal campaign logic
+
 ## Workspace Output
 
 The toolkit writes everything into `.catalog/`.
@@ -127,6 +175,16 @@ Important files:
   - image metadata and downloads
 - `.catalog/generated/workflow-products.json`
   - running accepted/generated product ledger
+- `.catalog/generated/collections/collections.csv`
+  - local collection registry for imported, proposed, created, and skipped collections
+- `.catalog/generated/collections/collections.json`
+  - structured collection registry with rule payloads and statuses
+- `.catalog/generated/collections/summary.json`
+  - grouped `product_type` and approved metafield values with counts
+- `.catalog/generated/collections/proposals.json`
+  - latest smart collection proposals and evaluator decisions
+- `.catalog/generated/collections/apply-results.json`
+  - results from explicit collection apply runs
 - `.catalog/generated/shopify-import.csv`
   - Shopify import file
 - `.catalog/generated/catalog-review.xlsx`
@@ -195,6 +253,15 @@ Publish only safe products:
 node .\dist\cli.js publish
 ```
 
+Generate smart collections locally:
+
+```powershell
+node .\dist\cli.js collections import
+node .\dist\cli.js collections propose --min-products 5
+node .\dist\cli.js collections show
+node .\dist\cli.js collections apply
+```
+
 Live publish to Shopify:
 
 ```powershell
@@ -241,6 +308,15 @@ node .\dist\cli.js review queue
 node .\dist\cli.js review <job-id>
 node .\dist\cli.js review <job-id> --action approve
 node .\dist\cli.js apply <job-id>
+```
+
+Collections:
+
+```powershell
+node .\dist\cli.js collections import
+node .\dist\cli.js collections propose --min-products 5
+node .\dist\cli.js collections show
+node .\dist\cli.js collections apply
 ```
 
 Auth and model setup:

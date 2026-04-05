@@ -16,8 +16,31 @@ import { buildGeneratedProduct, getProductKey, persistGeneratedImageArtifacts, p
 import { resolveProvider } from "./lib/providers.js";
 import { summarizeWorkflowCosts } from "./lib/provider-cost.js";
 import { getGuidePassingScore } from "./lib/catalog-guide.js";
+import {
+  buildCollectionCandidate,
+  buildRegistryEntryFromProposal,
+  buildCollectionSourceSummary,
+  createSkippedDuplicateProposal,
+  dedupeCollectionCandidates,
+  findCollectionRegistryDuplicate,
+  loadCollectionProposals,
+  loadCollectionRegistry,
+  loadCollectionSummary,
+  mergeCollectionRegistryEntries,
+  saveCollectionApplyResults,
+  saveCollectionProposals,
+  saveCollectionRegistry,
+  saveCollectionSummary
+} from "./lib/collections.js";
 import { INDUSTRY_OPTIONS } from "./lib/policy-template.js";
-import { testShopifyConnection, fetchShopifyCatalogSnapshot, applyShopifyPayload, authenticateShopifyViaOAuth } from "./connectors/shopify.js";
+import {
+  testShopifyConnection,
+  fetchShopifyCatalogSnapshot,
+  applyShopifyPayload,
+  applyShopifySmartCollection,
+  authenticateShopifyViaOAuth,
+  importShopifyCollectionsToRegistry
+} from "./connectors/shopify.js";
 import { authenticateGeminiViaOAuth } from "./connectors/gemini.js";
 import { loadRecordsFromSource, loadRecordsFromText, runIngest } from "./modules/ingest.js";
 import { runMatchDecision, buildCatalogIndex } from "./modules/match.js";
@@ -28,7 +51,26 @@ import { runSync } from "./modules/sync.js";
 import { runLearn } from "./modules/learn.js";
 import { runGuideAgent } from "./agents/guide-agent.js";
 import { runAgenticWorkflow } from "./workflows/agentic-workflow.js";
-import type { ApplyResult, CliStreams, LooseRecord, ModuleResult, OutputWriter, PolicyDocument, ProductRecord, ReviewDecision, RunData, RuntimeConfig, ShopifyPayload, WorkflowRunSummary } from "./types.js";
+import { runCollectionProposalWorkflow } from "./workflows/collection-workflow.js";
+import type {
+  ApplyResult,
+  CliStreams,
+  CollectionApplyResult,
+  CollectionCandidate,
+  CollectionProposal,
+  CollectionRegistryEntry,
+  CollectionSourceSummary,
+  LooseRecord,
+  ModuleResult,
+  OutputWriter,
+  PolicyDocument,
+  ProductRecord,
+  ReviewDecision,
+  RunData,
+  RuntimeConfig,
+  ShopifyPayload,
+  WorkflowRunSummary
+} from "./types.js";
 
 type Flags = Record<string, string | boolean>;
 type OutputMode = "json" | "text";
@@ -398,6 +440,120 @@ function renderPublishSummary(payload: { live: boolean; published: number; skipp
   lines.push("", section("Try Next"));
   lines.push("- catalog review queue");
   lines.push("- catalog publish --live");
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCollectionSummary(summary: CollectionSourceSummary | null): string {
+  if (!summary) {
+    return `${section("Collection Summary")}\nNo saved collection summary found. Run \`catalog collections propose\` first.\n`;
+  }
+
+  const lines = [
+    section("Collection Summary"),
+    `Products analyzed: ${summary.total_products_analyzed}`,
+    `Minimum products: ${summary.min_products_per_collection}`,
+    `Candidates: ${summary.candidates.length}`,
+    `Skipped: ${summary.skipped.length}`
+  ];
+  if (summary.candidates.length > 0) {
+    lines.push("", section("Top Candidates"));
+    summary.candidates.slice(0, 12).forEach((entry) => {
+      lines.push(`- ${entry.source_label} = ${entry.source_value} (${entry.product_count} products)`);
+    });
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCollectionProposalSummary(payload: {
+  summary: CollectionSourceSummary;
+  proposals: CollectionProposal[];
+  registryCount: number;
+  summaryPath: string;
+  proposalsPath: string;
+  registryCsv: string;
+}): string {
+  const lines = [
+    section("Collection Proposals"),
+    `Products analyzed: ${payload.summary.total_products_analyzed}`,
+    `Candidates considered: ${payload.summary.candidates.length}`,
+    `Proposals saved: ${payload.proposals.length}`,
+    `Registry entries: ${payload.registryCount}`
+  ];
+
+  if (payload.proposals.length > 0) {
+    lines.push("", section("Latest Proposals"));
+    payload.proposals.slice(0, 12).forEach((proposal) => {
+      lines.push(`- ${proposal.title} -> ${proposal.evaluator_decision} (${proposal.product_count} products)`);
+    });
+  }
+
+  lines.push("", section("Generated Files"));
+  lines.push(`Summary: ${payload.summaryPath}`);
+  lines.push(`Proposals: ${payload.proposalsPath}`);
+  lines.push(`Registry CSV: ${payload.registryCsv}`);
+  lines.push("", section("Try Next"));
+  lines.push("- catalog collections show");
+  lines.push("- catalog collections apply");
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCollectionShow(payload: {
+  summary: CollectionSourceSummary | null;
+  registry: CollectionRegistryEntry[];
+  proposals: CollectionProposal[];
+}): string {
+  const lines = [
+    renderCollectionSummary(payload.summary).trimEnd(),
+    "",
+    section("Collection Registry"),
+    `Entries: ${payload.registry.length}`
+  ];
+
+  if (payload.registry.length > 0) {
+    payload.registry.slice(0, 12).forEach((entry) => {
+      lines.push(`- ${entry.title} [${entry.status}] -> ${entry.source_label} = ${entry.source_value}`);
+    });
+  }
+
+  lines.push("", section("Latest Proposal Results"));
+  if (payload.proposals.length === 0) {
+    lines.push("No saved proposals yet.");
+  } else {
+    payload.proposals.slice(0, 12).forEach((proposal) => {
+      lines.push(`- ${proposal.title}: ${proposal.status} (${proposal.evaluator_decision})`);
+    });
+  }
+  lines.push("", section("Try Next"));
+  lines.push("- catalog collections propose");
+  lines.push("- catalog collections apply");
+  return `${lines.join("\n")}\n`;
+}
+
+function renderCollectionImport(payload: { imported: number; registryCount: number; registryCsv: string }): string {
+  return [
+    section("Collection Import Complete"),
+    `Imported: ${payload.imported}`,
+    `Registry entries: ${payload.registryCount}`,
+    `Registry CSV: ${payload.registryCsv}`,
+    "",
+    section("Try Next"),
+    "- catalog collections show",
+    "- catalog collections propose"
+  ].join("\n") + "\n";
+}
+
+function renderCollectionApply(payload: { applied: CollectionApplyResult[]; registryCount: number; applyResultsPath: string; registryCsv: string }): string {
+  const lines = [
+    section("Collection Apply Complete"),
+    `Processed: ${payload.applied.length}`,
+    `Registry entries: ${payload.registryCount}`
+  ];
+  payload.applied.forEach((result) => {
+    lines.push(`- ${result.title}: ${result.status} (${result.message})`);
+  });
+  lines.push("", section("Generated Files"));
+  lines.push(`Apply results: ${payload.applyResultsPath}`);
+  lines.push(`Registry CSV: ${payload.registryCsv}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -1351,6 +1507,8 @@ export async function runCli(
         return await handleBatch(root, subcommand, flags, stdout);
       case "workflow":
         return await handleWorkflow(root, subcommand, flags, stdout);
+      case "collections":
+        return await handleCollections(root, subcommand, flags, stdout);
       case "review":
         return await handleReview(root, positional[1], flags, stdout);
       case "apply":
@@ -1892,6 +2050,221 @@ async function handleWorkflow(root: string, subcommand: string | undefined, flag
   return 0;
 }
 
+async function handleCollections(root: string, subcommand: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
+  await initWorkspace(root);
+  const mode = getOutputMode(flags);
+
+  if (subcommand === "import") {
+    const shopifyProvider = await resolveProvider(root, "shopify-sync", "shopify_provider");
+    if (!providerIsReady(shopifyProvider)) {
+      throw new Error("Shopify provider is not ready. Configure Shopify credentials before importing collections.");
+    }
+
+    const imported = await withSpinner("Importing Shopify collections", mode, () => importShopifyCollectionsToRegistry({
+      store: shopifyProvider!.provider.store,
+      apiVersion: shopifyProvider!.provider.api_version ?? "2025-04",
+      accessToken: shopifyProvider!.credential!.value
+    }));
+    const registry = await loadCollectionRegistry(root);
+    const merged = mergeCollectionRegistryEntries(registry, imported);
+    const registryPaths = await saveCollectionRegistry(root, merged);
+    const payload = {
+      imported: imported.length,
+      registryCount: merged.length,
+      registryCsv: registryPaths.csvPath
+    };
+    writeOutput(stdout, mode, payload, renderCollectionImport(payload));
+    return 0;
+  }
+
+  if (subcommand === "propose") {
+    const runtimeConfig = await loadRuntimeConfig(root);
+    const policy = await getPolicyOrThrow(root);
+    const explicitMin = flags["min-products"] ? Number(flags["min-products"]) : undefined;
+    const summary = await withSpinner("Summarizing collection sources", mode, () => buildCollectionSourceSummary({
+      root,
+      policy,
+      runtimeConfig,
+      minProducts: explicitMin
+    }));
+    const summaryPath = await saveCollectionSummary(root, summary);
+    const existingRegistry = await loadCollectionRegistry(root);
+    const workingRegistry = [...existingRegistry];
+    const candidates = dedupeCollectionCandidates(summary.candidates)
+      .slice(0, flags.limit ? Number(flags.limit) : summary.candidates.length)
+      .map((entry) => buildCollectionCandidate(entry, runtimeConfig, explicitMin));
+    const proposals: CollectionProposal[] = [];
+
+    for (const candidate of candidates) {
+      const duplicate = findCollectionRegistryDuplicate(candidate, workingRegistry);
+      if (duplicate) {
+        const proposal = createSkippedDuplicateProposal(candidate, duplicate);
+        proposals.push(proposal);
+        workingRegistry.push(buildRegistryEntryFromProposal(proposal, "skipped_duplicate", { duplicate_of: duplicate.id }));
+        continue;
+      }
+
+      const workflow = await withSpinner(`Proposing ${candidate.source_label} = ${candidate.source_value}`, mode, () => runCollectionProposalWorkflow({
+        root,
+        candidate,
+        policy,
+        runtimeConfig,
+        registry: workingRegistry,
+        executeModule: (moduleName, input, handler) => executeModule(root, moduleName, input, async (jobId) => handler(jobId))
+      }));
+
+      let proposal = workflow.proposal;
+      const duplicateAfterProposal = findCollectionRegistryDuplicate({
+        source_type: proposal.source_type,
+        source_key: proposal.source_key,
+        source_value: proposal.source_value,
+        handle: proposal.handle
+      }, workingRegistry);
+      if (duplicateAfterProposal) {
+        proposal = {
+          ...proposal,
+          status: "skipped_duplicate",
+          duplicate_of: duplicateAfterProposal.id,
+          evaluator_decision: "APPROVE",
+          evaluation: {
+            decision: "APPROVE",
+            summary: "Skipped duplicate proposal because an equivalent collection already exists locally.",
+            reasons: [`Matched registry entry ${duplicateAfterProposal.id}`],
+            retry_instructions: []
+          }
+        };
+        workingRegistry.push(buildRegistryEntryFromProposal(proposal, "skipped_duplicate", { duplicate_of: duplicateAfterProposal.id }));
+      } else {
+        const registryStatus = proposal.status === "approved"
+          ? "proposed"
+          : proposal.status === "skipped_duplicate"
+            ? "skipped_duplicate"
+            : "rejected";
+        workingRegistry.push(buildRegistryEntryFromProposal(proposal, registryStatus));
+      }
+      proposals.push(proposal);
+    }
+
+    const proposalsPath = await saveCollectionProposals(root, proposals);
+    const registryPaths = await saveCollectionRegistry(root, mergeCollectionRegistryEntries(existingRegistry, workingRegistry));
+    const payload = {
+      summary,
+      proposals,
+      registryCount: workingRegistry.length,
+      summaryPath,
+      proposalsPath,
+      registryCsv: registryPaths.csvPath
+    };
+    writeOutput(stdout, mode, payload, renderCollectionProposalSummary(payload));
+    return 0;
+  }
+
+  if (subcommand === "show") {
+    const summary = await loadCollectionSummary(root);
+    const registry = await loadCollectionRegistry(root);
+    const proposals = await loadCollectionProposals(root);
+    const payload = { summary, registry, proposals };
+    writeOutput(stdout, mode, payload, renderCollectionShow(payload));
+    return 0;
+  }
+
+  if (subcommand === "apply") {
+    const shopifyProvider = await resolveProvider(root, "shopify-sync", "shopify_provider");
+    if (!providerIsReady(shopifyProvider)) {
+      throw new Error("Shopify provider is not ready. Configure Shopify credentials before applying collections.");
+    }
+
+    const proposals = await loadCollectionProposals(root);
+    const registry = await loadCollectionRegistry(root);
+    const applyResults: CollectionApplyResult[] = [];
+    const nextRegistry = [...registry];
+    const approved = proposals.filter((proposal) => proposal.status === "approved");
+
+    for (const proposal of approved) {
+      const duplicate = nextRegistry.find((entry) =>
+        entry.id !== proposal.id
+        && (
+          (entry.source_type === proposal.source_type && entry.source_key === proposal.source_key && entry.normalized_value === proposal.normalized_value)
+          || entry.handle === proposal.handle
+        )
+        && ["imported", "created", "skipped_duplicate"].includes(entry.status)
+      );
+
+      if (duplicate) {
+        applyResults.push({
+          proposal_id: proposal.id,
+          title: proposal.title,
+          handle: proposal.handle,
+          status: "skipped_duplicate",
+          duplicate_of: duplicate.id,
+          message: `Matched registry entry ${duplicate.id}`,
+          applied_at: new Date().toISOString()
+        });
+        nextRegistry.push(buildRegistryEntryFromProposal(proposal, "skipped_duplicate", { duplicate_of: duplicate.id }));
+        continue;
+      }
+
+      try {
+        const created = await withSpinner(`Creating ${proposal.title}`, mode, () => applyShopifySmartCollection({
+          store: shopifyProvider!.provider.store,
+          apiVersion: shopifyProvider!.provider.api_version ?? "2025-04",
+          accessToken: shopifyProvider!.credential!.value,
+          proposal
+        }));
+        applyResults.push({
+          proposal_id: proposal.id,
+          title: created.title,
+          handle: created.handle,
+          status: "created",
+          shopify_id: created.id,
+          message: "Created successfully in Shopify.",
+          applied_at: new Date().toISOString()
+        });
+        nextRegistry.push(buildRegistryEntryFromProposal(proposal, "created", {
+          shopify_id: created.id,
+          title: created.title,
+          handle: created.handle
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/already exists|taken|duplicate/i.test(message)) {
+          applyResults.push({
+            proposal_id: proposal.id,
+            title: proposal.title,
+            handle: proposal.handle,
+            status: "skipped_duplicate",
+            message,
+            applied_at: new Date().toISOString()
+          });
+          nextRegistry.push(buildRegistryEntryFromProposal(proposal, "skipped_duplicate"));
+        } else {
+          applyResults.push({
+            proposal_id: proposal.id,
+            title: proposal.title,
+            handle: proposal.handle,
+            status: "error",
+            message,
+            applied_at: new Date().toISOString()
+          });
+        }
+      }
+    }
+
+    const applyResultsPath = await saveCollectionApplyResults(root, applyResults);
+    const registryPaths = await saveCollectionRegistry(root, mergeCollectionRegistryEntries(registry, nextRegistry));
+    const payload = {
+      applied: applyResults,
+      registryCount: nextRegistry.length,
+      applyResultsPath,
+      registryCsv: registryPaths.csvPath
+    };
+    writeOutput(stdout, mode, payload, renderCollectionApply(payload));
+    return 0;
+  }
+
+  throw new Error("Use `catalog collections import`, `catalog collections propose`, `catalog collections show`, or `catalog collections apply`.");
+}
+
 async function handleReview(root: string, jobOrPath: string | undefined, flags: Flags, stdout: OutputWriter): Promise<number> {
   if (!jobOrPath) throw new Error("Use `catalog review <job-id>`.");
   const mode = getOutputMode(flags);
@@ -2184,6 +2557,10 @@ guide show [--json]
 workflow run --input <file> [--catalog <file>] [--limit N] [--json]
 workflow run --text "<product lines>" [--catalog <file>] [--limit N] [--json]
 publish [--live] [--json]
+collections import [--json]
+collections propose [--min-products N] [--limit N] [--json]
+collections show [--json]
+collections apply [--json]
 
 ${section("Single-Step Commands")}
 ingest --input <file> [--json]
@@ -2223,6 +2600,10 @@ catalog guide generate --industry food_and_beverage --business-name "Blyzr" --bu
 catalog workflow run --input .\\examples\\grocery\\products-match.json --catalog .\\examples\\grocery\\catalog-match.json
 catalog workflow run --input .\\examples\\alt-structure\\products-grocery.csv --catalog .\\examples\\grocery\\catalog-match.json
 catalog workflow run --text "Almarai Fresh Milk Low Fat 1L - 8.50\nBaladna Greek Yogurt Plain 500g - 12.50" --catalog .\\examples\\grocery\\catalog-match.json
+catalog collections import
+catalog collections propose --min-products 5
+catalog collections show
+catalog collections apply
 catalog auth set --provider anthropic --value <api-key> --model claude-sonnet-4-20250514
 catalog auth login --provider openai --model gpt-5
 catalog review queue
