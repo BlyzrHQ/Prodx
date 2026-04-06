@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { resolveLiveVariantAttachPayload, runCli, shouldSkipAfterMatch } from "../dist/cli.js";
 import { buildShopifyPayload } from "../dist/connectors/shopify.js";
 import { analyzeImageWithOpenAI } from "../dist/connectors/openai.js";
@@ -75,6 +75,77 @@ function writer() {
       this.text += chunk;
     }
   };
+}
+
+function stringifyCellValue(value: ExcelJS.CellValue | undefined): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "object") {
+    if ("richText" in value && Array.isArray(value.richText)) {
+      return value.richText.map((part) => part.text).join("");
+    }
+    if ("text" in value && typeof value.text === "string") {
+      return value.text;
+    }
+    if ("hyperlink" in value && typeof value.hyperlink === "string") {
+      return value.hyperlink;
+    }
+    if ("result" in value && value.result !== undefined && value.result !== null) {
+      return String(value.result);
+    }
+    if ("error" in value && typeof value.error === "string") {
+      return value.error;
+    }
+  }
+  return String(value);
+}
+
+async function readWorksheetRowsFromWorkbook(
+  workbookPath: string,
+  sheetName: string
+): Promise<Array<Record<string, string>>> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(workbookPath);
+  const worksheet = workbook.getWorksheet(sheetName);
+  assert.ok(worksheet, `Worksheet ${sheetName} was not found`);
+  const headerRow = worksheet.getRow(1);
+  const headers = headerRow.values
+    .slice(1)
+    .map((value) => stringifyCellValue(value as ExcelJS.CellValue | undefined));
+
+  const rows: Array<Record<string, string>> = [];
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      record[header] = stringifyCellValue(row.getCell(index + 1).value as ExcelJS.CellValue | undefined);
+    });
+    rows.push(record);
+  });
+  return rows;
+}
+
+async function readRowsFromCsv(csv: string): Promise<Array<Record<string, string>>> {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = await workbook.csv.read(Buffer.from(csv, "utf8"));
+  const headerRow = worksheet.getRow(1);
+  const headers = headerRow.values
+    .slice(1)
+    .map((value) => stringifyCellValue(value as ExcelJS.CellValue | undefined));
+
+  const rows: Array<Record<string, string>> = [];
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      record[header] = stringifyCellValue(row.getCell(index + 1).value as ExcelJS.CellValue | undefined);
+    });
+    rows.push(record);
+  });
+  return rows;
 }
 
 const tests = [
@@ -1770,21 +1841,21 @@ price: 199
       assert.match(shopifyImport, /Saudi Arabia/);
       assert.match(shopifyImport, /https:\/\/example\.com\/fresh-milk\.jpg/);
       const excelWorkbookPath = path.join(cwd, ".catalog", "generated", "catalog-review.xlsx");
-      const excelWorkbookBuffer = await fs.readFile(excelWorkbookPath);
-      const workbook = XLSX.read(excelWorkbookBuffer, { type: "buffer" });
-      assert.deepEqual(workbook.SheetNames, ["Runs", "Generated Products", "Images", "Metafields", "Pending Review", "Shopify Import"]);
-      const generatedProductsSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Generated Products"]);
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.readFile(excelWorkbookPath);
+      assert.deepEqual(workbook.worksheets.map((sheet) => sheet.name), ["Runs", "Generated Products", "Images", "Metafields", "Pending Review", "Shopify Import"]);
+      const generatedProductsSheet = await readWorksheetRowsFromWorkbook(excelWorkbookPath, "Generated Products");
       assert.equal(generatedProductsSheet[0]["Featured Image"], "https://example.com/fresh-milk.jpg");
       assert.match(generatedProductsSheet[0].Metafields, /custom\.country_of_origin=Saudi Arabia/);
-      const imageSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Images"]);
+      const imageSheet = await readWorksheetRowsFromWorkbook(excelWorkbookPath, "Images");
       assert.equal(imageSheet[0]["Selected Image URL"], "https://example.com/fresh-milk.jpg");
       const productJson = JSON.parse(await fs.readFile(workflow.runs[0].generated_product_path, "utf8"));
       assert.ok(productJson._catalog_stage_metrics);
-      const metafieldSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Metafields"]);
+      const metafieldSheet = await readWorksheetRowsFromWorkbook(excelWorkbookPath, "Metafields");
       const originMetafield = metafieldSheet.find((row) => row.Namespace === "custom" && row.Key === "country_of_origin");
       assert.ok(originMetafield);
       assert.equal(originMetafield.Value, "Saudi Arabia");
-      const shopifyImportSheet = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Shopify Import"]);
+      const shopifyImportSheet = await readWorksheetRowsFromWorkbook(excelWorkbookPath, "Shopify Import");
       assert.equal(shopifyImportSheet[0]["Country Of Origin (product.metafields.custom.country_of_origin)"], "Saudi Arabia");
     }
   },
@@ -1845,8 +1916,7 @@ price: 199
       await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
       const generatedProduct = JSON.parse(await fs.readFile(path.join(cwd, ".catalog", "generated", "products", "e1.json"), "utf8"));
       assert.equal(generatedProduct.vendor ?? "", "");
-      const workbook = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
-      const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Shopify Import"]);
+      const rows = await readWorksheetRowsFromWorkbook(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx"), "Shopify Import");
       const row = rows[0];
       assert.equal(row["Vendor"], "");
       assert.equal(row["Option1 name"], "Title");
@@ -2085,8 +2155,7 @@ price: 199
       ], policy);
 
       const csv = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
-      const workbook = XLSX.read(csv, { type: "string" });
-      const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]]);
+      const rows = await readRowsFromCsv(csv);
       const blackRow = rows.find((row) => row["Option1 value"] === "Black");
       assert.ok(blackRow);
       assert.equal(blackRow["Option1 name"], "color");
@@ -2135,8 +2204,7 @@ price: 199
       ], policy);
 
       const csv = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
-      const workbook = XLSX.read(csv, { type: "string" });
-      const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]]);
+      const rows = await readRowsFromCsv(csv);
       assert.equal(rows[0]["Title"], "Baladna Greek Yogurt 500g");
       assert.equal(rows[0]["Option1 value"], "Plain");
     }
@@ -2194,8 +2262,7 @@ price: 199
       assert.equal(queueCode, 0);
       const queue = JSON.parse(io.text);
       assert.equal(queue.count > 0, true);
-      const workbookBefore = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
-      const pendingBefore = XLSX.utils.sheet_to_json<Record<string, string>>(workbookBefore.Sheets["Pending Review"]);
+      const pendingBefore = await readWorksheetRowsFromWorkbook(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx"), "Pending Review");
       assert.equal(pendingBefore.length > 0, true);
       io.text = "";
       const bulkCode = await runCli(["review", "bulk", "--action", "approve", "--json"], { cwd, stdout: io, stderr: io });
@@ -2207,8 +2274,7 @@ price: 199
       assert.equal(queueAfterCode, 0);
       const queueAfter = JSON.parse(io.text);
       assert.equal(queueAfter.count, 0);
-      const workbookAfter = XLSX.read(await fs.readFile(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx")), { type: "buffer" });
-      const pendingAfter = XLSX.utils.sheet_to_json<Record<string, string>>(workbookAfter.Sheets["Pending Review"]);
+      const pendingAfter = await readWorksheetRowsFromWorkbook(path.join(cwd, ".catalog", "generated", "catalog-review.xlsx"), "Pending Review");
       assert.equal(pendingAfter.length, 0);
       const shopifyImport = await fs.readFile(path.join(cwd, ".catalog", "generated", "shopify-import.csv"), "utf8");
       assert.match(shopifyImport, /Title,URL handle,Description,Vendor/);

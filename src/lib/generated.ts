@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { materializeProposedChanges } from "./change-records.js";
 import { ensureDir, readJson, writeJson, writeText } from "./fs.js";
 import { getCatalogPaths } from "./paths.js";
@@ -949,13 +949,37 @@ export async function writeExcelWorkbook(
   const shopifyRows = buildShopifyCsvRows(shopifyProducts, shopifyMetafieldColumns, policy);
   const shopifyHeader = [...SHOPIFY_IMPORT_HEADER, ...shopifyMetafieldColumns.map((column) => column.header)];
 
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(moduleRows), "Runs");
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(productRows), "Generated Products");
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(imageRows), "Images");
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(metafieldRows), "Metafields");
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(pendingReviewRows), "Pending Review");
-  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([shopifyHeader, ...shopifyRows]), "Shopify Import");
-  XLSX.writeFile(workbook, paths.generatedExcelWorkbook);
+  const workbook = new ExcelJS.Workbook();
+  appendJsonWorksheet(workbook, "Runs", moduleRows);
+  appendJsonWorksheet(workbook, "Generated Products", productRows);
+  appendJsonWorksheet(workbook, "Images", imageRows);
+  appendJsonWorksheet(workbook, "Metafields", metafieldRows);
+  appendJsonWorksheet(workbook, "Pending Review", pendingReviewRows);
+  appendRowsWorksheet(workbook, "Shopify Import", [shopifyHeader, ...shopifyRows]);
+  await workbook.xlsx.writeFile(paths.generatedExcelWorkbook);
   return paths.generatedExcelWorkbook;
+}
+
+function appendJsonWorksheet(
+  workbook: ExcelJS.Workbook,
+  sheetName: string,
+  rows: Array<Record<string, string>>
+): void {
+  const worksheet = workbook.addWorksheet(sheetName);
+  const headers = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
+  worksheet.columns = headers.map((header) => ({ header, key: header }));
+  for (const row of rows) {
+    worksheet.addRow(row);
+  }
+}
+
+function appendRowsWorksheet(
+  workbook: ExcelJS.Workbook,
+  sheetName: string,
+  rows: Array<readonly string[] | string[]>
+): void {
+  const worksheet = workbook.addWorksheet(sheetName);
+  for (const row of rows) {
+    worksheet.addRow([...row]);
+  }
 }
