@@ -363,20 +363,19 @@ async function main() {
     convexReady = true;
     p.log.success("Convex deployed — tables and indexes ready");
 
-    // Copy CONVEX_URL from .env.local to .env (Convex writes to .env.local, our CLI reads .env)
+    // Sync Convex-generated env vars from .env.local into .env so the scaffold can run immediately
     const envLocalPath = path.join(resolvedDir, ".env.local");
     if (fs.existsSync(envLocalPath)) {
-      const envLocal = fs.readFileSync(envLocalPath, "utf-8");
-      const urlMatch = envLocal.match(/CONVEX_URL=(.+)/);
-      if (urlMatch) {
-        const envPath = path.join(resolvedDir, ".env");
-        let envContent = fs.readFileSync(envPath, "utf-8");
-        envContent = envContent.replace(/CONVEX_URL=.*/, `CONVEX_URL=${urlMatch[1].trim()}`);
-        fs.writeFileSync(envPath, envContent);
-        p.log.success(`Convex URL saved to .env: ${urlMatch[1].trim()}`);
+      const envPath = path.join(resolvedDir, ".env");
+      const syncedKeys = syncEnvFileVars(envLocalPath, envPath);
+      const convexUrl = readEnvVar(envPath, "CONVEX_URL");
 
-        // Save guide + store context to Convex so Trigger tasks can access them
-        const convexUrl = urlMatch[1].trim();
+      if (syncedKeys.length > 0) {
+        p.log.success(`Convex env vars saved to .env: ${syncedKeys.join(", ")}`);
+      }
+
+      // Save guide + store context to Convex so Trigger tasks can access them
+      if (convexUrl) {
         try {
           if (guide || storeContext) {
             const setupStoreContext = buildSetupStoreContext(storeContext, shopifyMetafields);
@@ -640,6 +639,30 @@ function writeEnvVar(envPath: string, key: string, value: string): void {
     ? current.replace(pattern, `${key}=${nextValue}`)
     : `${current.trimEnd()}\n${key}=${nextValue}\n`;
   fs.writeFileSync(envPath, next);
+}
+
+function syncEnvFileVars(sourceEnvPath: string, targetEnvPath: string): string[] {
+  if (!fs.existsSync(sourceEnvPath)) return [];
+
+  const sourceContent = fs.readFileSync(sourceEnvPath, "utf-8");
+  const syncedKeys: string[] = [];
+
+  for (const line of sourceContent.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex <= 0) continue;
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    if (!key) continue;
+
+    writeEnvVar(targetEnvPath, key, value);
+    syncedKeys.push(key);
+  }
+
+  return syncedKeys;
 }
 
 function cancel(): void {

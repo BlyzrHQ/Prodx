@@ -39,7 +39,15 @@ function loadCanonicalRuntimeSource(relativePath: string): string {
 }
 
 function generateConfig(config: ProjectConfig): string {
-  return `import "dotenv/config";
+  return `import fs from "node:fs";
+import path from "node:path";
+import { config as loadEnv } from "dotenv";
+
+loadEnv();
+const envLocalPath = path.resolve(".env.local");
+if (fs.existsSync(envLocalPath)) {
+  loadEnv({ path: envLocalPath, override: true });
+}
 
 export interface Config {
   openaiApiKey: string | undefined;
@@ -103,6 +111,12 @@ export async function convexQuery<T = unknown>(path: string, args: Record<string
 
   if (!res.ok) throw new Error("Convex query [" + path + "] failed: " + res.status);
   const data = (await res.json()) as any;
+  if (data?.status && data.status !== "success") {
+    throw new Error(
+      "Convex query [" + path + "] failed: " +
+        (data.errorMessage || data.errorData || JSON.stringify(data))
+    );
+  }
   return data.value as T;
 }
 
@@ -121,6 +135,12 @@ export async function convexMutation<T = unknown>(path: string, args: Record<str
 
   if (!res.ok) throw new Error("Convex mutation [" + path + "] failed: " + res.status);
   const data = (await res.json()) as any;
+  if (data?.status && data.status !== "success") {
+    throw new Error(
+      "Convex mutation [" + path + "] failed: " +
+        (data.errorMessage || data.errorData || JSON.stringify(data))
+    );
+  }
   return data.value as T;
 }
 
@@ -139,6 +159,12 @@ export async function convexAction<T = unknown>(path: string, args: Record<strin
 
   if (!res.ok) throw new Error("Convex action [" + path + "] failed: " + res.status);
   const data = (await res.json()) as any;
+  if (data?.status && data.status !== "success") {
+    throw new Error(
+      "Convex action [" + path + "] failed: " +
+        (data.errorMessage || data.errorData || JSON.stringify(data))
+    );
+  }
   return data.value as T;
 }
 `;

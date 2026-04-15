@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import {
+  approveAndPublishProduct,
   buildCollectionsOnce,
   getStatusSnapshot,
   ingestProducts,
@@ -28,6 +29,8 @@ async function main() {
       return handleCollections(args[0]);
     case "publish":
       return handlePublish();
+    case "approve":
+      return handleApprove(args[0]);
     case "status":
       return handleStatus();
     case "guide":
@@ -36,7 +39,7 @@ async function main() {
       return handleAdd(args);
     default:
       console.log("Usage: npx tsx src/cli.ts <command>");
-      console.log("Commands: sync, sync context, review, run pipeline, collections build, publish, status, guide, add");
+      console.log("Commands: sync, sync context, review, run pipeline, collections build, publish, approve, status, guide, add");
   }
 }
 
@@ -123,6 +126,20 @@ async function handlePublish() {
 
   const approved = await convexQuery<any[]>("products:getApprovedForPublish", {});
   console.log("Approved products ready for publish: " + approved.length);
+}
+
+async function handleApprove(productId: string | undefined) {
+  if (!productId) {
+    console.log("Usage: npx tsx src/cli.ts approve <productId>");
+    return;
+  }
+
+  const result = await approveAndPublishProduct(productId);
+  console.log(
+    result.dispatched
+      ? "Marked approved and dispatched Shopify publish to Trigger.dev."
+      : "Marked approved and attempted Shopify publish locally."
+  );
 }
 
 async function handleStatus() {

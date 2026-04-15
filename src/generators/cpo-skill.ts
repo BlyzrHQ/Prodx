@@ -45,6 +45,7 @@ Current config (non-sensitive):
 | \`npx tsx src/cli.ts review\` | Find products needing improvement |
 | \`npx tsx src/cli.ts run pipeline\` | Run only the needed stages, then QA and publish on pass |
 | \`npx tsx src/cli.ts collections build\` | Build collection proposals from catalogue patterns |
+| \`npx tsx src/cli.ts approve <productId>\` | Mark one product approved and immediately trigger Shopify publish |
 | \`npx tsx src/cli.ts publish\` | Publish approved products → Shopify |
 | \`npx tsx src/cli.ts status\` | Check pipeline health |
 | \`npx tsx src/cli.ts guide\` | Regenerate catalog guide |
@@ -102,7 +103,8 @@ After adding credentials, run \`npx tsx src/cli.ts sync\`.
 | Products in review = 0 and catalog not synced recently | Run \`sync\` then \`review\` |
 | Average QA score dropping below passing threshold | Investigate findings, then run \`run pipeline\` |
 | Products stuck in \`rejected\` or repeatedly returning to \`needs_review\` | Review manually, decide retry or skip |
-| Approved products not yet published | Run \`publish\` |
+| A user intentionally approves one specific product | Run \`approve <productId>\` |
+| Approved products not yet published in bulk | Run \`publish\` |
 | Collection candidates with 5+ products | Run collection builder |
 
 ## Workflow
@@ -179,6 +181,7 @@ npx tsx src/cli.ts add --image-url https://...  # Image URL intake via vision
 npx tsx src/cli.ts review        # Find improvements
 npx tsx src/cli.ts run pipeline  # Needed stages → QA → publish on pass
 npx tsx src/cli.ts collections build  # Build collection proposals
+npx tsx src/cli.ts approve <productId>  # Approve one product and trigger publish
 npx tsx src/cli.ts publish       # Approved → Shopify
 npx tsx src/cli.ts status        # Pipeline health
 \`\`\`
@@ -204,7 +207,8 @@ TRIGGER_SECRET_KEY   # Trigger.dev development secret key
 | Products in \`needs_review\` / \`in_review\` > 10 | \`run pipeline\` |
 | Products in review = 0 | \`sync\` then \`review\` |
 | Avg QA score < passing threshold | Investigate, then \`run pipeline\` |
-| Approved products ready | \`publish\` |
+| One product explicitly approved by a user | \`approve <productId>\` |
+| Approved products ready in bulk | \`publish\` |
 | Collection candidates (5+ products) | Run collection builder task |
 `;
 }

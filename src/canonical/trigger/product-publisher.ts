@@ -3,9 +3,19 @@ import { publishApprovedProducts, runProductPublishStage } from "../services/pip
 
 export const productPublisher = task({
   id: "product-publisher",
-  run: async (payload?: { productId?: string }) => {
+  run: async (payload?: {
+    productId?: string;
+    product?: Record<string, unknown>;
+    qaScore?: number;
+    reviewNotes?: Array<Record<string, unknown>>;
+  }) => {
     if (payload?.productId) {
-      return runProductPublishStage(String(payload.productId));
+      return runProductPublishStage(
+        String(payload.productId),
+        payload.product,
+        payload.qaScore,
+        payload.reviewNotes
+      );
     }
     return publishApprovedProducts();
   },

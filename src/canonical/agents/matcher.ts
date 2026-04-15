@@ -200,6 +200,7 @@ Normalize one incoming product candidate into a clean product-level record plus 
 - Remove obvious size or pack tokens from the product title unless the guide clearly allows them at the product level.
 - If no existing SKU is provided, imitate the existing store SKU style shown below.
 - If a brand is clearly visible or obvious from the title, use it. Otherwise leave it empty.
+- Never invent image URLs. If the input does not include a real URL, return an empty string.
 - Use empty strings for unavailable string fields, never null-like placeholders.
 
 Guide slices:
@@ -292,6 +293,7 @@ ${JSON.stringify(skuExamples, null, 2)}
     product_type: result.product_type || String(product.productType ?? ""),
     search_text:
       result.search_text || buildSearchText(buildNormalizedProduct(product, result), buildVariantPayload(product, result)),
+    image_url: sanitizeImageUrl(result.image_url),
   };
 }
 
@@ -368,6 +370,10 @@ function buildNormalizedProduct(
   product: Record<string, unknown>,
   validator: VariantValidatorResult
 ): Record<string, unknown> {
+  const validatedImageUrl = sanitizeImageUrl(validator.image_url);
+  const existingImages = Array.isArray(product.images)
+    ? (product.images as unknown[]).map(String).map(cleanValue).map(sanitizeImageUrl).filter(Boolean)
+    : [];
   const title = stripVariantTokens(validator.title || String(product.title ?? ""));
   const vendor = cleanValue(validator.brand || String(product.vendor ?? product.brand ?? ""));
   const productType = cleanValue(validator.product_type || String(product.productType ?? ""));
@@ -376,10 +382,6 @@ function buildNormalizedProduct(
   const compareAtPrice = cleanValue(
     validator.variant.compare_at_price || String(product.compareAtPrice ?? "")
   );
-  const images = Array.isArray(product.images)
-    ? (product.images as unknown[]).map(String).filter(Boolean)
-    : [];
-
   return {
     ...product,
     title,
@@ -392,11 +394,11 @@ function buildNormalizedProduct(
     featuredImage:
       typeof product.featuredImage === "string"
         ? product.featuredImage
-        : validator.image_url || images[0] || undefined,
+        : validatedImageUrl || existingImages[0] || undefined,
     images:
-      validator.image_url && !images.includes(validator.image_url)
-        ? [validator.image_url, ...images]
-        : images,
+      validatedImageUrl && !existingImages.includes(validatedImageUrl)
+        ? [validatedImageUrl, ...existingImages]
+        : existingImages,
   };
 }
 
@@ -493,6 +495,23 @@ function buildGuideSlices(guide: Record<string, unknown>, keys: string[]): strin
 
 function cleanValue(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function sanitizeImageUrl(value: string): string {
+  const next = cleanValue(value);
+  if (!next) return "";
+  if (!/^https?:\/\//i.test(next)) return "";
+
+  try {
+    const url = new URL(next);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "example.com" || hostname.endsWith(".example.com")) {
+      return "";
+    }
+    return next;
+  } catch {
+    return "";
+  }
 }
 
 function slugify(value: string): string {

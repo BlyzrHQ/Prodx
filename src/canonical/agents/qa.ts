@@ -71,6 +71,7 @@ Score the product against the Catalog Guide rules. Every check should reference 
 - Missing or clearly wrong image is a hard blocker for publish.
 - If customer-facing description contains citations, URLs, or source notes, fail it.
 - Description must include a clean overview in the body.
+- If the product title includes obvious size, weight, volume, or pack-count tokens, flag it unless the guide explicitly allows that pattern.
 - Missing SEO, tags, or fixable metafields should stay LLM-retryable.
 - Only send to human review for blockers the LLM cannot reliably fix.
 
@@ -248,6 +249,21 @@ function normalizeQaResult(
     specificFields.add("descriptionHtml");
   }
 
+  if (hasVariantTokensInTitle(String(product.title ?? ""))) {
+    findings.push({
+      category: "title",
+      field: "title",
+      severity: "major",
+      message: "Product title contains variant tokens like size or pack count",
+      issueType: "variant_token_in_title",
+      source: "title",
+    });
+    specificFields.add("title");
+    if (!String(product.handle ?? "").trim()) {
+      specificFields.add("handle");
+    }
+  }
+
   const criticalIssues = findings
     .filter((finding) => finding.severity === "critical")
     .map((finding) => finding.message);
@@ -387,4 +403,8 @@ function buildFallbackQa(
         ? "Fallback QA found no obvious blockers."
         : "Fallback QA found issues that should be corrected before publishing.",
   };
+}
+
+function hasVariantTokensInTitle(title: string): boolean {
+  return /\b\d+(\.\d+)?\s?(g|kg|oz|lb|ml|l|pack|pcs|pc|dozen)\b/i.test(title) || /\b\d+-pack\b/i.test(title);
 }

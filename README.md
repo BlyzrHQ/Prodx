@@ -87,6 +87,7 @@ This scaffold already owns `trigger.config.ts` and `src/trigger/*`, so you do no
 | `npx tsx src/cli.ts sync context` | Sync Shopify metafield definitions and referenced metaobject entries to `storeContext` directly |
 | `npx tsx src/cli.ts review` | Find products needing improvement |
 | `npx tsx src/cli.ts run pipeline` | Run the needed pipeline stages (enrich and/or image, then QA, then publish on pass) |
+| `npx tsx src/cli.ts approve <productId>` | Mark one product approved and immediately trigger Shopify publish |
 | `npx tsx src/cli.ts publish` | Push generated products to Shopify |
 | `npx tsx src/cli.ts status` | Check pipeline health |
 | `npx tsx src/cli.ts guide` | Regenerate catalog guide |
@@ -225,6 +226,7 @@ LLM-driven quality gate with deterministic safety guards:
 - Only the needed stages rerun on retry
 - Products retry up to 3 times
 - Passing products are pushed back to Shopify automatically
+- Manual approval through the supported CLI flow can immediately trigger Shopify publish with `approve <productId>`
 - Products with missing price can still go through enrich / image / QA, but they are blocked from publish until price exists
 - Products that still fail move to `needs_human_review` with the issues saved
 

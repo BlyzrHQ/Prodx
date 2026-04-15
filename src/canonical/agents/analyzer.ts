@@ -417,7 +417,9 @@ function normalizeProduct(
     option2Value: cleanText(String(raw.option2Value ?? "")),
     option3Name: cleanText(String(raw.option3Name ?? "")),
     option3Value: cleanText(String(raw.option3Value ?? "")),
-    images: Array.isArray(raw.images) ? raw.images.map(String).map(cleanText).filter(Boolean) : [],
+    images: Array.isArray(raw.images)
+      ? raw.images.map(String).map(cleanText).map(sanitizeImageUrl).filter(Boolean)
+      : [],
     rawData,
   };
 }
@@ -626,6 +628,23 @@ async function readFileLikeInput(input: AnalyzerInput): Promise<string> {
 
 function cleanText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function sanitizeImageUrl(value: string): string {
+  const next = cleanText(value);
+  if (!next) return "";
+  if (!/^https?:\/\//i.test(next)) return "";
+
+  try {
+    const url = new URL(next);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "example.com" || hostname.endsWith(".example.com")) {
+      return "";
+    }
+    return next;
+  } catch {
+    return "";
+  }
 }
 
 function guessMimeType(fileName: string): string {

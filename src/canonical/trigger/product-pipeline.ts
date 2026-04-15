@@ -1,14 +1,17 @@
 import { task, tasks } from "@trigger.dev/sdk/v3";
 import {
   handleMatchedCandidate,
-  processProductPipeline,
+  processProductPipelineWithRunners,
 } from "../services/pipeline.js";
 
 export const productPipeline = task({
   id: "product-pipeline",
   run: async (payload: { productId?: string; input?: Record<string, unknown> }) => {
     if (payload.productId) {
-      return processProductPipeline(String(payload.productId));
+      return processProductPipelineWithRunners(
+        String(payload.productId),
+        createTriggerPipelineStageRunners()
+      );
     }
 
     if (!payload.input) {
@@ -33,15 +36,32 @@ export const productPipeline = task({
     for (const product of analysis.products ?? []) {
       const matchRun = await tasks.triggerAndWait("match-product-candidate", { product });
       const match = unwrapTaskResult<any>(matchRun);
-      const outcome = await handleMatchedCandidate(
+      const result = await handleMatchedCandidate(
         (product.rawData as Record<string, unknown> | undefined) ?? {},
-        match
+        match,
+        { runPipelineInline: false, publishVariantInline: false }
       );
 
-      if (outcome === "added") added++;
-      if (outcome === "skipped") skipped++;
-      if (outcome === "variant") variants++;
-      if (outcome === "uncertain") uncertain++;
+      if (result.outcome === "added") {
+        added++;
+        if (result.productId) {
+          await processProductPipelineWithRunners(
+            String(result.productId),
+            createTriggerPipelineStageRunners()
+          );
+        }
+      }
+      if (result.outcome === "skipped") skipped++;
+      if (result.outcome === "variant") {
+        variants++;
+        if (result.productId) {
+          const publishRun = await tasks.triggerAndWait("product-publisher", {
+            productId: String(result.productId),
+          });
+          unwrapTaskResult(publishRun);
+        }
+      }
+      if (result.outcome === "uncertain") uncertain++;
     }
 
     return { added, skipped, variants, uncertain };
@@ -56,4 +76,34 @@ function unwrapTaskResult<T>(result: { ok: boolean; output?: T; error?: unknown 
     );
   }
   return result.output as T;
+}
+
+function createTriggerPipelineStageRunners() {
+  return {
+    enrich: async (payload: {
+      product: Record<string, unknown>;
+      fieldsToImprove: string[];
+      qaFeedback: string[];
+    }) => {
+      const run = await tasks.triggerAndWait("product-enricher", payload);
+      return unwrapTaskResult(run);
+    },
+    image: async (payload: { product: Record<string, unknown> }) => {
+      const run = await tasks.triggerAndWait("product-image-optimizer", payload);
+      return unwrapTaskResult(run);
+    },
+    qa: async (payload: { product: Record<string, unknown> }) => {
+      const run = await tasks.triggerAndWait("product-qa", payload);
+      return unwrapTaskResult(run);
+    },
+    publish: async (payload: {
+      productId: string;
+      product: Record<string, unknown>;
+      qaScore?: number;
+      reviewNotes?: Array<Record<string, unknown>>;
+    }) => {
+      const run = await tasks.triggerAndWait("product-publisher", payload);
+      return unwrapTaskResult<{ action: string; qaScore?: number }>(run);
+    },
+  };
 }

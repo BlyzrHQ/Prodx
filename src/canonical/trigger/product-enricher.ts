@@ -5,7 +5,11 @@ import { loadGuide } from "../services/pipeline.js";
 
 export const productEnricher = task({
   id: "product-enricher",
-  run: async (payload: { product: Record<string, unknown>; fieldsToImprove?: string[] }) => {
+  run: async (payload: {
+    product: Record<string, unknown>;
+    fieldsToImprove?: string[];
+    qaFeedback?: string[];
+  }) => {
     const [guide, storeContext] = await Promise.all([
       loadGuide(),
       convexQuery<Record<string, unknown> | null>("storeContext:get", {}),
@@ -16,6 +20,7 @@ export const productEnricher = task({
       guide,
       storeContext,
       fieldsToImprove: payload.fieldsToImprove ?? [],
+      qaFeedback: payload.qaFeedback ?? [],
     });
   },
 });

@@ -627,6 +627,15 @@ function buildProductOptions(variants: Array<Record<string, unknown>>) {
     }
   }
 
+  if (optionMap.size === 0 && variants.length > 0) {
+    return [
+      {
+        name: "Title",
+        values: [{ name: "Default Title" }],
+      },
+    ];
+  }
+
   return [...optionMap.entries()].map(([name, values]) => ({
     name,
     values: [...values].map((value) => ({ name: value })),
@@ -634,7 +643,7 @@ function buildProductOptions(variants: Array<Record<string, unknown>>) {
 }
 
 function buildVariantOptionValues(variant: Record<string, unknown>) {
-  return [
+  const values = [
     { nameKey: "option1Name", valueKey: "option1" },
     { nameKey: "option2Name", valueKey: "option2" },
     { nameKey: "option3Name", valueKey: "option3" },
@@ -644,6 +653,12 @@ function buildVariantOptionValues(variant: Record<string, unknown>) {
       name: String(variant[valueKey] ?? "").trim(),
     }))
     .filter((entry) => entry.optionName && entry.name);
+
+  if (values.length === 0) {
+    return [{ optionName: "Title", name: "Default Title" }];
+  }
+
+  return values;
 }
 
 function buildProductFiles(product: Record<string, unknown>) {

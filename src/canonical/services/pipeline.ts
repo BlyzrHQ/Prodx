@@ -22,6 +22,25 @@ import {
 } from "./shopify.js";
 
 type ProductRecord = Record<string, unknown> & { _id?: string };
+type MatchedCandidateOutcome = {
+  outcome: "added" | "skipped" | "variant" | "uncertain";
+  productId?: string;
+};
+type PipelineStageRunners = {
+  enrich: (payload: {
+    product: ProductRecord;
+    fieldsToImprove: string[];
+    qaFeedback: string[];
+  }) => Promise<any>;
+  image: (payload: { product: ProductRecord }) => Promise<Awaited<ReturnType<typeof runImageAgent>>>;
+  qa: (payload: { product: ProductRecord }) => Promise<Awaited<ReturnType<typeof runQaAgent>>>;
+  publish: (payload: {
+    productId: string;
+    product: ProductRecord;
+    qaScore?: number;
+    reviewNotes?: Array<Record<string, unknown>>;
+  }) => Promise<{ action: string; qaScore?: number }>;
+};
 
 export async function syncShopifyCatalog(): Promise<{
   productsSynced: number;
@@ -70,10 +89,8 @@ export async function syncShopifyCatalog(): Promise<{
     });
   }
 
-  const collectionDocs = await Promise.all(
-    shopifyCollections.map(async (collection) =>
-      mapShopifyCollectionToCollectionRecord(collection, await embedText(collection.title))
-    )
+  const collectionDocs = await mapWithConcurrency(shopifyCollections, 5, async (collection) =>
+    mapShopifyCollectionToCollectionRecord(collection, await embedText(collection.title))
   );
   await convexMutation("collections:upsertSyncedBatch", { collections: collectionDocs });
 
@@ -165,11 +182,11 @@ export async function ingestProducts(input: {
 
   for (const candidate of analysis.products) {
     const match = await runMatcherAgent({ product: candidate as any, guide });
-    const outcome = await handleMatchedCandidate(candidate.rawData ?? {}, match);
-    if (outcome === "skipped") skipped++;
-    if (outcome === "variant") variants++;
-    if (outcome === "uncertain") uncertain++;
-    if (outcome === "added") added++;
+    const result = await handleMatchedCandidate(candidate.rawData ?? {}, match);
+    if (result.outcome === "skipped") skipped++;
+    if (result.outcome === "variant") variants++;
+    if (result.outcome === "uncertain") uncertain++;
+    if (result.outcome === "added") added++;
   }
 
   return { added, skipped, variants, uncertain };
@@ -177,10 +194,14 @@ export async function ingestProducts(input: {
 
 export async function handleMatchedCandidate(
   rawData: Record<string, unknown>,
-  match: Awaited<ReturnType<typeof runMatcherAgent>>
-): Promise<"added" | "skipped" | "variant" | "uncertain"> {
+  match: Awaited<ReturnType<typeof runMatcherAgent>>,
+  options?: { runPipelineInline?: boolean; publishVariantInline?: boolean }
+): Promise<MatchedCandidateOutcome> {
+  const runPipelineInline = options?.runPipelineInline ?? true;
+  const publishVariantInline = options?.publishVariantInline ?? true;
+
   if (match.decision === "REJECTED" || match.decision === "DUPLICATE") {
-    return "skipped";
+    return { outcome: "skipped" };
   }
 
   if (match.decision === "NEW_VARIANT" && match.matchedProductId) {
@@ -191,17 +212,29 @@ export async function handleMatchedCandidate(
         title: String(match.normalizedProduct.title ?? "") || undefined,
       },
     });
-    await runProductPublishStage(match.matchedProductId);
-    return "variant";
+    if (publishVariantInline) {
+      await runProductPublishStage(match.matchedProductId);
+    }
+    return { outcome: "variant", productId: match.matchedProductId };
   }
 
   const product = normalizeMatchedProduct(match.normalizedProduct, rawData);
   const fieldsToImprove = computeFieldsToImprove(product);
-  const id = await convexMutation<string>("products:enqueueForReview", {
+  let id = await convexMutation<string | undefined>("products:enqueueForReview", {
     source: "manual_input",
     product,
     fieldsToImprove,
   });
+
+  if (!id) {
+    id = await recoverEnqueuedProductId(product);
+  }
+  if (!id) {
+    throw new Error(
+      "products:enqueueForReview did not return a product id for title: " +
+        String(product.title ?? "")
+    );
+  }
 
   await ensureEmbeddingForProduct(id, {
     title: String(product.title ?? ""),
@@ -219,11 +252,37 @@ export async function handleMatchedCandidate(
   });
 
   if (match.decision === "UNCERTAIN") {
-    return "uncertain";
+    return { outcome: "uncertain", productId: id };
   }
 
-  await processProductPipeline(id);
-  return "added";
+  if (runPipelineInline) {
+    await processProductPipeline(id);
+  }
+  return { outcome: "added", productId: id };
+}
+
+async function recoverEnqueuedProductId(product: Record<string, unknown>): Promise<string | undefined> {
+  const candidates = await convexQuery<any[]>("products:getAll", {
+    limit: 25,
+    source: "manual_input",
+  });
+
+  const title = String(product.title ?? "").trim().toLowerCase();
+  const vendor = String(product.vendor ?? "").trim().toLowerCase();
+  const productType = String(product.productType ?? "").trim().toLowerCase();
+
+  const match = candidates.find((candidate) => {
+    const candidateTitle = String(candidate.title ?? "").trim().toLowerCase();
+    const candidateVendor = String(candidate.vendor ?? "").trim().toLowerCase();
+    const candidateProductType = String(candidate.productType ?? "").trim().toLowerCase();
+
+    if (title && candidateTitle !== title) return false;
+    if (vendor && candidateVendor && candidateVendor !== vendor) return false;
+    if (productType && candidateProductType && candidateProductType !== productType) return false;
+    return true;
+  });
+
+  return typeof match?._id === "string" ? match._id : undefined;
 }
 
 export async function processPendingProducts(options?: { limit?: number }): Promise<{ processed: number }> {
@@ -248,8 +307,37 @@ export async function publishApprovedProducts(): Promise<{ published: number }> 
   return { published };
 }
 
+export async function approveAndPublishProduct(productId: string): Promise<{ dispatched: boolean }> {
+  const product = await convexQuery<any>("products:getById", { id: productId });
+  if (!product) {
+    throw new Error("Product not found: " + productId);
+  }
+
+  await convexMutation("products:approveProduct", {
+    id: productId,
+    productPatch: toProductPatch(product),
+    qaScore: typeof product.qaScore === "number" ? product.qaScore : undefined,
+    reviewNotes: Array.isArray(product.reviewNotes) ? product.reviewNotes : undefined,
+  });
+
+  if (isTriggerConfigured()) {
+    await triggerTask("product-publisher", { productId });
+    return { dispatched: true };
+  }
+
+  await runProductPublishStage(productId);
+  return { dispatched: false };
+}
+
 export async function processProductPipeline(
   productId: string
+): Promise<{ action: string; qaScore?: number }> {
+  return processProductPipelineWithRunners(productId, createInlinePipelineStageRunners());
+}
+
+export async function processProductPipelineWithRunners(
+  productId: string,
+  stageRunners: PipelineStageRunners
 ): Promise<{ action: string; qaScore?: number }> {
   const original = await convexQuery<any>("products:getById", { id: productId });
   if (!original) {
@@ -261,7 +349,6 @@ export async function processProductPipeline(
     workflowStatus: "in_review",
   });
 
-  const guide = await loadGuide();
   let storeContext = await convexQuery<any>("storeContext:get", {});
   let currentProduct: ProductRecord = { ...original };
   let fieldsToImprove = normalizeFieldsToImprove(
@@ -273,10 +360,8 @@ export async function processProductPipeline(
     const stagePlan = determineStagePlan(currentProduct, fieldsToImprove, attempt);
 
     if (stagePlan.needsEnrichment) {
-      const enrichResult = await runEnrichAgent({
+      const enrichResult = await stageRunners.enrich({
         product: currentProduct,
-        guide,
-        storeContext,
         fieldsToImprove,
         qaFeedback,
       });
@@ -288,7 +373,7 @@ export async function processProductPipeline(
     }
 
     if (stagePlan.needsImageOptimization) {
-      const imageResult = await runImageAgent({ product: currentProduct, guide });
+      const imageResult = await stageRunners.image({ product: currentProduct });
       currentProduct = mergeImageResult(currentProduct, imageResult);
     }
 
@@ -300,11 +385,7 @@ export async function processProductPipeline(
       source: String(currentProduct.source ?? "manual_input"),
     });
 
-    const qaResult = await runQaAgent({
-      product: currentProduct,
-      guide,
-      passingScore: Number((guide as any)?.qa_validation_system?.passing_score ?? 70),
-    });
+    const qaResult = await stageRunners.qa({ product: currentProduct });
 
     const reviewNotes = buildReviewNotes(qaResult);
     fieldsToImprove = normalizeFieldsToImprove(qaResult.suggested_fixes.specific_fields);
@@ -323,7 +404,12 @@ export async function processProductPipeline(
     });
 
     if (qaResult.status === "PASS") {
-      return runProductPublishStage(productId, currentProduct, qaResult.score, reviewNotes);
+      return stageRunners.publish({
+        productId,
+        product: currentProduct,
+        qaScore: qaResult.score,
+        reviewNotes,
+      });
     }
 
     if (attempt === 2) {
@@ -619,6 +705,40 @@ async function ensureEmbeddingForProduct(
   });
 }
 
+function createInlinePipelineStageRunners(): PipelineStageRunners {
+  const guidePromise = loadGuide();
+
+  return {
+    enrich: async ({ product, fieldsToImprove, qaFeedback }) => {
+      const [guide, storeContext] = await Promise.all([
+        guidePromise,
+        convexQuery<Record<string, unknown> | null>("storeContext:get", {}),
+      ]);
+      return runEnrichAgent({
+        product,
+        guide,
+        storeContext,
+        fieldsToImprove,
+        qaFeedback,
+      });
+    },
+    image: async ({ product }) => {
+      const guide = await guidePromise;
+      return runImageAgent({ product, guide });
+    },
+    qa: async ({ product }) => {
+      const guide = await guidePromise;
+      return runQaAgent({
+        product,
+        guide,
+        passingScore: Number((guide as any)?.qa_validation_system?.passing_score ?? 70),
+      });
+    },
+    publish: async ({ productId, product, qaScore, reviewNotes }) =>
+      runProductPublishStage(productId, product, qaScore, reviewNotes),
+  };
+}
+
 function mapShopifyProductToProductRecord(product: ShopifyProduct): Record<string, unknown> {
   return {
     shopifyId: product.id,
@@ -703,7 +823,7 @@ function sanitizeStoreContext(storeContext: Awaited<ReturnType<typeof fetchStore
 
 function normalizeMatchedProduct(
   product: Record<string, unknown>,
-  _rawData: Record<string, unknown>
+  rawData: Record<string, unknown>
 ): Record<string, unknown> {
   const images = Array.isArray(product.images)
     ? product.images.map((image, index) =>
@@ -713,13 +833,34 @@ function normalizeMatchedProduct(
       )
     : [];
 
+  const mergedRawData =
+    product.rawData && typeof product.rawData === "object"
+      ? { ...(product.rawData as Record<string, unknown>), ...rawData }
+      : rawData;
+
   return {
-    ...product,
+    shopifyId: typeof product.shopifyId === "string" ? product.shopifyId : undefined,
+    title: String(product.title ?? "").trim(),
+    handle: typeof product.handle === "string" ? product.handle : undefined,
+    description: typeof product.description === "string" ? product.description : undefined,
+    descriptionHtml: typeof product.descriptionHtml === "string" ? product.descriptionHtml : undefined,
+    vendor: typeof product.vendor === "string" ? product.vendor : undefined,
+    productType: typeof product.productType === "string" ? product.productType : undefined,
+    status: typeof product.status === "string" ? product.status : undefined,
+    tags: Array.isArray(product.tags) ? product.tags.map(String).filter(Boolean) : undefined,
     images,
     featuredImage:
       typeof product.featuredImage === "string"
         ? product.featuredImage
         : images[0]?.url ?? undefined,
+    price: typeof product.price === "string" ? product.price : undefined,
+    compareAtPrice:
+      typeof product.compareAtPrice === "string" ? product.compareAtPrice : undefined,
+    seoTitle: typeof product.seoTitle === "string" ? product.seoTitle : undefined,
+    seoDescription:
+      typeof product.seoDescription === "string" ? product.seoDescription : undefined,
+    metafields: Array.isArray(product.metafields) ? product.metafields : undefined,
+    rawData: mergedRawData,
   };
 }
 
@@ -1048,6 +1189,25 @@ function uniqueStrings(values: Array<string | null | undefined | string[]>): str
         .filter(Boolean)
     ),
   ];
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
 }
 
 function slugify(value: string): string {

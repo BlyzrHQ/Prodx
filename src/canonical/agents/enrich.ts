@@ -246,6 +246,14 @@ function sanitizeEnrichmentResult(
   result: EnrichResult,
   product: Record<string, unknown>
 ): EnrichResult {
+  const normalizedTitle = normalizeProductLevelTitle(
+    result.title || String(product.title ?? ""),
+    [
+      product.option1Value,
+      product.option2Value,
+      product.option3Value,
+    ]
+  );
   const description = sanitizeCustomerCopy(result.description);
   const descriptionHtml = sanitizeCustomerCopy(result.descriptionHtml);
   const tags = [...new Set((result.tags ?? []).map((tag) => tag.trim()).filter(Boolean))];
@@ -253,8 +261,8 @@ function sanitizeEnrichmentResult(
 
   return {
     ...result,
-    title: cleanValue(result.title || String(product.title ?? "")),
-    handle: cleanValue(result.handle || slugify(result.title || String(product.title ?? ""))),
+    title: normalizedTitle,
+    handle: cleanValue(result.handle || slugify(normalizedTitle)),
     description,
     descriptionHtml,
     seoTitle: cleanValue(result.seoTitle),
@@ -272,6 +280,23 @@ function sanitizeEnrichmentResult(
       metaobjectEntries: sanitizeMetaobjectEntries(result.newStoreValues?.metaobjectEntries),
     },
   };
+}
+
+function normalizeProductLevelTitle(value: string, optionValues: Array<unknown> = []): string {
+  let next = String(value ?? "");
+
+  for (const token of optionValues.map((entry) => cleanValue(String(entry ?? ""))).filter(Boolean)) {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    next = next.replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ");
+  }
+
+  next = next
+    .replace(/\b\d+(\.\d+)?\s?(g|kg|oz|lb|ml|l|pack|pcs|pc|dozen)\b/gi, " ")
+    .replace(/\b\d+-pack\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleanValue(next || String(value ?? ""));
 }
 
 function buildDeterministicFallback(product: Record<string, unknown>): EnrichResult {
