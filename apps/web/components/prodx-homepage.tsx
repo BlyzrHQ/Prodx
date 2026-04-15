@@ -113,13 +113,19 @@ const sectionBadgeStyle = {
 };
 
 const sectionTitleStyle = {
-  width: "100%",
+  width: "fit-content",
+  maxWidth: "100%",
+  display: "block",
+  marginLeft: "auto",
+  marginRight: "auto",
   textAlign: "center" as const,
   fontFamily: "var(--font-display)",
   fontSize: "32px",
   fontWeight: 600,
   color: "var(--ink)",
-  margin: 0
+  marginTop: 0,
+  marginBottom: 0,
+  textWrap: "balance" as const
 };
 
 const sectionIntroStyle = {
