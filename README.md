@@ -1,632 +1,297 @@
 # Prodx
 
-Local-first Shopify catalog toolkit with an agentic workflow core and a simple Prodx homepage.
+Open-source Shopify catalog management CLI powered by AI agents. Set up once, then use Claude Code or OpenAI Codex to manage your entire product catalog through natural language.
 
-Prodx helps you prepare Shopify products with a guided workflow:
+Prodx connects your Shopify store to an AI-powered pipeline that analyzes, enriches, validates, and publishes products — with duplicate detection, image optimization, and smart collection creation built in.
 
-1. create a Catalog Guide
-2. ingest products from JSON or CSV
-3. detect duplicates and variants
-4. enrich product content
-5. find and review product images
-6. run QA
-7. generate a Shopify import file
-8. propose smart collections from accepted product types and approved metafields
-9. publish only safe products
+## How It Works
 
-Everything is written locally into `.catalog/`, so every run is inspectable and repeatable.
-The guide is meant to work both as:
-
-- the machine-readable contract for the workflow
-- a human-readable operating playbook for catalog, merchandising, and QA teams
-
-## Prodx Web
-
-This repo includes a lightweight **Next.js + React** frontend in [`apps/web`](./apps/web).
-
-The current web surface is a homepage for the project:
-
-- product overview
-- local install steps
-- example workflow commands
-- output summary
-
-It keeps the same visual system and branding, but the working product surface remains the local CLI.
-
-## Cloudflare Hosting
-
-The fastest hosting path today is to deploy the homepage in [`apps/web`](./apps/web) to Cloudflare Workers and keep the real catalog workflow local in the CLI.
-
-This repo is now prepared for that homepage-only path with:
-
-- `@opennextjs/cloudflare`
-- `wrangler.jsonc`
-- `open-next.config.ts`
-- workspace scripts for Cloudflare build, preview, and deploy
-
-Useful commands:
-
-```powershell
-npm run web:cf:build
-npm run web:preview
-npm run web:deploy
+```
+You (or CPO skill)
+    |
+    v
+[ Add products ] -----> CSV, text, or product image
+    |
+    v
+[ Analyzer ] ---------> LLM parses & normalizes input
+    |
+    v
+[ Matcher ] ----------> Embedding search + LLM decides:
+    |                    DUPLICATE (skip) | NEW_VARIANT (add to parent) | NEW_PRODUCT (full pipeline) | UNCERTAIN (save for review)
+    v
+[ Enricher ] ---------> LLM + web research builds title, description, SEO, metafields
+    |
+    v
+[ Image Optimizer ] --> Reviews uploaded image first, then falls back to web search + Convex storage upload
+    |
+    v
+[ QA Agent ] ---------> Scores product against Catalog Guide rules
+    |
+    v
+[ Retry Loop ] -------> PASS → publish | FAIL → targeted retry | REVIEW → human
+    |
+    v
+[ Publish ] ----------> Push to Shopify via GraphQL
 ```
 
-Recommended Cloudflare setup:
+## Quick Start
 
-- connect the GitHub repo
-- set the project root directory to `apps/web`
-- deploy the generated Worker first to a `workers.dev` URL
-- add your custom domain only after the homepage looks right
+```bash
+git clone https://github.com/BlyzrHQ/prodx.git
+cd prodx
+npm install
+npm run setup
+```
 
-Important note:
+The setup wizard walks you through:
+1. Business name, description, industry
+2. LLM provider (OpenAI, Gemini, or Anthropic) + model selection
+3. Embedding model for duplicate detection
+4. Shopify store connection (recommended)
+5. Convex database deployment (automatic)
+6. Trigger.dev project linking (`TRIGGER_PROJECT_ID` + `TRIGGER_SECRET_KEY`)
+7. Catalog guide generation via LLM
 
-- the hosted site is currently the Prodx homepage
-- the full agentic catalog workflow still runs locally through the CLI
-- D1, R2, and queue-backed hosted workflow execution are a later phase
+If you connect Shopify, the app should include these Admin API scopes:
+- `read_products`
+- `write_products`
+- `read_product_listings`
+- `read_inventory`
+- `read_publications`
+- `write_publications`
+- `read_metaobject_definitions`
+- `read_metaobjects`
+- `write_metaobjects`
 
-## Project Structure
+After setup, use the CPO skill in Claude Code or Codex:
 
-```text
-prodx/
-├── apps/
-│   └── web/                     # Prodx homepage
-├── examples/                    # Grocery, apparel, electronics, variants, and alt-structure fixtures
-├── src/
-│   ├── agents/                  # Guide, enrich, image, QA, supervisor, and collection agent wrappers
-│   ├── connectors/              # OpenAI, Gemini, Anthropic, Shopify, and Serper integrations
-│   ├── lib/                     # Paths, runtime config, collections, exports, pricing, guide helpers, artifacts
-│   ├── modules/                 # Deterministic engines and compatibility modules
-│   └── workflows/               # Shared orchestration, retry loops, collection workflow, and workflow graph
-├── tests/                       # End-to-end and fixture-backed regression tests
-└── .catalog/                    # Local workspace outputs created at runtime
+```
+/prodx-cpo sync my Shopify catalog
+/prodx-cpo add products from this CSV
+/prodx-cpo run the enrichment pipeline
+/prodx-cpo check catalog status
+```
+
+Setup generates the runtime app back into this same repository: `convex/*`, `src/agents/*`, `src/services/*`, `src/cli.ts`, Trigger task files, and `.catalog/guide/*`.
+This scaffold already owns `trigger.config.ts` and `src/trigger/*`, so you do not run `trigger init` as part of normal setup. `TRIGGER_PROJECT_ID` must be set in `.env` before running Trigger.dev commands.
+
+## Commands
+
+| Command | What It Does |
+|---------|-------------|
+| `npx tsx src/cli.ts add --file ./products.csv` | Add products from CSV and run the full workflow for true new products |
+| `npx tsx src/cli.ts add --text "Product name..."` | Add from text description |
+| `npx tsx src/cli.ts add --file ./photo.jpg` | Add from a local product image file (AI vision) |
+| `npx tsx src/cli.ts add --image-url https://...` | Add from a product image URL |
+| `npx tsx src/cli.ts sync` | Sync Shopify catalog to Convex |
+| `npx tsx src/cli.ts sync context` | Sync Shopify metafield definitions and referenced metaobject entries to `storeContext` directly |
+| `npx tsx src/cli.ts review` | Find products needing improvement |
+| `npx tsx src/cli.ts run pipeline` | Run the needed pipeline stages (enrich and/or image, then QA, then publish on pass) |
+| `npx tsx src/cli.ts publish` | Push generated products to Shopify |
+| `npx tsx src/cli.ts status` | Check pipeline health |
+| `npx tsx src/cli.ts guide` | Regenerate catalog guide |
+
+## Data Flow
+
+```
+Shopify Store
+    | (sync)
+    v
+products (source=shopify_sync, workflowStatus=synced) <-----------+
+    | (review)                                                     |
+    v                                                              |
+products (workflowStatus=needs_review / in_review)                 |
+    | (run pipeline)                                               |
+    v                                                              |
+enrich / image (only as needed) --> QA --> retry loop              |
+    |                                                              |
+    +-- pass --------------> products (workflowStatus=published) --+--> Shopify
+    +-- fail after retries -> products (workflowStatus=needs_human_review)
+
+Shopify Collections ---> collections (source=shopify_sync, workflowStatus=synced)
+Catalogue summary ---> collection builder ---> collections (source=generated, workflowStatus=needs_review)
+
+Store metadata + generated guide ---> storeContext
 ```
 
 ## Architecture
 
-Prodx keeps the CLI and local workspace model stable, while the internal workflow is now more agentic:
-
-- `catalogue-match`
-  - stays deterministic
-  - decides `DUPLICATE`, `NEW_VARIANT`, `NEW_PRODUCT`, or review-needed outcomes
-- `guide-agent`
-  - generates the Catalog Guide
-- `enrich-agent`
-  - drafts product content and structured fields
-- `image-agent`
-  - searches and reviews product images
-- `qa-agent`
-  - produces structured findings, retry targets, and review blockers
-- `supervisor-agent`
-  - decides whether to accept, retry, or escalate
-- `collection-builder-agent`
-  - drafts smart collection proposals from accepted product types and approved metafield values
-- `collection-evaluator-agent`
-  - approves, retries, or rejects collection proposals before apply
-- `shopify-sync`
-  - stays deterministic
-  - prepares safe export and publish payloads
-
-The user-facing CLI commands stay consistent. `init`, `guide generate`, `workflow run`, `review`, `publish`, the single-module commands, and the new `collections` command family all work locally from the same workspace.
-
-## What It Handles
-
-- Catalog Guide generation
-- Duplicate detection
-- New variant detection
-- Product enrichment with LLMs
-- Image search and image review
-- QA scoring and review queueing
-- Smart collection proposals from `product_type` and approved metafields
-- Local collection registry with duplicate protection
-- Shopify CSV export
-- Safe local publish and optional live publish
-- Provider usage logging in run artifacts
-
-## How It Works
-
-The workflow is:
-
-1. `catalogue-match`
-   - compares incoming products against accepted/generated products and any optional external catalog
-   - stops immediately for true duplicates or review-only matches
-
-2. `product-enricher`
-   - uses the Catalog Guide plus trusted research to improve title, description, tags, and supported fields
-   - fills verified facts
-   - skips unverified facts
-
-3. `image-optimizer`
-   - searches for product images
-   - reviews candidates
-   - picks the best valid hero image if one exists
-
-4. `catalogue-qa`
-   - scores the product against the guide
-   - creates findings and review recommendations
-   - includes agentic-commerce readiness scoring and recommendations
-
-5. `shopify-sync`
-   - prepares a Shopify-ready payload
-   - supports safe variant attach mode for `NEW_VARIANT`
-
-6. `collections propose`
-   - summarizes accepted/generated products by `product_type` and guide-approved metafield values
-   - only considers values that meet the minimum product threshold
-   - checks duplicates against the local collection registry
-   - runs a builder/evaluator loop before saving proposals
-
-7. `collections apply`
-   - creates evaluator-approved smart collections in Shopify
-   - writes created or skipped results back into the local collection registry
-
-## Smart Collections
-
-Prodx now includes a local-first smart collection workflow.
-
-It is designed to stay aligned with the rest of the toolkit:
-
-- source of truth is the accepted/generated product ledger
-- duplicate checking is local-registry-first
-- Shopify is only used for one-time collection import and explicit apply
-- collections are proposed before they are ever created live
-
-The default flow is:
-
-1. `collections import`
-   - imports existing Shopify smart collections into the local registry
-2. `collections propose`
-   - groups accepted products by `product_type` and guide-approved metafield values
-   - only keeps values with `5` or more matching products by default
-   - runs the collection builder/evaluator loop
-3. `collections show`
-   - shows the saved summary, registry, and latest proposal results
-4. `collections apply`
-   - creates only evaluator-approved smart collections in Shopify
-
-The first version intentionally keeps scope narrow:
-
-- smart collections only
-- automatic rules from `product_type` and guide-approved metafields only
-- no manual/editorial collections
-- no seasonal campaign logic
-
-## Workspace Output
-
-The toolkit writes everything into `.catalog/`.
-
-Important files:
-
-- `.catalog/guide/catalog-guide.md`
-  - human-readable Catalog Guide
-- `.catalog/guide/catalog-guide.json`
-  - machine-readable Catalog Guide
-- `.catalog/generated/products/`
-  - generated product JSON files
-- `.catalog/generated/images/`
-  - image metadata and downloads
-- `.catalog/generated/workflow-products.json`
-  - running accepted/generated product ledger
-- `.catalog/generated/collections/collections.csv`
-  - local collection registry for imported, proposed, created, and skipped collections
-- `.catalog/generated/collections/collections.json`
-  - structured collection registry with rule payloads and statuses
-- `.catalog/generated/collections/summary.json`
-  - grouped `product_type` and approved metafield values with counts
-- `.catalog/generated/collections/proposals.json`
-  - latest smart collection proposals and evaluator decisions
-- `.catalog/generated/collections/apply-results.json`
-  - results from explicit collection apply runs
-- `.catalog/generated/shopify-import.csv`
-  - Shopify import file
-- `.catalog/generated/catalog-review.xlsx`
-  - review workbook
-- `.catalog/generated/review-queue.csv`
-  - review queue export
-- `.catalog/runs/<job-id>/`
-  - raw module artifacts for each run
-  - includes provider usage metadata when available
-
-## Quick Start
-
-Install and build:
-
-```powershell
-npm install
-npm run build
-npm test
-npm run web:check
-npm run web:build
+```
+prodx/
+  src/
+    generators/          # Scaffold CLI — generates all project files
+      project.ts         # Directories, .env, .gitignore
+      convex.ts          # Convex schema (5 canonical tables) + functions
+      agents.ts          # All agent code (analyzer, matcher, enricher, QA, image, etc.)
+      runtime.ts         # Config, services, shared pipeline helpers, CLI
+      trigger.ts         # Trigger.dev config + task wrappers
+      cpo-skill.ts       # CPO skill for Claude Code + Codex
+      guide-template.ts  # Catalog guide template + markdown renderer
+    index.ts             # Setup wizard entry point
+    types.ts             # TypeScript interfaces
+  apps/web/              # Next.js marketing site (Cloudflare Workers)
 ```
 
-Run the web app locally:
+### What Gets Generated
 
-```powershell
-npm run web:dev
+```
+src/
+  agents/                # AI agents (all logic + LLM prompts)
+    analyzer.ts          # Parses CSV/text/image into structured products
+    matcher.ts           # Two-step LLM: variant validator + product matcher
+    enrich.ts            # Expert merchandiser with web research
+    image.ts             # Visual merchandising with tiered image search
+    qa.ts                # Strict quality gate with scoring
+    guide.ts             # Catalog guide generation
+    collection-builder.ts
+    collection-evaluator.ts
+  services/              # External service clients
+    llm.ts               # LLM abstraction (OpenAI, Gemini, Anthropic)
+    convex.ts            # Convex HTTP client
+    shopify.ts           # Shopify GraphQL with pagination
+    embeddings.ts        # Text embeddings for duplicate detection
+    image-upload.ts      # Convex file storage upload
+    pipeline.ts          # Shared sync / review / pipeline / collections logic
+  trigger/               # Trigger.dev task wrappers (generated from trigger.config.ts)
+  config.ts              # Environment config loader
+  cli.ts                 # Project CLI
+convex/
+  schema.ts              # 5 tables (products, variants, productEmbeddings, collections, storeContext)
+.claude/skills/prodx-cpo/  # CPO skill for Claude Code
+.agents/skills/prodx-cpo/  # CPO skill for Codex
+.catalog/guide/            # Generated catalog guide (JSON + Markdown)
+.env                       # API keys and config
 ```
 
-Initialize the workspace:
+## Convex Tables
 
-```powershell
-node .\dist\cli.js init
-node .\dist\cli.js doctor
+| Table | Purpose |
+|-------|---------|
+| `products` | Unified product lifecycle table for synced, manual, approved, rejected, and published products |
+| `variants` | Synced and generated variants linked to `products` |
+| `productEmbeddings` | Product title embeddings for duplicate and variant detection |
+| `collections` | Synced Shopify collections and generated collection proposals/results |
+| `storeContext` | Store options, metaobject choices, sync metadata, and the generated catalog guide |
+
+## Trigger.dev Tasks
+
+| Task | What It Does |
+|------|-------------|
+| `product-pipeline` | Orchestrates the durable product workflow used by the local CLI |
+| `analyze-product-input` | Analyzer stage for CSV, text, and image intake |
+| `match-product-candidate` | Matcher stage for duplicate / variant / new-product decisions |
+| `product-enricher` | Enrichment stage task |
+| `product-image-optimizer` | Product image selection and Convex upload stage |
+| `product-qa` | QA review stage |
+| `product-publisher` | Shopify publish stage for approved products and variant updates |
+| `shopify-sync` | Syncs Shopify catalog data into Convex |
+| `store-context-sync` | Syncs Shopify metafield definitions and referenced metaobject entries into `storeContext` |
+| `build-collections` | Builds collection proposals from the catalogue summary with duplicate checks |
+| `nightly-collection-builder` | Scheduled collection build refresh |
+| `regenerate-catalog-guide` | Regenerates the guide stored in `storeContext` |
+| `weekly-guide-refresh` | Scheduled guide refresh |
+
+## Agents
+
+### Analyzer
+Parses any input format into structured product data:
+- **CSV/TSV**: LLM formats each row (cleans abbreviations, extracts brand/size)
+- **Text**: LLM parses natural language descriptions
+- **Image**: OpenAI Vision extracts product info from photos
+
+### Matcher (Two-Step LLM)
+1. **Variant Validator**: Extracts brand, generates handle, identifies variant options, creates search text
+2. **Product Matcher**: RAG search + variant lookup + LLM decision (NEW_PRODUCT / NEW_VARIANT / DUPLICATE / UNCERTAIN)
+
+Brand-aware: different brands are never variants of each other.
+
+### Enricher
+Expert merchandiser with web research:
+- Builds titles per guide formula
+- Writes descriptions per guide structure
+- Fills metafields respecting automation modes
+- Researches high-risk fields (ingredients, allergens) from trusted sources only
+- Creates new store context values when nothing fits
+
+### QA Agent
+LLM-driven quality gate with deterministic safety guards:
+- Scores the product against the generated catalog guide
+- Returns exact fields to fix plus reusable feedback for the enricher
+- Auto-fails on critical blockers like missing price, placeholder values, unsupported customer-facing citations, required metafield gaps, and bad imagery
+- Routes fixes to enricher or image agent based on findings
+
+### Publish + Retry Flow
+- QA returns a score plus fix guidance tied to the catalog guide
+- Only the needed stages rerun on retry
+- Products retry up to 3 times
+- Passing products are pushed back to Shopify automatically
+- Products with missing price can still go through enrich / image / QA, but they are blocked from publish until price exists
+- Products that still fail move to `needs_human_review` with the issues saved
+
+## Catalog Guide
+
+The guide is the operating playbook for the entire pipeline. Generated during setup based on your business, industry, and Shopify store data. It includes:
+
+- Business context and eligibility rules
+- Product title formula and examples
+- Description structure and tone rules
+- Variant architecture and dimensions
+- Metafield definitions with automation modes
+- Image and media standards
+- SEO rules
+- QA passing score and validation rules
+- Collection building logic
+
+The guide is stored in both `.catalog/guide/` (local) and Convex (for Trigger.dev tasks).
+
+## CPO Skill
+
+After setup, a CPO (Chief Product Officer) skill is installed for both Claude Code and Codex. It knows all commands and decision rules. Use it to manage your catalog through natural language:
+
+```
+/prodx-cpo check my catalog status
+/prodx-cpo add these products [attach CSV]
+/prodx-cpo sync my Shopify store
+/prodx-cpo run the pipeline on pending products
+/prodx-cpo regenerate the catalog guide
 ```
 
-`init` still works the same way after the agentic refactor. The retry loop, learning, and cost tracking are internal workflow changes, not CLI-surface changes.
-
-During `init`, the guided setup can now:
-
-- connect OpenAI with a local Codex-backed auth import when a reusable OpenAI API key is available
-- connect Gemini with API key or OAuth
-- connect Anthropic with API key
-- let the user choose the model for each provider during onboarding
-
-Generate a guide:
-
-```powershell
-node .\dist\cli.js guide generate --industry apparel --business-name "Demo Store" --business-description "A store testing catalog workflows." --operating-mode both
-```
-
-Run the full workflow:
-
-```powershell
-node .\dist\cli.js workflow run --input .\examples\apparel\products-match.json --catalog .\examples\apparel\catalog-match.json
-```
-
-Or paste product text directly:
-
-```powershell
-node .\dist\cli.js workflow run --text "Uniqlo Club T-Shirt - 29.00`nNike Club Fleece Joggers Grey Large - 65.00"
-```
-
-Publish only safe products:
-
-```powershell
-node .\dist\cli.js publish
-```
-
-Generate smart collections locally:
-
-```powershell
-node .\dist\cli.js collections import
-node .\dist\cli.js collections propose --min-products 5
-node .\dist\cli.js collections show
-node .\dist\cli.js collections apply
-```
-
-Live publish to Shopify:
-
-```powershell
-node .\dist\cli.js publish --live
-```
-
-## Most Useful Commands
-
-Initialize:
-
-```powershell
-node .\dist\cli.js init
-node .\dist\cli.js doctor
-```
-
-Guide:
-
-```powershell
-node .\dist\cli.js guide generate --industry food_and_beverage --business-name "Demo Store" --business-description "A grocery store focused on pantry staples." --operating-mode both
-node .\dist\cli.js guide show
-```
-
-Single modules:
-
-```powershell
-node .\dist\cli.js match --input .\examples\product.json --catalog .\examples\catalog.json
-node .\dist\cli.js enrich --input .\examples\product.json
-node .\dist\cli.js image --input .\examples\product.json
-node .\dist\cli.js qa --input .\examples\product.json
-node .\dist\cli.js sync --input .\examples\product.json
-```
-
-Single-product pasted text also works:
-
-```powershell
-node .\dist\cli.js enrich --text "Uniqlo Club T-Shirt - 29.00"
-node .\dist\cli.js match --text "JBL Tune 520BT Wireless On-Ear Headphones Black - 199" --catalog .\examples\electronics\catalog-match.json
-```
-
-Review:
-
-```powershell
-node .\dist\cli.js review queue
-node .\dist\cli.js review <job-id>
-node .\dist\cli.js review <job-id> --action approve
-node .\dist\cli.js apply <job-id>
-```
-
-Collections:
-
-```powershell
-node .\dist\cli.js collections import
-node .\dist\cli.js collections propose --min-products 5
-node .\dist\cli.js collections show
-node .\dist\cli.js collections apply
-```
-
-Auth and model setup:
-
-```powershell
-node .\dist\cli.js auth login --provider openai --model gpt-5
-node .\dist\cli.js auth login --provider gemini --client-id <id> --client-secret <secret> --project-id <project> --model gemini-2.5-flash
-node .\dist\cli.js auth set --provider anthropic --value <api-key> --model claude-sonnet-4-20250514
-```
-
-## Input Files
-
-The workflow accepts:
-
-- JSON
-- CSV
-- TXT files
-- plain text
-
-It also normalizes common alternate structures, including:
-
-- nested JSON record arrays
-- alternate header names
-- common aliases such as:
-  - `product_name` -> `title`
-- `sale_price` -> `price`
-- `brand_name` -> `brand`
-- `image_url` -> `featured_image`
-- `body_html` -> `description_html`
-
-Plain text is supported in two useful forms:
-
-1. simple title/price lines
-
-```text
-Almarai Fresh Milk Low Fat 1L - 8.50
-Baladna Greek Yogurt Plain 500g - 12.50
-```
-
-2. key/value blocks
-
-```text
-title: Uniqlo Club T-Shirt
-brand: Uniqlo
-price: 29.00
-size: Large
-```
-
-You can paste product text directly with `--text`:
-
-```powershell
-node .\dist\cli.js workflow run --text "Almarai Fresh Milk Low Fat 1L - 8.50`nBaladna Greek Yogurt Plain 500g - 12.50" --catalog .\examples\grocery\catalog-match.json
-```
-
-## Matching Rules
-
-The workflow compares products against the running generated-product ledger, not just the raw input file.
-
-That means:
-
-- later rows can match earlier accepted rows
-- duplicates are skipped early
-- safe new variants can attach to the matched parent family
-- Shopify export is built from accepted/generated products
-
-## Enrichment Rules
-
-The enrich behavior is intentionally simple:
-
-- use the Catalog Guide
-- research when needed
-- fill facts only when the evidence is trusted
-- skip facts that cannot be verified
-- never put internal review notes into customer-facing text
-- keep the customer-facing description clean even when factual fields are skipped
-
-## Image Rules
-
-The image workflow:
-
-- searches with exact product-title-based queries
-- checks more than one search query pattern
-- filters obviously bad URLs before vision review
-- reviews candidates in batches
-- avoids using obvious brand assets as hero images
-
-If it still fails, the usual reason is that the web does not surface a good exact product image.
-
-## Variants
-
-The toolkit now supports:
-
-- duplicate skip
-- `NEW_VARIANT` detection
-- parent/child export rows under the same Shopify handle
-- variant attach payload generation
-
-For live Shopify attach, the parent product must exist in Shopify and be resolvable to a real Shopify product ID.
-
-## Guide Quality
-
-The generated Catalog Guide is intentionally richer than a basic config dump. It includes:
-
-- taxonomy and category design
-- title and description playbooks
-- variant and duplicate rules
-- metafield definitions
-- image and QA standards
-- agentic-commerce readiness guidance
-- worked examples and edge cases
-
-If live guide generation fails, the command now fails cleanly instead of silently pretending a fallback guide is the final result.
-
-## Examples
-
-Use the sample fixtures in:
-
-- `examples/grocery/`
-- `examples/apparel/`
-- `examples/electronics/`
-- `examples/alt-structure/`
-
-These are useful for:
-
-- duplicate testing
-- variant testing
-- alternate input structure testing
-- cross-industry workflow checks
-
-## Manual Category Tests
-
-You can test the same workflow end to end with the provided fixtures.
-
-Start from a clean local workspace each time:
-
-```powershell
-Remove-Item -Recurse -Force .\.catalog -ErrorAction SilentlyContinue
-node .\dist\cli.js init
-```
-
-Grocery:
-
-```powershell
-node .\dist\cli.js workflow run --input .\examples\grocery\products-match.json --catalog .\examples\grocery\catalog-match.json
-```
-
-Apparel:
-
-```powershell
-node .\dist\cli.js workflow run --input .\examples\apparel\products-match.json --catalog .\examples\apparel\catalog-match.json
-```
-
-Electronics:
-
-```powershell
-node .\dist\cli.js workflow run --input .\examples\electronics\products-match.json --catalog .\examples\electronics\catalog-match.json
-```
-
-You can also test pasted text:
-
-```powershell
-node .\dist\cli.js workflow run --text "Almarai Fresh Milk Low Fat 1L - 8.50`nJBL Tune 520BT Wireless On-Ear Headphones Black - 199" --catalog .\examples\grocery\catalog-match.json
-```
-
-## Credentials And Config
-
-Common auth commands:
-
-```powershell
-node .\dist\cli.js auth set --provider openai --value <key>
-node .\dist\cli.js auth set --provider gemini --value <key>
-node .\dist\cli.js auth set --provider anthropic --value <key>
-node .\dist\cli.js auth set --provider serper --value <key>
-node .\dist\cli.js auth set --provider shopify --value <token>
-```
-
-Common config commands:
-
-```powershell
-node .\dist\cli.js config set providers.shopify_default.store your-store.myshopify.com
-node .\dist\cli.js config set modules.product-enricher.llm_provider openai_default
-node .\dist\cli.js config set modules.image-optimizer.search_provider serper_default
-node .\dist\cli.js config set modules.image-optimizer.vision_provider openai_vision_default
-```
-
-You can also tune the new agentic runtime settings:
-
-```powershell
-node .\dist\cli.js config set agentic.max_enrich_retries 1
-node .\dist\cli.js config set agentic.max_image_retries 1
-node .\dist\cli.js config set agentic.max_iterations_per_product 4
-node .\dist\cli.js config set agentic.strict_cost_guardrail true
-```
-
-## Customization
-
-Prodx is designed to be customized both through config and through code.
-
-Config-driven customization:
-
-- change provider defaults and models in `.catalog/config/runtime.json`
-- change agent retry caps and guardrails in `.catalog/config/runtime.json`
-- change module-to-provider routing with `catalog config set ...`
-- switch Shopify store targets and API credentials without changing code
-
-Code-driven customization:
-
-- add new agent wrappers in [src/agents](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/agents)
-- extend orchestration in [src/workflows](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/workflows)
-- add or refine deterministic logic in [src/modules](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/modules)
-- adjust guide rendering and export behavior in [src/lib](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/lib)
-- extend input normalization in [src/modules/ingest.ts](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/modules/ingest.ts)
-
-Typical extension points:
-
-- cost-estimator agent
-- image-input agent
-- compliance agent
-- SEO agent
-- custom Shopify metafield export rules
-
-## Cost Estimation
-
-Prodx now tracks token usage and estimated USD cost as part of the local workflow artifacts.
-
-What is stored:
-
-| Level | File | What it contains |
-| --- | --- | --- |
-| Per module run | `.catalog/runs/<job-id>/usage-cost.json` | Provider usage and estimated USD cost for that run |
-| Per module run | `.catalog/runs/<job-id>/result.json` | Full result plus `artifacts.provider_usage` and `artifacts.provider_cost` |
-| Per generated product | `.catalog/generated/products/<product-key>.json` | Stage-level metrics under `_catalog_stage_metrics` |
-| Per workflow batch | `.catalog/generated/workflow-costs.json` | Rolled-up token totals and estimated USD cost across workflow runs |
-
-How to think about these numbers:
-
-- they are estimates, not billing statements
-- they are based on model-specific pricing cards in [src/lib/provider-cost.ts](C:/Users/Abood/Cataluge%20Manager/shopify-catalog-toolkit/src/lib/provider-cost.ts)
-- provider pricing changes over time, so the numbers should be treated as operational estimates
-- token-tracked model calls are included
-- external services that do not expose token usage may not be fully priced
-
-## Safety
-
-- live Shopify writes only happen with `--live`
-- QA is the main publish gate
-- duplicate and review-blocked products do not get exported for publish
-- the toolkit prefers skipping uncertain data over guessing
-
-## Known Limitations
-
-- image quality still depends on what trusted exact-match sources exist on the web
-- provider quality and factual source quality still affect the final result
-- cost estimates are helpful operationally but are not exact provider invoices
-- the current web app is a homepage only; the operational workflow still lives in the CLI
-- live Shopify publish still depends on real store credentials and store-side product state
+## Supported LLM Providers
+
+| Provider | Models | Used For |
+|----------|--------|----------|
+| OpenAI | gpt-5, gpt-5-mini, gpt-4.1, gpt-4.1-mini, o3, o4-mini | Enrichment, QA, guide, vision |
+| Google Gemini | gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite | Enrichment, QA, guide |
+| Anthropic | claude-opus-4.6, claude-sonnet-4.6, claude-opus-4, claude-sonnet-4 | Enrichment, QA, guide |
+
+## Built With
+
+<p>
+  <a href="https://convex.dev"><img src="https://img.shields.io/badge/Convex-Database-orange" alt="Convex"></a>
+  <a href="https://trigger.dev"><img src="https://img.shields.io/badge/Trigger.dev-Background%20Tasks-green" alt="Trigger.dev"></a>
+  <a href="https://openai.com"><img src="https://img.shields.io/badge/OpenAI-LLM%20%2B%20Vision-blue" alt="OpenAI"></a>
+  <a href="https://www.shopify.com"><img src="https://img.shields.io/badge/Shopify-E--commerce-brightgreen" alt="Shopify"></a>
+  <a href="https://serper.dev"><img src="https://img.shields.io/badge/Serper-Image%20Search-yellow" alt="Serper"></a>
+  <a href="https://ai.google.dev"><img src="https://img.shields.io/badge/Google%20Gemini-LLM-red" alt="Gemini"></a>
+  <a href="https://anthropic.com"><img src="https://img.shields.io/badge/Anthropic-LLM-purple" alt="Anthropic"></a>
+</p>
+
+- **[Convex](https://convex.dev)** — Real-time database with vector search, file storage, and scheduled functions
+- **[Trigger.dev](https://trigger.dev)** — Background task orchestration with retries, scheduling, and monitoring
+- **[OpenAI](https://openai.com)** — LLM for enrichment, QA, guide generation + Vision for image analysis
+- **[Shopify](https://shopify.com)** — E-commerce platform (GraphQL Admin API for catalog sync)
+- **[Serper](https://serper.dev)** — Google search API for product image discovery
+- **[Google Gemini](https://ai.google.dev)** — Alternative LLM provider
+- **[Anthropic Claude](https://anthropic.com)** — Alternative LLM provider
 
 ## Contributing
 
 PRs welcome. Please open an issue first to discuss what you'd like to change.
 
+## License
+
+MIT
+
 ## Credits
 
-Built by BlyzrHQ.
-
-Powered by:
-
-- OpenAI
-- Google Gemini
-- Anthropic
-- Shopify
-- Serper
-
-## Verification
-
-Before pushing changes:
-
-```powershell
-npm run build
-npm test
-```
+Built by [BlyzrHQ](https://github.com/BlyzrHQ).

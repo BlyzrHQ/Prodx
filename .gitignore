@@ -1,14 +1,21 @@
-.catalog/
-.catalog-web/
 node_modules/
 dist/
-coverage/
-.DS_Store
-test-results/
-tmp-*.json
-apps/web/.next/
-apps/web/.open-next/
-apps/web/.wrangler/
-apps/web/tsconfig.tsbuildinfo
+.env
+.catalog/config/credentials.json
+paperclip/data/
 
-apps/web/.codex-dev/
+.env.local
+
+.trigger
+
+# Generated scaffold runtime output
+.catalog/guide/
+.agents/skills/prodx-cpo/
+.claude/skills/prodx-cpo/
+convex/
+src/agents/
+src/services/
+src/trigger/
+src/cli.ts
+src/config.ts
+trigger.config.ts

@@ -1,35 +1,36 @@
 {
   "name": "prodx",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Local-first Shopify catalog toolkit built from the PRD in this workspace.",
+  "description": "Scaffold CLI for Shopify catalog management with Convex, Trigger.dev, and Paperclip.",
   "workspaces": [
     "apps/web"
   ],
   "bin": {
-    "catalog": "./bin/catalog.js"
+    "prodx": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --disable-warning=ExperimentalWarning --experimental-strip-types ./tests/run-tests.ts",
-    "catalog": "npm run build && node ./dist/cli.js",
-    "web:dev": "npm --workspace apps/web run dev",
-    "web:build": "npm run build && npm --workspace apps/web run build",
-    "web:check": "npm run build && npm --workspace apps/web run check",
-    "web:cf:build": "npm --workspace apps/web run build:cf",
-    "web:preview": "npm --workspace apps/web run preview",
-    "web:deploy": "npm --workspace apps/web run deploy"
+    "build": "tsc",
+    "setup": "tsx src/index.ts",
+    "start": "npm run build && node dist/index.js",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=22"
   },
-  "devDependencies": {
-    "@types/node": "^25.5.0",
-    "typescript": "^6.0.2"
-  },
   "dependencies": {
-    "exceljs": "^4.4.0"
+    "@clack/prompts": "^0.9.1",
+    "@trigger.dev/sdk": "4.4.4",
+    "convex": "^1.21.0",
+    "dotenv": "^16.4.7",
+    "openai": "^4.85.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "4.4.4",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
   }
 }

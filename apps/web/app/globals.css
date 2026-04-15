@@ -23,6 +23,7 @@
   --shadow-md: 0 12px 30px rgba(24, 42, 29, 0.06);
   --font-display: "Aptos Display", "Segoe UI", Arial, sans-serif;
   --font-body: "Aptos", "Segoe UI", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", Consolas, "SFMono-Regular", monospace;
 }
 
 * {
@@ -36,6 +37,7 @@ body {
   background: var(--surface-soft);
   color: var(--ink);
   font-family: var(--font-body);
+  overflow-x: hidden;
 }
 
 body {
@@ -945,8 +947,8 @@ textarea {
 }
 
 .homepageShell {
-  width: min(1120px, calc(100% - 24px));
-  margin: 0 auto;
+  width: 100%;
+  margin: 0;
   padding: 18px 0 56px;
   display: grid;
   gap: 28px;
@@ -1058,7 +1060,6 @@ textarea {
 
 @media (max-width: 720px) {
   .homepageShell {
-    width: min(100% - 16px, 100%);
     gap: 20px;
   }
 
