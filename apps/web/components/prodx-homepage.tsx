@@ -121,11 +121,13 @@ const sectionTitleStyle = {
   textAlign: "center" as const,
   fontFamily: "var(--font-display)",
   fontSize: "32px",
-  fontWeight: 600,
+  fontWeight: 700,
   color: "var(--ink)",
   marginTop: 0,
   marginBottom: 0,
-  textWrap: "balance" as const
+  textWrap: "balance" as const,
+  fontKerning: "normal" as const,
+  textRendering: "optimizeLegibility" as const
 };
 
 const sectionIntroStyle = {
@@ -232,7 +234,7 @@ export function ProdxHomepage() {
           max-width: 720px;
         }
         .sectionTitle {
-          letter-spacing: -0.03em;
+          letter-spacing: -0.015em;
         }
         .sectionIntro {
           max-width: 640px;
@@ -340,6 +342,19 @@ export function ProdxHomepage() {
           width: min(1120px, calc(100% - 24px));
           margin-left: auto;
           margin-right: auto;
+        }
+        .quickstartHeader {
+          width: 100%;
+          max-width: 760px;
+          margin-left: auto;
+          margin-right: auto;
+        }
+        .quickstartTitle {
+          width: 100% !important;
+          max-width: 100% !important;
+          margin-left: 0 !important;
+          margin-right: 0 !important;
+          text-align: center !important;
         }
         .featuresSection,
         .toolsSection {
@@ -859,14 +874,14 @@ export function ProdxHomepage() {
 
       <motion.section
         className="pipelineSection"
-        initial={{ opacity: 0, y: 30 }}
+        initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-100px" }}
         transition={{ duration: 0.6 }}
       >
         <div className="sectionHeader" style={sectionHeaderStyle}>
           <span style={sectionBadgeStyle}>Workflow</span>
-          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, fontWeight: 800, lineHeight: 1.08 }}>
+          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, lineHeight: 1.08 }}>
             How it works
           </h2>
         </div>
@@ -924,14 +939,17 @@ export function ProdxHomepage() {
       <motion.section
         id="quickstart"
         className="quickstartSection"
-        initial={{ opacity: 0, y: 30 }}
+        initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-100px" }}
         transition={{ duration: 0.6 }}
       >
-        <div className="sectionHeader" style={sectionHeaderStyle}>
+        <div className="sectionHeader quickstartHeader" style={sectionHeaderStyle}>
           <span style={sectionBadgeStyle}>Quick start</span>
-          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, color: "#fff", fontWeight: 800, lineHeight: 1.08 }}>
+          <h2
+            className="sectionTitle quickstartTitle"
+            style={{ ...sectionTitleStyle, color: "#fff", width: "100%", maxWidth: "100%", lineHeight: 1.08 }}
+          >
             Download and run locally
           </h2>
           <p className="sectionIntro" style={{ ...sectionIntroStyle, color: "#9CA89C", maxWidth: "600px" }}>
@@ -1011,14 +1029,14 @@ export function ProdxHomepage() {
 
       <motion.section
         className="featuresSection"
-        initial={{ opacity: 0, y: 30 }}
+        initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-100px" }}
         transition={{ duration: 0.6 }}
       >
         <div className="sectionHeader" style={sectionHeaderStyle}>
           <span style={sectionBadgeStyle}>Features</span>
-          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, fontWeight: 800, lineHeight: 1.08 }}>
+          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, lineHeight: 1.08 }}>
             Everything you need
           </h2>
         </div>
@@ -1052,14 +1070,14 @@ export function ProdxHomepage() {
 
       <motion.section
         className="toolsSection"
-        initial={{ opacity: 0, y: 30 }}
+        initial={{ opacity: 0, y: 20 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-100px" }}
         transition={{ duration: 0.6 }}
       >
         <div className="sectionHeader" style={sectionHeaderStyle}>
           <span style={sectionBadgeStyle}>Built with</span>
-          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, fontWeight: 800, lineHeight: 1.08 }}>
+          <h2 className="sectionTitle" style={{ ...sectionTitleStyle, lineHeight: 1.08 }}>
             The current stack
           </h2>
         </div>
