@@ -94,6 +94,7 @@ const tickerMessages = [
 ];
 
 const sectionHeaderStyle = {
+  width: "100%",
   textAlign: "center" as const,
   display: "flex",
   flexDirection: "column" as const,
@@ -112,6 +113,8 @@ const sectionBadgeStyle = {
 };
 
 const sectionTitleStyle = {
+  width: "100%",
+  textAlign: "center" as const,
   fontFamily: "var(--font-display)",
   fontSize: "32px",
   fontWeight: 600,
@@ -361,7 +364,7 @@ export function ProdxHomepage() {
         }
         .toolsGrid {
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          grid-template-columns: repeat(4, minmax(0, 1fr));
           gap: 16px;
           width: 100%;
           max-width: 1200px;
@@ -380,6 +383,9 @@ export function ProdxHomepage() {
         @media (max-width: 960px) {
           .featuresGrid {
             grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+          .toolsGrid {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
           }
           .pipelineArrow {
             display: none;
